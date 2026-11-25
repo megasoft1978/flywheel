@@ -22,3 +22,19 @@
 ## Open questions
 - TB2.0 exact task-set id/registry for 2.0 (vs original-tasks 1.0).
 - Whether containers have outbound network by default (needed for host.docker.internal engine path) — verify with hello-world.
+
+
+## Progress log (2026-11-25 session 2)
+- Harness corrected: TB2.0 runs on **Harbor** (`uv tool install harbor`), NOT terminal-bench 1.x.
+- Oracle smoke: PASSED 2/2 (circuit-fibsqrt, make-mips-interpreter) — Docker pipeline + dataset download validated. Jobs in bench-tb/jobs/.
+- Engine: Splash lives on port **8312** (not 8021). Server up: local/qwen-pi4, ctx 262144.
+- flywheel_agent.py written for Harbor BaseAgent (setup: upload binary per uname arch; run: one-shot).
+- BLOCKER: Linux static build stalls — apk large downloads stall inside containers (small files ok).
+  Docker Desktop container-network egress broken for big transfers; oracle still passed (tasks need no net).
+- CRITICAL UNVERIFIED: whether containers can reach host.docker.internal:8312 — test in flight with curlimages/curl.
+  If THAT path is also broken, flywheel-in-container cannot reach the engine and the whole approach needs
+  host networking (--network host unsupported for TB) or engine-in-container sidecar.
+- Compile fixes needed for musl: -D_GNU_SOURCE (wcwidth/usleep/killpg/realpath implicit decls) — done in build script.
+- bench validation (tsreact vtools1 imperfect tasks) restarted with correct task ids — results in /tmp/fwbench_result.txt.
+- next: finish static build (consider host-side musl.cc toolchain download since host network is fine),
+  verify container->host engine path, then single-task agent smoke.
