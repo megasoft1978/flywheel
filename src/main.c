@@ -1,5 +1,7 @@
 #include "flywheel.h"
+#ifndef FW_MINI_HTTP
 #include <curl/curl.h>
+#endif
 #include <locale.h>
 #include <wchar.h>
 #include <signal.h>
@@ -384,9 +386,13 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "init") || !strcmp(a, "setup")) subcmd = a;
         else if (!strcmp(a, "bench")) {
             signal(SIGINT, on_sigint);
+            #ifndef FW_MINI_HTTP
             curl_global_init(CURL_GLOBAL_DEFAULT);
+            #endif
             int rc = fw_do_bench(argc - i - 1, argv + i + 1);
+            #ifndef FW_MINI_HTTP
             curl_global_cleanup();
+            #endif
             return rc;
         }
         else if (a[0] != '-') g_cfg.once = str_dup(a);
@@ -399,7 +405,9 @@ int main(int argc, char **argv) {
     }
 
     signal(SIGINT, on_sigint);
+    #ifndef FW_MINI_HTTP
     curl_global_init(CURL_GLOBAL_DEFAULT);
+    #endif
     if (subcmd) return !strcmp(subcmd, "init") ? fw_do_init() : fw_do_setup();
 
     const Profile *prof = profile_detect(g_cfg.cwd, g_cfg.profile);
@@ -423,7 +431,9 @@ int main(int argc, char **argv) {
         const char *fin = agent_run(&msgs, &ui, sum, sizeof sum);
         printf("\n" GREEN "●" RESET " flywheel: %s\n", sum);
         msgs_free(&msgs);
+        #ifndef FW_MINI_HTTP
         curl_global_cleanup();
+        #endif
         return !strcmp(fin, "done") ? 0 : 1;
     }
 
@@ -437,6 +447,8 @@ int main(int argc, char **argv) {
     tui_cleanup();
     perm_free();
     msgs_free(&msgs);
+    #ifndef FW_MINI_HTTP
     curl_global_cleanup();
+    #endif
     return 0;
 }

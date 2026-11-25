@@ -7,7 +7,7 @@ host.docker.internal. Non-interactive one-shot mode per task.
 usage:
   harbor run -d terminal-bench/terminal-bench-2 \
     --agent-import-path flywheel_agent:FlywheelAgent \
-    -k engine_url=http://host.docker.internal:8021/v1 \
+    -k engine_url=http://host.docker.internal:8312/v1 \
     --include-task-name <task>
 """
 
@@ -23,7 +23,7 @@ DIST = Path(__file__).resolve().parent.parent / "dist"
 
 class FlywheelAgent(BaseAgent):
     def __init__(self, *args, **kwargs):
-        self._engine_url = kwargs.pop("engine_url", "http://host.docker.internal:8021/v1")
+        self._engine_url = kwargs.pop("engine_url", "http://host.docker.internal:8312/v1")
         self._model = kwargs.pop("fw_model", None)
         self._turn_timeout = kwargs.pop("turn_timeout", 90)
         self._wall_timeout = kwargs.pop("wall_timeout", 1500)
@@ -74,7 +74,7 @@ class FlywheelAgent(BaseAgent):
             env["FW_MODEL"] = self._model
         cmd = (
             "cd /app 2>/dev/null || cd /; "
-            f"flywheel -f /tmp/fw_instruction.txt -T {self._turn_timeout} "
+            f"flywheel -q -f /tmp/fw_instruction.txt -T {self._turn_timeout} "
             f"-W {self._wall_timeout} --transcript /tmp/fw_transcript.jsonl "
             "> /tmp/fw_out.log 2>&1; echo FW_EXIT_$?"
         )

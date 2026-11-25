@@ -1,5 +1,13 @@
 #include "flywheel.h"
+#include <time.h>
+#ifdef FW_MINI_HTTP
+int fw_mini_post_stream(const char *url, const char *payload, int streaming,
+                        size_t (*cb)(char *, size_t, size_t, void *), void *ud,
+                        char *errbuf, size_t errcap);
+char *fw_mini_get(const char *url);
+#else
 #include <curl/curl.h>
+#endif
 #include <fcntl.h>
 #include <sys/select.h>
 #include <termios.h>
@@ -142,12 +150,14 @@ static size_t on_data(char *ptr, size_t sz, size_t nm, void *ud) {
 
 
 /* poll stdin for Esc/ctrl-c while a request streams (TUI) — sets g_abort */
+#ifndef FW_MINI_HTTP
 static int on_progress(void *ud, curl_off_t a, curl_off_t b, curl_off_t c, curl_off_t d) {
     (void)a;(void)b;(void)c;(void)d;(void)ud;
     if (g_abort) return 1;
     if (fw_tick_hook) fw_tick_hook();
     return g_abort ? 1 : 0;
 }
+#endif
 
 ChatResp *chat(Msgs *msgs, StreamCb *cb) {
     char url[512];
@@ -244,6 +254,7 @@ ChatResp *chat(Msgs *msgs, StreamCb *cb) {
 
     Acc a = {0};
     a.cb = cb;
+#ifndef FW_MINI_HTTP
     /* cached handle: TCP/TLS connection reuse across turns (localhost latency matters) */
     static CURL *hc;
     if (!hc) hc = curl_easy_init();
@@ -262,20 +273,36 @@ ChatResp *chat(Msgs *msgs, StreamCb *cb) {
     curl_easy_setopt(h, CURLOPT_XFERINFOFUNCTION, on_progress);
     curl_easy_setopt(h, CURLOPT_XFERINFODATA, NULL);
     curl_easy_setopt(h, CURLOPT_NOPROGRESS, 0L);
+#endif
 
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
+#ifdef FW_MINI_HTTP
+    char merr[256] = "";
+    int mrc = fw_mini_post_stream(url, payload, cb && cb->stream, on_data, &a, merr, sizeof merr);
+#else
     CURLcode rc = curl_easy_perform(h);
+#endif
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double secs = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
 
     ChatResp *r = calloc(1, sizeof *r);
     r->secs = secs;
+#ifdef FW_MINI_HTTP
+    if (mrc != 0) {
+        if (g_abort) r->error = str_dup("aborted");
+        else {
+            snprintf(a.err, sizeof a.err, "http: %s", merr[0] ? merr : "transport error");
+            r->error = str_dup(a.err);
+        }
+    } else if (!cb || !cb->stream) {
+#else
     if (rc != CURLE_OK) {
         if (g_abort) r->error = str_dup("aborted");
         else snprintf(a.err, sizeof a.err, "curl: %s", curl_easy_strerror(rc)),
              r->error = str_dup(a.err);
     } else if (!cb || !cb->stream) {
+#endif
         acc_chunk(&a, a.raw.buf ? a.raw.buf : "{}");
     }
     /* long http errors land as JSON with error field */
@@ -301,8 +328,9 @@ ChatResp *chat(Msgs *msgs, StreamCb *cb) {
         r->tool_calls = arr;
     }
     free(a.raw.buf);
+#ifndef FW_MINI_HTTP
     curl_slist_free_all(hdrs);
-    /* handle cached — no cleanup (process-lifetime) */
+#endif
     free(payload);
     return r;
 }
@@ -314,6 +342,9 @@ char *http_get(const char *path) {
 }
 
 char *http_get_url(const char *url) {
+#ifdef FW_MINI_HTTP
+    return fw_mini_get(url);
+#else
     SBuf s = {0};
     CURL *h = curl_easy_init();
     curl_easy_setopt(h, CURLOPT_URL, url);
@@ -327,6 +358,7 @@ char *http_get_url(const char *url) {
     curl_easy_cleanup(h);
     if (rc != CURLE_OK) { free(a.raw.buf); return NULL; }
     return a.raw.buf;
+#endif
 }
 
 void chat_resp_free(ChatResp *r) {
