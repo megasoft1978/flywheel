@@ -2161,8 +2161,6 @@ void tui_repl(void) {
 
     render_screen();
 
-    unsigned char escbuf_dummy[1]; (void)escbuf_dummy;
-
     want_exit = false;
     for (;;) {
         if (g_resized) { g_resized = 0; render_screen(); }

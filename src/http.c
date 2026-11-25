@@ -244,7 +244,11 @@ ChatResp *chat(Msgs *msgs, StreamCb *cb) {
 
     Acc a = {0};
     a.cb = cb;
-    CURL *h = curl_easy_init();
+    /* cached handle: TCP/TLS connection reuse across turns (localhost latency matters) */
+    static CURL *hc;
+    if (!hc) hc = curl_easy_init();
+    CURL *h = hc;
+    curl_easy_reset(h);
     struct curl_slist *hdrs = NULL;
     hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
     if (cb && cb->stream)
@@ -298,7 +302,7 @@ ChatResp *chat(Msgs *msgs, StreamCb *cb) {
     }
     free(a.raw.buf);
     curl_slist_free_all(hdrs);
-    curl_easy_cleanup(h);
+    /* handle cached — no cleanup (process-lifetime) */
     free(payload);
     return r;
 }
