@@ -1023,6 +1023,30 @@ static void build_transcript(VBuf *vb) {
     }
 }
 
+/* word-ish wrap modal body text into fixed-width display lines (render-local buffer) */
+static char mbody_lines[24][160];
+static int wrap_modal_body(const char *body, int width, int maxlines) {
+    int n = 0, w = 0, col = 0;
+    if (!body || !*body) return 0;
+    for (const char *p = body; *p && n < maxlines;) {
+        if (*p == '\n') {
+            mbody_lines[n][w] = 0; n++; w = col = 0; p++;
+            continue;
+        }
+        int bl = 0;
+        int cw = utf8_cell_width(p, (int)strlen(p), &bl);
+        if (bl <= 0) { p++; continue; }
+        if (col + cw > width && w > 0) {
+            mbody_lines[n][w] = 0; n++; w = col = 0;
+            if (n >= maxlines) break;
+        }
+        if (w + bl < 159) { memcpy(mbody_lines[n] + w, p, (size_t)bl); w += bl; }
+        col += cw; p += bl;
+    }
+    if (n < maxlines && (w > 0 || n == 0)) { mbody_lines[n][w] = 0; n++; }
+    return n;
+}
+
 /* ---------- full-screen atomic renderer ---------- */
 
 static void draw_hline(const char *left, const char *right, int inner) {
@@ -1144,7 +1168,11 @@ static void render_screen(void) {
     int modal_body_lines = 0;
 
     if (active_modal) {
-        modal_body_lines = (active_modal->body && *active_modal->body) ? 2 : 0; /* body + blank */
+        int bcap = rows / 3;
+        if (bcap < 2) bcap = 2;
+        if (bcap > 24) bcap = 24;
+        int bn = wrap_modal_body(active_modal->body, inner_w > 4 ? inner_w - 4 : inner_w, bcap);
+        modal_body_lines = bn > 0 ? bn + 1 : 0; /* wrapped body rows + blank */
         ch = 2 /*borders*/ + modal_body_lines + 1 /*prompt*/ + active_modal->nopts + 1 /*status*/;
         if (ch > rows - 2) { modal_body_lines = 0; ch = 2 + 1 + active_modal->nopts + 1; }
     } else {
@@ -1205,16 +1233,10 @@ static void render_screen(void) {
         draw_titled_top(m->title, box_w);
 
         if (modal_body_lines > 0) {
-            char flat[512];
-            int fk = 0;
-            for (const char *p = m->body; *p && fk < inner_w - 2 && fk < 500; p++) {
-                if (*p == '\n') { flat[fk++] = ' '; }
-                else flat[fk++] = *p;
-            }
-            flat[fk] = 0;
-            printf("\033[%d;1H" CLR_LINE YELLOW "│" RESET " " BOLD "%s%s" RESET "\033[%d;%dH" YELLOW "│" RESET,
-                   r, flat, (int)strlen(m->body) > fk ? "…" : "", r, cols);
-            r++;
+            int bn = modal_body_lines - 1;
+            for (int bi = 0; bi < bn; bi++, r++)
+                printf("\033[%d;1H" CLR_LINE YELLOW "│" RESET " " BOLD "%s" RESET "\033[%d;%dH" YELLOW "│" RESET,
+                       r, mbody_lines[bi], r, cols);
             printf("\033[%d;1H" CLR_LINE YELLOW "│" RESET "\033[%d;%dH" YELLOW "│" RESET, r, r, cols);
             r++;
         }
