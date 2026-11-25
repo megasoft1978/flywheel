@@ -1,10 +1,47 @@
 # flywheel
 
 From-scratch C agent harness for local OpenAI-compatible engines
-(tuned for Splash + Qwen3.8-27B on Apple Silicon). Single binary,
-deps: libcurl + vendored cJSON.
+(tuned for Splash + Qwen3.8-27B on Apple Silicon). Single binary;
+macOS links only libcurl + vendored cJSON, and the Linux build
+(`zig cc -target x86_64-linux-musl`, see `bench-tb/build-zig.sh`)
+is fully static with **zero dependencies** — it speaks HTTP/SSE
+directly over sockets (`src/minihttp.c`).
 
 Build: `make` → `./flywheel`
+
+## Benchmark: Terminal-Bench 2.0
+
+Public, harness-agnostic terminal benchmark: the agent runs inside
+Linux Docker containers and end-state tests score the task. flywheel
+competes through a Harbor custom agent (`bench-tb/flywheel_agent.py`):
+the static binary is uploaded into each container and talks back to
+the Splash engine on the host — inference stays on Apple Silicon,
+zero tokens cost nothing.
+
+Reference numbers from the official tbench.ai 2.0 leaderboard
+(archived 2026-03, best published result per agent+model):
+
+| harness | model | TB2.0 |
+|---|---|---|
+| ForgeCode | Claude Opus 4.6 | 81.8% |
+| Codex CLI | GPT-5.2 | 62.9% |
+| Claude Code | Claude Opus 4.6 | 58.0% |
+| Claude Code | Claude Sonnet 4.5 | 40.1% |
+| Goose | Claude Haiku 4.5 | 35.5% |
+| Terminus 2 | Claude Haiku 4.5 | 28.3% |
+| Claude Code | Claude Haiku 4.5 | 27.5% |
+| Dakou Agent | Qwen3-Coder-**480B** (cloud) | 27.2% |
+| **flywheel** | **Qwen3.8-27B, local, $0/token** | slice in progress |
+
+The bar flywheel aims at: the best any harness extracted from
+Qwen3-Coder-480B — a cloud model ~18x larger — is 27.2%, and
+Claude Haiku 4.5 tops out at 35.5% across all published harnesses.
+Harness quality is half the product at small scale; that is the
+measured claim, not a slogan.
+
+Reproduce: `bench-tb/run-slice.sh` (10-task slice) — needs Docker
+and a local OpenAI-compatible engine on `:8312`. Full task list and
+oracle validation notes in `bench-tb/PLAN.md`.
 
 ## Modes
 

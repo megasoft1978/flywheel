@@ -1,0 +1,962 @@
+[
+ {
+  "agent": "ForgeCode",
+  "model": "Claude Opus 4.6",
+  "accuracy": 81.8,
+  "stderr": 0.9,
+  "date": "2026-03-12",
+  "verified": false
+ },
+ {
+  "agent": "ForgeCode",
+  "model": "GPT-5.4",
+  "accuracy": 81.8,
+  "stderr": 1.0,
+  "date": "2026-03-12",
+  "verified": false
+ },
+ {
+  "agent": "TongAgents",
+  "model": "Gemini 3.1 Pro",
+  "accuracy": 80.2,
+  "stderr": 1.3,
+  "date": "2026-03-13",
+  "verified": false
+ },
+ {
+  "agent": "ForgeCode",
+  "model": "Gemini 3.1 Pro",
+  "accuracy": 78.4,
+  "stderr": 0.9,
+  "date": "2026-03-02",
+  "verified": false
+ },
+ {
+  "agent": "SageAgent",
+  "model": "GPT-5.3-Codex",
+  "accuracy": 78.4,
+  "stderr": 1.1,
+  "date": "2026-03-13",
+  "verified": false
+ },
+ {
+  "agent": "Droid",
+  "model": "GPT-5.3-Codex",
+  "accuracy": 77.3,
+  "stderr": 1.1,
+  "date": "2026-02-24",
+  "verified": false
+ },
+ {
+  "agent": "Capy",
+  "model": "Claude Opus 4.6",
+  "accuracy": 75.3,
+  "stderr": 1.2,
+  "date": "2026-03-12",
+  "verified": false
+ },
+ {
+  "agent": "Simple Codex",
+  "model": "GPT-5.3-Codex",
+  "accuracy": 75.1,
+  "stderr": 1.2,
+  "date": "2026-02-06",
+  "verified": true
+ },
+ {
+  "agent": "Terminus-KIRA",
+  "model": "Gemini 3.1 Pro",
+  "accuracy": 74.8,
+  "stderr": 1.3,
+  "date": "2026-02-23",
+  "verified": false
+ },
+ {
+  "agent": "Terminus-KIRA",
+  "model": "Claude Opus 4.6",
+  "accuracy": 74.7,
+  "stderr": 1.3,
+  "date": "2026-02-22",
+  "verified": false
+ },
+ {
+  "agent": "Mux",
+  "model": "GPT-5.3-Codex",
+  "accuracy": 74.6,
+  "stderr": 1.3,
+  "date": "2026-03-06",
+  "verified": false
+ },
+ {
+  "agent": "MAYA-V2",
+  "model": "Claude 4.6 Opus",
+  "accuracy": 72.1,
+  "stderr": 1.1,
+  "date": "2026-03-12",
+  "verified": false
+ },
+ {
+  "agent": "TongAgents",
+  "model": "Claude Opus 4.6",
+  "accuracy": 71.9,
+  "stderr": 1.4,
+  "date": "2026-02-22",
+  "verified": false
+ },
+ {
+  "agent": "Junie CLI",
+  "model": "Claude Opus 4.6,Gemini 3 Flash,Gemini 3.1 Pro,GPT-5.3-Codex",
+  "accuracy": 71.0,
+  "stderr": 1.5,
+  "date": "2026-03-07",
+  "verified": false
+ },
+ {
+  "agent": "CodeBrain-1",
+  "model": "GPT-5.3-Codex",
+  "accuracy": 70.3,
+  "stderr": 1.3,
+  "date": "2026-02-10",
+  "verified": false
+ },
+ {
+  "agent": "Droid",
+  "model": "Claude Opus 4.6",
+  "accuracy": 69.9,
+  "stderr": 1.3,
+  "date": "2026-02-05",
+  "verified": false
+ },
+ {
+  "agent": "Ante",
+  "model": "Gemini 3 Pro",
+  "accuracy": 69.4,
+  "stderr": 1.1,
+  "date": "2026-01-06",
+  "verified": false
+ },
+ {
+  "agent": "IndusAGI Coding Agent",
+  "model": "GPT-5.3-Codex",
+  "accuracy": 69.1,
+  "stderr": 1.2,
+  "date": "2026-03-18",
+  "verified": false
+ },
+ {
+  "agent": "Crux",
+  "model": "Claude Opus 4.6",
+  "accuracy": 66.9,
+  "stderr": 0,
+  "date": "2026-02-23",
+  "verified": false
+ },
+ {
+  "agent": "Mux",
+  "model": "Claude Opus 4.6",
+  "accuracy": 66.5,
+  "stderr": 1.3,
+  "date": "2026-02-13",
+  "verified": false
+ },
+ {
+  "agent": "Deep Agents",
+  "model": "GPT-5.2-Codex",
+  "accuracy": 66.5,
+  "stderr": 1.6,
+  "date": "2026-02-12",
+  "verified": false
+ },
+ {
+  "agent": "SageAgent",
+  "model": "Gemini 3 Pro",
+  "accuracy": 65.2,
+  "stderr": 1.1,
+  "date": "2026-02-23",
+  "verified": false
+ },
+ {
+  "agent": "Droid",
+  "model": "GPT-5.2",
+  "accuracy": 64.9,
+  "stderr": 1.4,
+  "date": "2025-12-24",
+  "verified": false
+ },
+ {
+  "agent": "Terminus 2",
+  "model": "GPT-5.3-Codex",
+  "accuracy": 64.7,
+  "stderr": 1.4,
+  "date": "2026-02-05",
+  "verified": true
+ },
+ {
+  "agent": "Junie CLI",
+  "model": "Gemini 3 Flash",
+  "accuracy": 64.3,
+  "stderr": 1.4,
+  "date": "2025-12-23",
+  "verified": false
+ },
+ {
+  "agent": "Droid",
+  "model": "Claude Opus 4.5",
+  "accuracy": 63.1,
+  "stderr": 1.4,
+  "date": "2025-12-11",
+  "verified": false
+ },
+ {
+  "agent": "Codex CLI",
+  "model": "GPT-5.2",
+  "accuracy": 62.9,
+  "stderr": 1.5,
+  "date": "2025-12-18",
+  "verified": true
+ },
+ {
+  "agent": "Terminus 2",
+  "model": "Claude Opus 4.6",
+  "accuracy": 62.9,
+  "stderr": 1.4,
+  "date": "2026-02-06",
+  "verified": true
+ },
+ {
+  "agent": "CodeBrain-1",
+  "model": "Gemini 3 Pro",
+  "accuracy": 62.2,
+  "stderr": 1.3,
+  "date": "2026-02-05",
+  "verified": false
+ },
+ {
+  "agent": "II-Agent",
+  "model": "Gemini 3 Pro",
+  "accuracy": 61.8,
+  "stderr": 1.4,
+  "date": "2025-12-23",
+  "verified": false
+ },
+ {
+  "agent": "Warp",
+  "model": "Claude Haiku 4.5,GPT-5.2",
+  "accuracy": 61.2,
+  "stderr": 1.5,
+  "date": "2025-12-12",
+  "verified": false
+ },
+ {
+  "agent": "Droid",
+  "model": "Gemini 3 Pro",
+  "accuracy": 61.1,
+  "stderr": 1.4,
+  "date": "2025-12-24",
+  "verified": false
+ },
+ {
+  "agent": "Mux",
+  "model": "GPT-5.2",
+  "accuracy": 60.7,
+  "stderr": 0,
+  "date": "2026-01-17",
+  "verified": false
+ },
+ {
+  "agent": "Codex CLI",
+  "model": "GPT-5.1-Codex-Max",
+  "accuracy": 60.4,
+  "stderr": 1.4,
+  "date": "2025-11-24",
+  "verified": true
+ },
+ {
+  "agent": "Letta Code",
+  "model": "Claude Opus 4.5",
+  "accuracy": 59.1,
+  "stderr": 1.2,
+  "date": "2025-12-17",
+  "verified": false
+ },
+ {
+  "agent": "Warp",
+  "model": "Claude Haiku 4.5,Gemini 3 Pro,GPT-5-Nano",
+  "accuracy": 59.1,
+  "stderr": 1.4,
+  "date": "2025-11-20",
+  "verified": false
+ },
+ {
+  "agent": "Abacus AI Desktop",
+  "model": "Claude Haiku 4.5,Gemini 3 Pro",
+  "accuracy": 58.4,
+  "stderr": 1.4,
+  "date": "2025-12-11",
+  "verified": false
+ },
+ {
+  "agent": "Mux",
+  "model": "Claude Opus 4.5",
+  "accuracy": 58.4,
+  "stderr": 0,
+  "date": "2026-01-17",
+  "verified": false
+ },
+ {
+  "agent": "Claude Code",
+  "model": "Claude Opus 4.6",
+  "accuracy": 58.0,
+  "stderr": 1.5,
+  "date": "2026-02-07",
+  "verified": true
+ },
+ {
+  "agent": "Terminus 2",
+  "model": "Claude Opus 4.5",
+  "accuracy": 57.8,
+  "stderr": 1.3,
+  "date": "2025-11-22",
+  "verified": true
+ },
+ {
+  "agent": "Crux",
+  "model": "GPT-5.1-Codex",
+  "accuracy": 57.8,
+  "stderr": 1.5,
+  "date": "2025-11-16",
+  "verified": true
+ },
+ {
+  "agent": "Terminus 2",
+  "model": "Gemini 3 Pro",
+  "accuracy": 56.9,
+  "stderr": 1.3,
+  "date": "2025-11-21",
+  "verified": true
+ },
+ {
+  "agent": "Letta Code",
+  "model": "Gemini 3 Pro",
+  "accuracy": 56.0,
+  "stderr": 1.5,
+  "date": "2025-12-17",
+  "verified": false
+ },
+ {
+  "agent": "Goose",
+  "model": "Claude Opus 4.5",
+  "accuracy": 54.3,
+  "stderr": 1.3,
+  "date": "2025-12-11",
+  "verified": false
+ },
+ {
+  "agent": "Terminus 2",
+  "model": "GPT-5.2",
+  "accuracy": 54.0,
+  "stderr": 1.5,
+  "date": "2025-12-12",
+  "verified": true
+ },
+ {
+  "agent": "Letta Code",
+  "model": "GPT-5.1-Codex",
+  "accuracy": 53.5,
+  "stderr": 1.4,
+  "date": "2025-12-17",
+  "verified": false
+ },
+ {
+  "agent": "Terminus 2",
+  "model": "GLM 5",
+  "accuracy": 52.4,
+  "stderr": 1.3,
+  "date": "2026-02-23",
+  "verified": false
+ },
+ {
+  "agent": "Claude Code",
+  "model": "Claude Opus 4.5",
+  "accuracy": 52.1,
+  "stderr": 1.3,
+  "date": "2025-12-18",
+  "verified": true
+ },
+ {
+  "agent": "OpenHands",
+  "model": "Claude Opus 4.5",
+  "accuracy": 51.9,
+  "stderr": 1.5,
+  "date": "2026-01-04",
+  "verified": true
+ },
+ {
+  "agent": "OpenCode",
+  "model": "Claude Opus 4.5",
+  "accuracy": 51.7,
+  "stderr": 0,
+  "date": "2026-01-12",
+  "verified": false
+ },
+ {
+  "agent": "Terminus 2",
+  "model": "Gemini 3 Flash",
+  "accuracy": 51.7,
+  "stderr": 1.6,
+  "date": "2026-01-07",
+  "verified": true
+ },
+ {
+  "agent": "Warp",
+  "model": "Claude Haiku 4.5,Claude Sonnet 4.5,GPT-5-Nano",
+  "accuracy": 50.1,
+  "stderr": 1.4,
+  "date": "2025-11-11",
+  "verified": false
+ },
+ {
+  "agent": "Codex CLI",
+  "model": "GPT-5",
+  "accuracy": 49.6,
+  "stderr": 1.5,
+  "date": "2025-11-04",
+  "verified": true
+ },
+ {
+  "agent": "Terminus 2",
+  "model": "GPT-5.1",
+  "accuracy": 47.6,
+  "stderr": 1.4,
+  "date": "2025-11-16",
+  "verified": true
+ },
+ {
+  "agent": "Gemini CLI",
+  "model": "Gemini 3 Flash",
+  "accuracy": 47.4,
+  "stderr": 1.5,
+  "date": "2026-03-06",
+  "verified": false
+ },
+ {
+  "agent": "CAMEL-AI",
+  "model": "Claude Sonnet 4.5",
+  "accuracy": 46.5,
+  "stderr": 1.2,
+  "date": "2025-12-24",
+  "verified": false
+ },
+ {
+  "agent": "Codex CLI",
+  "model": "GPT-5-Codex",
+  "accuracy": 44.3,
+  "stderr": 1.4,
+  "date": "2025-11-04",
+  "verified": true
+ },
+ {
+  "agent": "OpenHands",
+  "model": "GPT-5",
+  "accuracy": 43.8,
+  "stderr": 1.5,
+  "date": "2025-11-02",
+  "verified": true
+ },
+ {
+  "agent": "Terminus 2",
+  "model": "GPT-5-Codex",
+  "accuracy": 43.4,
+  "stderr": 1.5,
+  "date": "2025-10-31",
+  "verified": true
+ },
+ {
+  "agent": "Terminus 2",
+  "model": "Kimi K2.5",
+  "accuracy": 43.2,
+  "stderr": 1.5,
+  "date": "2026-02-04",
+  "verified": true
+ },
+ {
+  "agent": "Goose",
+  "model": "Claude Sonnet 4.5",
+  "accuracy": 43.1,
+  "stderr": 1.3,
+  "date": "2025-12-11",
+  "verified": false
+ },
+ {
+  "agent": "Crux",
+  "model": "GPT-5.1-Codex-Mini",
+  "accuracy": 43.1,
+  "stderr": 1.5,
+  "date": "2025-11-17",
+  "verified": true
+ },
+ {
+  "agent": "Terminus 2",
+  "model": "Claude Sonnet 4.5",
+  "accuracy": 42.8,
+  "stderr": 1.4,
+  "date": "2025-10-31",
+  "verified": true
+ },
+ {
+  "agent": "MAYA-V2",
+  "model": "Claude 4.5 Sonnet",
+  "accuracy": 42.7,
+  "stderr": 0,
+  "date": "2026-01-04",
+  "verified": false
+ },
+ {
+  "agent": "OpenHands",
+  "model": "Claude Sonnet 4.5",
+  "accuracy": 42.6,
+  "stderr": 1.4,
+  "date": "2025-11-02",
+  "verified": true
+ },
+ {
+  "agent": "Mini-SWE-Agent",
+  "model": "Claude Sonnet 4.5",
+  "accuracy": 42.5,
+  "stderr": 1.4,
+  "date": "2025-11-03",
+  "verified": true
+ },
+ {
+  "agent": "Terminus 2",
+  "model": "Minimax m2.5",
+  "accuracy": 42.2,
+  "stderr": 1.3,
+  "date": "2026-02-23",
+  "verified": false
+ },
+ {
+  "agent": "Mini-SWE-Agent",
+  "model": "GPT-5-Codex",
+  "accuracy": 41.3,
+  "stderr": 1.4,
+  "date": "2025-11-03",
+  "verified": true
+ },
+ {
+  "agent": "Claude Code",
+  "model": "Claude Sonnet 4.5",
+  "accuracy": 40.1,
+  "stderr": 1.5,
+  "date": "2025-11-04",
+  "verified": true
+ },
+ {
+  "agent": "Terminus 2",
+  "model": "DeepSeek-V3.2",
+  "accuracy": 39.6,
+  "stderr": 1.4,
+  "date": "2026-02-10",
+  "verified": false
+ },
+ {
+  "agent": "Terminus 2",
+  "model": "Claude Opus 4.1",
+  "accuracy": 38.0,
+  "stderr": 1.3,
+  "date": "2025-10-31",
+  "verified": true
+ },
+ {
+  "agent": "Terminus 2",
+  "model": "GPT-5.1-Codex",
+  "accuracy": 36.9,
+  "stderr": 1.7,
+  "date": "2025-11-17",
+  "verified": true
+ },
+ {
+  "agent": "OpenHands",
+  "model": "Claude Opus 4.1",
+  "accuracy": 36.9,
+  "stderr": 1.4,
+  "date": "2025-11-02",
+  "verified": true
+ },
+ {
+  "agent": "Crux",
+  "model": "MiniMax M2.1",
+  "accuracy": 36.6,
+  "stderr": 1.5,
+  "date": "2025-12-22",
+  "verified": true
+ },
+ {
+  "agent": "Terminus 2",
+  "model": "Kimi K2 Thinking",
+  "accuracy": 35.7,
+  "stderr": 1.4,
+  "date": "2025-11-11",
+  "verified": true
+ },
+ {
+  "agent": "Goose",
+  "model": "Claude Haiku 4.5",
+  "accuracy": 35.5,
+  "stderr": 1.5,
+  "date": "2025-12-11",
+  "verified": false
+ },
+ {
+  "agent": "Terminus 2",
+  "model": "GPT-5",
+  "accuracy": 35.2,
+  "stderr": 1.6,
+  "date": "2025-10-31",
+  "verified": true
+ },
+ {
+  "agent": "Mini-SWE-Agent",
+  "model": "Claude Opus 4.1",
+  "accuracy": 35.1,
+  "stderr": 1.3,
+  "date": "2025-11-03",
+  "verified": true
+ },
+ {
+  "agent": "Claude Code",
+  "model": "Claude Opus 4.1",
+  "accuracy": 34.8,
+  "stderr": 1.5,
+  "date": "2025-11-04",
+  "verified": true
+ },
+ {
+  "agent": "spoox-m",
+  "model": "GPT-5-Mini",
+  "accuracy": 34.8,
+  "stderr": 1.4,
+  "date": "2025-12-24",
+  "verified": false
+ },
+ {
+  "agent": "Mini-SWE-Agent",
+  "model": "GPT-5",
+  "accuracy": 33.9,
+  "stderr": 1.5,
+  "date": "2025-11-03",
+  "verified": true
+ },
+ {
+  "agent": "Terminus 2",
+  "model": "GLM 4.7",
+  "accuracy": 33.4,
+  "stderr": 1.4,
+  "date": "2026-01-28",
+  "verified": true
+ },
+ {
+  "agent": "Crux",
+  "model": "GLM 4.7",
+  "accuracy": 33.3,
+  "stderr": 1.3,
+  "date": "2026-02-08",
+  "verified": false
+ },
+ {
+  "agent": "Terminus 2",
+  "model": "Gemini 2.5 Pro",
+  "accuracy": 32.6,
+  "stderr": 1.5,
+  "date": "2025-10-31",
+  "verified": true
+ },
+ {
+  "agent": "Codex CLI",
+  "model": "GPT-5-Mini",
+  "accuracy": 31.9,
+  "stderr": 1.5,
+  "date": "2025-11-04",
+  "verified": true
+ },
+ {
+  "agent": "Terminus 2",
+  "model": "MiniMax M2",
+  "accuracy": 30.0,
+  "stderr": 1.4,
+  "date": "2025-11-01",
+  "verified": true
+ },
+ {
+  "agent": "Mini-SWE-Agent",
+  "model": "Claude Haiku 4.5",
+  "accuracy": 29.8,
+  "stderr": 1.3,
+  "date": "2025-11-03",
+  "verified": true
+ },
+ {
+  "agent": "OpenHands",
+  "model": "GPT-5-Mini",
+  "accuracy": 29.2,
+  "stderr": 1.4,
+  "date": "2025-11-02",
+  "verified": true
+ },
+ {
+  "agent": "Terminus 2",
+  "model": "MiniMax M2.1",
+  "accuracy": 29.2,
+  "stderr": 1.5,
+  "date": "2025-12-23",
+  "verified": true
+ },
+ {
+  "agent": "Terminus 2",
+  "model": "Claude Haiku 4.5",
+  "accuracy": 28.3,
+  "stderr": 1.5,
+  "date": "2025-10-31",
+  "verified": true
+ },
+ {
+  "agent": "Terminus 2",
+  "model": "Kimi K2 Instruct",
+  "accuracy": 27.8,
+  "stderr": 1.3,
+  "date": "2025-11-01",
+  "verified": true
+ },
+ {
+  "agent": "Claude Code",
+  "model": "Claude Haiku 4.5",
+  "accuracy": 27.5,
+  "stderr": 1.4,
+  "date": "2025-11-04",
+  "verified": true
+ },
+ {
+  "agent": "Dakou Agent",
+  "model": "Qwen 3 Coder 480B",
+  "accuracy": 27.2,
+  "stderr": 1.3,
+  "date": "2025-12-28",
+  "verified": false
+ },
+ {
+  "agent": "OpenHands",
+  "model": "Grok 4",
+  "accuracy": 27.2,
+  "stderr": 1.6,
+  "date": "2025-11-02",
+  "verified": true
+ },
+ {
+  "agent": "OpenHands",
+  "model": "Kimi K2 Instruct",
+  "accuracy": 26.7,
+  "stderr": 1.4,
+  "date": "2025-11-02",
+  "verified": true
+ },
+ {
+  "agent": "Mini-SWE-Agent",
+  "model": "Gemini 2.5 Pro",
+  "accuracy": 26.1,
+  "stderr": 1.3,
+  "date": "2025-11-03",
+  "verified": true
+ },
+ {
+  "agent": "Mini-SWE-Agent",
+  "model": "Grok Code Fast 1",
+  "accuracy": 25.8,
+  "stderr": 1.3,
+  "date": "2025-11-03",
+  "verified": true
+ },
+ {
+  "agent": "OpenHands",
+  "model": "Qwen 3 Coder 480B",
+  "accuracy": 25.4,
+  "stderr": 1.3,
+  "date": "2025-11-02",
+  "verified": true
+ },
+ {
+  "agent": "Mini-SWE-Agent",
+  "model": "Grok 4",
+  "accuracy": 25.4,
+  "stderr": 1.5,
+  "date": "2025-11-03",
+  "verified": true
+ },
+ {
+  "agent": "Terminus 2",
+  "model": "GLM 4.6",
+  "accuracy": 24.5,
+  "stderr": 1.2,
+  "date": "2025-11-01",
+  "verified": true
+ },
+ {
+  "agent": "Terminus 2",
+  "model": "GPT-5-Mini",
+  "accuracy": 24.0,
+  "stderr": 1.3,
+  "date": "2025-10-31",
+  "verified": true
+ },
+ {
+  "agent": "Terminus 2",
+  "model": "Qwen 3 Coder 480B",
+  "accuracy": 23.9,
+  "stderr": 1.4,
+  "date": "2025-11-01",
+  "verified": true
+ },
+ {
+  "agent": "Terminus 2",
+  "model": "Grok 4",
+  "accuracy": 23.1,
+  "stderr": 1.5,
+  "date": "2025-10-31",
+  "verified": true
+ },
+ {
+  "agent": "Mini-SWE-Agent",
+  "model": "GPT-5-Mini",
+  "accuracy": 22.2,
+  "stderr": 1.3,
+  "date": "2025-11-03",
+  "verified": true
+ },
+ {
+  "agent": "Gemini CLI",
+  "model": "Gemini 2.5 Pro",
+  "accuracy": 19.6,
+  "stderr": 1.5,
+  "date": "2025-11-04",
+  "verified": true
+ },
+ {
+  "agent": "Terminus 2",
+  "model": "GPT-OSS-120B",
+  "accuracy": 18.7,
+  "stderr": 1.4,
+  "date": "2025-11-01",
+  "verified": true
+ },
+ {
+  "agent": "Mini-SWE-Agent",
+  "model": "Gemini 2.5 Flash",
+  "accuracy": 17.1,
+  "stderr": 1.3,
+  "date": "2025-11-03",
+  "verified": true
+ },
+ {
+  "agent": "Terminus 2",
+  "model": "Gemini 2.5 Flash",
+  "accuracy": 16.9,
+  "stderr": 1.2,
+  "date": "2025-10-31",
+  "verified": true
+ },
+ {
+  "agent": "OpenHands",
+  "model": "Gemini 2.5 Flash",
+  "accuracy": 16.4,
+  "stderr": 1.2,
+  "date": "2025-11-02",
+  "verified": true
+ },
+ {
+  "agent": "OpenHands",
+  "model": "Gemini 2.5 Pro",
+  "accuracy": 16.4,
+  "stderr": 1.4,
+  "date": "2025-11-02",
+  "verified": true
+ },
+ {
+  "agent": "Gemini CLI",
+  "model": "Gemini 2.5 Flash",
+  "accuracy": 15.4,
+  "stderr": 1.2,
+  "date": "2025-11-04",
+  "verified": true
+ },
+ {
+  "agent": "Terminus 2",
+  "model": "Grok Code Fast 1",
+  "accuracy": 14.2,
+  "stderr": 1.3,
+  "date": "2025-10-31",
+  "verified": true
+ },
+ {
+  "agent": "Mini-SWE-Agent",
+  "model": "GPT-OSS-120B",
+  "accuracy": 14.2,
+  "stderr": 1.2,
+  "date": "2025-11-03",
+  "verified": true
+ },
+ {
+  "agent": "OpenHands",
+  "model": "Claude Haiku 4.5",
+  "accuracy": 13.9,
+  "stderr": 1.4,
+  "date": "2025-11-02",
+  "verified": true
+ },
+ {
+  "agent": "Codex CLI",
+  "model": "GPT-5-Nano",
+  "accuracy": 11.5,
+  "stderr": 1.2,
+  "date": "2025-11-04",
+  "verified": true
+ },
+ {
+  "agent": "OpenHands",
+  "model": "GPT-5-Nano",
+  "accuracy": 9.9,
+  "stderr": 1.1,
+  "date": "2025-11-02",
+  "verified": true
+ },
+ {
+  "agent": "Terminus 2",
+  "model": "GPT-5-Nano",
+  "accuracy": 7.9,
+  "stderr": 1.0,
+  "date": "2025-10-31",
+  "verified": true
+ },
+ {
+  "agent": "Mini-SWE-Agent",
+  "model": "GPT-5-Nano",
+  "accuracy": 7.0,
+  "stderr": 1.0,
+  "date": "2025-11-03",
+  "verified": true
+ },
+ {
+  "agent": "Mini-SWE-Agent",
+  "model": "GPT-OSS-20B",
+  "accuracy": 3.4,
+  "stderr": 0.7,
+  "date": "2025-11-03",
+  "verified": true
+ },
+ {
+  "agent": "Terminus 2",
+  "model": "GPT-OSS-20B",
+  "accuracy": 3.1,
+  "stderr": 0.8,
+  "date": "2025-11-01",
+  "verified": true
+ }
+]

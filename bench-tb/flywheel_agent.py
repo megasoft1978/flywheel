@@ -26,7 +26,7 @@ class FlywheelAgent(BaseAgent):
         self._engine_url = kwargs.pop("engine_url", "http://host.docker.internal:8312/v1")
         self._model = kwargs.pop("fw_model", None)
         self._turn_timeout = kwargs.pop("turn_timeout", 90)
-        self._wall_timeout = kwargs.pop("wall_timeout", 1500)
+        self._wall_timeout = kwargs.pop("wall_timeout", 900)
         super().__init__(*args, **kwargs)
 
     @staticmethod
@@ -85,3 +85,25 @@ class FlywheelAgent(BaseAgent):
         )
         out = res.stdout or ""
         self.logger.info("flywheel exec tail: %s", out[-400:])
+        # capture agent logs for postmortem into the trial's logging dir
+        try:
+            from harbor.models.trial.paths import TrialPaths  # noqa
+        except Exception:
+            TrialPaths = None
+        import logging
+        logdir = getattr(context, "logging_dir", None) or getattr(context, "trial_dir", None)
+        for remote, name in (("/tmp/fw_out.log", "fw_out.log"),
+                             ("/tmp/fw_transcript.jsonl", "fw_transcript.jsonl")):
+            try:
+                dl = getattr(environment, "download_file", None)
+                if dl and logdir:
+                    from pathlib import Path as P
+                    dest = P(str(logdir)) / name
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    await dl(remote, dest)
+                else:
+                    r2 = await environment.exec(f"cat {remote} 2>/dev/null | tail -c 6000", timeout_sec=15)
+                    if r2 and r2.stdout:
+                        self.logger.info("%s tail:\n%s", name, r2.stdout[-3000:])
+            except Exception as e:
+                self.logger.info("log capture %s failed: %s", name, e)

@@ -7,3 +7,9 @@ tests/*.dSYM/
 .flywheel.allow
 .flywheel/
 .DS_Store
+bench-tb/zig-work/
+bench-tb/musl-work/
+bench-tb/jobs/
+bench-tb/__pycache__/
+bench-tb/*.log
+dist/

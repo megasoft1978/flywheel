@@ -68,7 +68,7 @@
     <div class="card"><h3>Structured file tools</h3><p><code>write_file</code> / <code>edit_file</code> with path confinement and unique-match edits. No more heredoc roulette.</p></div>
     <div class="card"><h3>Verify gates</h3><p>Per-language auto-verification (<code>tsc</code>, <code>compileall</code>, <code>go vet</code>) every few write-turns and before finishing.</p></div>
     <div class="card"><h3>Permission system</h3><p>y / always / never per command prefix, persisted across sessions. Deny rules for destructive commands always win.</p></div>
-    <div class="card"><h3>Pure C, zero deps</h3><p>164KB binary. libcurl + vendored cJSON. No node, no python, no runtime. Starts in milliseconds.</p></div>
+    <div class="card"><h3>Pure C, zero-dep static</h3><p>No node, no python, no runtime. The Linux build is a fully static binary that speaks HTTP/SSE over raw sockets — it runs in bare containers. Starts in milliseconds.</p></div>
   </div>
 </section>
 
@@ -93,6 +93,28 @@
     <tr><td>optimistic-list (hardest UI task)</td><td class="num">19 / 19</td></tr>
   </table>
   <p style="color:var(--dim);margin-top:12px;font-size:13.5px">Harness fixes alone moved tasks from 0/19 to 19/19 with zero model change — the thesis in one number.</p>
+</section>
+
+<section>
+  <h2>Terminal-Bench 2.0 — the public scoreboard</h2>
+  <p style="color:var(--dim);max-width:70ch;margin-bottom:16px">Terminal-Bench 2.0 is harness-agnostic: the agent runs inside Linux
+  Docker containers, end-state tests score the task. flywheel enters through a Harbor custom agent — the static binary
+  is uploaded into each container and talks back to the Splash engine on the host. Inference stays on Apple Silicon;
+  tokens cost nothing. Reference numbers from the official tbench.ai 2.0 leaderboard (archived 2026-03):</p>
+  <table>
+    <tr><th>harness</th><th>model</th><th>TB2.0</th></tr>
+    <tr><td>ForgeCode</td><td>Claude Opus 4.6</td><td class="num">81.8%</td></tr>
+    <tr><td>Codex CLI</td><td>GPT-5.2</td><td class="num">62.9%</td></tr>
+    <tr><td>Claude Code</td><td>Claude Opus 4.6</td><td class="num">58.0%</td></tr>
+    <tr><td>Claude Code</td><td>Claude Sonnet 4.5</td><td class="num">40.1%</td></tr>
+    <tr><td>Goose</td><td>Claude Haiku 4.5</td><td class="num">35.5%</td></tr>
+    <tr><td>Claude Code</td><td>Claude Haiku 4.5</td><td class="num">27.5%</td></tr>
+    <tr><td>Dakou Agent</td><td>Qwen3-Coder-480B (cloud)</td><td class="num">27.2%</td></tr>
+    <tr style="outline:1px solid #1f6feb"><td><b>flywheel</b></td><td><b>Qwen3.8-27B — local, $0/token</b></td><td class="num"><b>slice running</b></td></tr>
+  </table>
+  <p style="color:var(--dim);margin-top:12px;font-size:13.5px">The bar: the best any published harness extracted from
+  Qwen3-Coder-480B — a cloud model ~18&times; larger — is 27.2%. Reproduce with <code>bench-tb/run-slice.sh</code> against any
+  OpenAI-compatible engine on <code>:8312</code>.</p>
 </section>
 
 <section id="quickstart">
