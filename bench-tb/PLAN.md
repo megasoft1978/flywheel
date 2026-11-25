@@ -38,3 +38,20 @@
 - bench validation (tsreact vtools1 imperfect tasks) restarted with correct task ids — results in /tmp/fwbench_result.txt.
 - next: finish static build (consider host-side musl.cc toolchain download since host network is fine),
   verify container->host engine path, then single-task agent smoke.
+
+
+## 2026-11-25 late — pipeline validated, slice running
+
+- **Static binaries built** via zig+minihttp (pure-C HTTP/SSE client, zero deps):
+  `dist/flywheel-linux-arm64` (2.4MB) + `dist/flywheel-linux-amd64` (2.3MB).
+  Build: `zig cc -target {arch}-linux-musl -DFW_MINI_HTTP` (see git history / build-zig.sh).
+- **TB2.0 containers are x86_64** (Rosetta-emulated on Apple Silicon) — amd64 binary required.
+- Smoke on circuit-fibsqrt: pipeline end-to-end green (binary uploads, engine reachable
+  at host.docker.internal:8312, tools execute in-container, verifier scores). reward 0.0 —
+  hard task, agent hit turn cap without DONE; expected for first smoke.
+- minihttp transport validated equivalent to curl build on host.
+- **Slice running** (10 tasks, wall 900s each, sequential): `bench-tb/harvest.sh` for results.
+- Leaderboard: `bench-tb/leaderboard-tb2.json` (120 official entries, archived 2026-03).
+- Known issues: agent kwargs (`--ak`) are ignored by harbor (options_model undeclared) —
+  defaults in flywheel_agent.py are authoritative. Model rarely emits DONE on hard tasks;
+  termination is finish_reason-driven, so hard tasks burn the full wall budget.
