@@ -11,6 +11,8 @@ rows = []
 for rj in sorted(glob.glob(os.path.join(jobdir, "*", "*__*", "result.json"))) or glob.glob(os.path.join(jobdir, "*__*", "result.json")):
     try:
         d = json.load(open(rj))
+        if "task_name" not in d:
+            continue
         task = d.get("task_name", "?")
         vr = d.get("verifier_result") or {}
         rw = (vr.get("rewards") or {}).get("reward", 0)
