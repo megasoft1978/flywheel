@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>flywheel — the agent harness measured against its model</title>
+<style>
+  :root { --bg:#0d1117; --fg:#e6edf3; --dim:#8b949e; --acc:#f0b429; --acc2:#58a6ff; --grn:#3fb950; --mag:#bc8cff; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system, "SF Pro", Inter, sans-serif; }
+  .wrap { max-width:880px; margin:0 auto; padding:0 24px; }
+  header { padding:84px 0 40px; text-align:center; }
+  .emblem { font-family:ui-monospace,Menlo,monospace; color:var(--acc); font-size:15px; line-height:1.4; white-space:pre; }
+  h1 { font-size:52px; letter-spacing:6px; margin:18px 0 8px; font-weight:800; }
+  h1 span { color:var(--acc); }
+  .tag { color:var(--dim); font-size:19px; }
+  .cta { margin-top:30px; display:flex; gap:14px; justify-content:center; flex-wrap:wrap; }
+  .cta a { padding:11px 22px; border-radius:8px; text-decoration:none; font-weight:600; font-size:15px; }
+  .cta .p { background:var(--acc); color:#111; }
+  .cta .s { border:1px solid #30363d; color:var(--fg); }
+  section { padding:44px 0; border-top:1px solid #21262d; }
+  h2 { font-size:26px; margin-bottom:18px; }
+  h2 b { color:var(--acc); }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:16px; }
+  .card { background:#161b22; border:1px solid #21262d; border-radius:10px; padding:18px; }
+  .card h3 { font-size:16px; margin-bottom:6px; color:var(--acc2); }
+  .card p { color:var(--dim); font-size:14px; }
+  pre { background:#161b22; border:1px solid #21262d; border-radius:10px; padding:18px; overflow-x:auto;
+        font:13.5px/1.55 ui-monospace,Menlo,monospace; color:#c9d1d9; }
+  .k { color:var(--grn); } .c { color:var(--dim); } .y { color:var(--acc); } .m { color:var(--mag); }
+  table { width:100%; border-collapse:collapse; font-size:14.5px; }
+  td,th { padding:8px 12px; border-bottom:1px solid #21262d; text-align:left; }
+  th { color:var(--dim); font-weight:600; }
+  .num { font-family:ui-monospace,Menlo,monospace; color:var(--grn); }
+  footer { padding:34px 0 60px; text-align:center; color:var(--dim); font-size:13.5px; }
+  a { color:var(--acc2); }
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <div class="emblem">    ╭─┴─╮
+  ╭─┤ ◎ ├─╮
+    ╰─┬─╯
+  ⚡ ───</div>
+  <h1>FLYWHEEL<span>.</span></h1>
+  <p class="tag">The agent harness measured against its model, not the market.<br>
+  Pure C. Single binary. Built for local models on Apple Silicon.</p>
+  <div class="cta">
+    <a class="p" href="https://github.com/megasoft1978/flywheel">GitHub</a>
+    <a class="s" href="#quickstart">Quickstart</a>
+  </div>
+</header>
+
+<section>
+  <h2>Why a harness <b>for this model</b>?</h2>
+  <p style="color:var(--dim);max-width:70ch">Mainstream agent CLIs are prompted, tooled and tested around frontier cloud models.
+  Point them at a local 27B and you get malformed tool calls, doom loops and silent stalls.
+  At this scale <b style="color:var(--fg)">harness quality is half the product</b> — flywheel is built around that truth:
+  every compensation exists because a benchmark failure demanded it.</p>
+</section>
+
+<section>
+  <h2>The compensation layer</h2>
+  <div class="grid">
+    <div class="card"><h3>Loop breaker</h3><p>Period-1/2/3 + similarity detection prunes doom loops, injects corrective context, escapes on a temporary temperature shift.</p></div>
+    <div class="card"><h3>Lenient tool parsing</h3><p>Repairs truncated JSON, raw control chars, missing braces — small models get a target they can actually hit.</p></div>
+    <div class="card"><h3>Structured file tools</h3><p><code>write_file</code> / <code>edit_file</code> with path confinement and unique-match edits. No more heredoc roulette.</p></div>
+    <div class="card"><h3>Verify gates</h3><p>Per-language auto-verification (<code>tsc</code>, <code>compileall</code>, <code>go vet</code>) every few write-turns and before finishing.</p></div>
+    <div class="card"><h3>Permission system</h3><p>y / always / never per command prefix, persisted across sessions. Deny rules for destructive commands always win.</p></div>
+    <div class="card"><h3>Pure C, zero deps</h3><p>164KB binary. libcurl + vendored cJSON. No node, no python, no runtime. Starts in milliseconds.</p></div>
+  </div>
+</section>
+
+<section>
+  <h2>A professional TUI</h2>
+  <div class="grid">
+    <div class="card"><h3>Input that never dies</h3><p>Type while the agent works — Enter queues, Esc interrupts, scrollback stays anchored instead of yanking to bottom.</p></div>
+    <div class="card"><h3>Markdown native</h3><p>Headings, bold/italic, fenced code boxes, tables, clickable OSC-8 hyperlinks — rendered as you stream.</p></div>
+    <div class="card"><h3>Collapsible everything</h3><p>Tool output and thinking collapse to one-liners. Click or ^O to expand. Mouse wheel scrolls.</p></div>
+    <div class="card"><h3>Live telemetry</h3><p>tok/s, context gauge, spinner phases, session stats, completion pills — the cockpit a local model deserves.</p></div>
+  </div>
+</section>
+
+<section>
+  <h2>Benchmark-driven</h2>
+  <p style="color:var(--dim);margin-bottom:16px">Every harness change is validated against a 13-task TypeScript/React suite
+  (express APIs, schedulers, SQLite repos, optimistic-update UIs, type-level gymnastics). Best composite:</p>
+  <table>
+    <tr><th>metric</th><th>score</th></tr>
+    <tr><td>composite</td><td class="num">12.76 / 13</td></tr>
+    <tr><td>perfect tasks</td><td class="num">10 / 13</td></tr>
+    <tr><td>optimistic-list (hardest UI task)</td><td class="num">19 / 19</td></tr>
+  </table>
+  <p style="color:var(--dim);margin-top:12px;font-size:13.5px">Harness fixes alone moved tasks from 0/19 to 19/19 with zero model change — the thesis in one number.</p>
+</section>
+
+<section id="quickstart">
+  <h2>Quickstart</h2>
+  <pre><span class="c"># build — needs clang + libcurl, nothing else</span>
+git clone https://github.com/megasoft1978/flywheel
+cd flywheel && make
+
+<span class="c"># point it at any OpenAI-compatible engine</span>
+./flywheel setup
+
+<span class="c"># then just talk to it</span>
+./flywheel
+<span class="y">›</span> write a rate-limiting middleware in src/limit.ts and test it
+
+<span class="m">✎ Write</span>(src/limit.ts) <span class="k">✓</span>  <span class="c">⎿ 42 lines</span>
+<span class="y">⚙ Bash</span>(npx tsc --noEmit) <span class="k">✓</span>  <span class="c">⎿ no errors</span>
+<span class="k">✓ done · 4 turns · 3 bash · 8.2k tok · ⚡ 91 tok/s · 34s</span></pre>
+</section>
+
+<footer>
+  MIT licensed · pure C17 · built for Apple Silicon local inference<br>
+  <a href="https://github.com/megasoft1978/flywheel">github.com/megasoft1978/flywheel</a>
+</footer>
+</div>
+</body>
+</html>
