@@ -2,6 +2,7 @@
 #define FW_VERSION "0.2"
 #define FLYWHEEL_H
 
+#include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>

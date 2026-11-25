@@ -1767,7 +1767,14 @@ static void run_slash(const char *cmd) {
 
 /* Cmd+V (Mica sends 0x16 for clipboard images) / Ctrl+V:
    save clipboard image (PNG, or TIFF fallback converted to PNG) without shell-injecting cwd. */
+#ifndef __APPLE__
 static void paste_clipboard_image(void) {
+    /* clipboard image paste is macOS-only (osascript); no-op elsewhere */
+}
+#else
+static void paste_clipboard_image_impl(void);
+static void paste_clipboard_image(void) { paste_clipboard_image_impl(); }
+static void paste_clipboard_image_impl(void) {
     char dir[1024];
     snprintf(dir, sizeof dir, "%s/.flywheel", g_cfg.cwd);
     mkdir(dir, 0755);
@@ -1805,6 +1812,7 @@ static void paste_clipboard_image(void) {
         set_status("no image in clipboard");
     }
 }
+#endif /* __APPLE__ */
 
 static void collapse_paste_if_big(void) {
     if (paste_start < 0) return;
