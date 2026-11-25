@@ -1,14 +1,14 @@
 #!/bin/bash
 # harvest slice results — safe to run any time, prints partial state too
 cd "$(dirname "$0")"
-JOB=$(ls -td jobs/slice-* 2>/dev/null | head -1)
+JOB=$(ls -td jobs/slice-*/ 2>/dev/null | head -1)
 [ -z "$JOB" ] && echo "no slice job found" && exit 1
 echo "job: $JOB"
 python3 - "$JOB" <<'PYE'
 import json, sys, os, glob
 jobdir = sys.argv[1]
 rows = []
-for rj in sorted(glob.glob(os.path.join(jobdir, "*", "*__*", "result.json"))):
+for rj in sorted(glob.glob(os.path.join(jobdir, "*", "*__*", "result.json"))) or glob.glob(os.path.join(jobdir, "*__*", "result.json")):
     try:
         d = json.load(open(rj))
         task = d.get("task_name", "?")
