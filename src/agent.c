@@ -78,7 +78,29 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
 
         StreamCb scb = {.on_text = ui->emit_text, .on_think = ui->emit_think,
                         .ud = ui->ud, .stream = ui->interactive};
-        ChatResp *r = chat(msgs, &scb);
+        /* transient transport errors (server busy, connection reset, engine
+           restart) must not kill a benchmark run — retry with backoff.
+           user aborts and malformed-response errors stay fatal. */
+        ChatResp *r = NULL;
+        for (int attempt = 0; attempt < 4; attempt++) {
+            r = chat(msgs, &scb);
+            if (!r || !r->error) break;
+            int transient = !strcmp(r->error, "aborted") ? 0 :
+                (!strncmp(r->error, "http:", 5) || !strncmp(r->error, "curl:", 5) ||
+                 strstr(r->error, "connect") || strstr(r->error, "timeout") ||
+                 strstr(r->error, "read failed") || strstr(r->error, "closed") != NULL);
+            if (!transient || attempt == 3) break;
+            if (ui->emit_text) {
+                char nb[160];
+                snprintf(nb, sizeof nb, "\n[transport: %.60s — retry %d/3]\n", r->error, attempt + 1);
+                ui->emit_text(nb, ui->ud);
+            }
+            chat_resp_free(r);
+            r = NULL;
+            struct timespec ts = {.tv_sec = 2 << attempt, .tv_nsec = 0};
+            nanosleep(&ts, NULL);
+            if (g_abort) break;
+        }
         g_cfg.temp = base_t;
         g_cfg.pp = base_pp;
         if (!r || r->error) {

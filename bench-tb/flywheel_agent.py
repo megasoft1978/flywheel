@@ -25,7 +25,7 @@ class FlywheelAgent(BaseAgent):
     def __init__(self, *args, **kwargs):
         self._engine_url = kwargs.pop("engine_url", "http://host.docker.internal:8312/v1")
         self._model = kwargs.pop("fw_model", None)
-        self._turn_timeout = kwargs.pop("turn_timeout", 90)
+        self._turn_timeout = kwargs.pop("turn_timeout", 150)
         self._wall_timeout = kwargs.pop("wall_timeout", 900)
         super().__init__(*args, **kwargs)
 
