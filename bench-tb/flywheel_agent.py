@@ -75,7 +75,7 @@ class FlywheelAgent(BaseAgent):
         cmd = (
             "cd /app 2>/dev/null || cd /; "
             f"flywheel -q -f /tmp/fw_instruction.txt -T {self._turn_timeout} "
-            f"-W {self._wall_timeout} --transcript /tmp/fw_transcript.jsonl "
+            f"-W {self._wall_timeout} -t 180 --transcript /tmp/fw_transcript.jsonl "
             "> /tmp/fw_out.log 2>&1; echo FW_EXIT_$?"
         )
         res = await environment.exec(
@@ -85,25 +85,9 @@ class FlywheelAgent(BaseAgent):
         )
         out = res.stdout or ""
         self.logger.info("flywheel exec tail: %s", out[-400:])
-        # capture agent logs for postmortem into the trial's logging dir
-        try:
-            from harbor.models.trial.paths import TrialPaths  # noqa
-        except Exception:
-            TrialPaths = None
-        import logging
-        logdir = getattr(context, "logging_dir", None) or getattr(context, "trial_dir", None)
-        for remote, name in (("/tmp/fw_out.log", "fw_out.log"),
-                             ("/tmp/fw_transcript.jsonl", "fw_transcript.jsonl")):
+        # keep the full log and transcript next to the trial for postmortems
+        for name in ("fw_out.log", "fw_transcript.jsonl"):
             try:
-                dl = getattr(environment, "download_file", None)
-                if dl and logdir:
-                    from pathlib import Path as P
-                    dest = P(str(logdir)) / name
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    await dl(remote, dest)
-                else:
-                    r2 = await environment.exec(f"cat {remote} 2>/dev/null | tail -c 6000", timeout_sec=15)
-                    if r2 and r2.stdout:
-                        self.logger.info("%s tail:\n%s", name, r2.stdout[-3000:])
+                await environment.download_file(f"/tmp/{name}", self.logs_dir / name)
             except Exception as e:
-                self.logger.info("log capture %s failed: %s", name, e)
+                self.logger.warning("log capture %s failed: %s", name, e)

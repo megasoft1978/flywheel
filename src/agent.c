@@ -1,39 +1,9 @@
 #include "flywheel.h"
 #include <time.h>
 
-#define MAXRECENT 16
 #define MAXPRUNES 8
 #define MAXRESETS 2
 
-typedef struct {
-    char *cmds[MAXRECENT];
-    int n;
-} Recent;
-
-static void rec_push(Recent *r, const char *c) {
-    if (r->n == MAXRECENT) { free(r->cmds[0]); memmove(r->cmds, r->cmds + 1, (MAXRECENT - 1) * sizeof(char *)); r->n--; }
-    r->cmds[r->n++] = str_dup(c);
-}
-static void rec_clear(Recent *r) { for (int i = 0; i < r->n; i++) free(r->cmds[i]); r->n = 0; }
-static void rec_free(Recent *r) { rec_clear(r); }
-
-static const char *detect_loop(Recent *r, int *clen) {
-    int n = r->n;
-    if (n >= 3 && sim_ratio(r->cmds[n-1], r->cmds[n-2]) > 0.82
-              && sim_ratio(r->cmds[n-2], r->cmds[n-3]) > 0.82) { *clen = 3; return "p1"; }
-    if (n >= 4 && sim_ratio(r->cmds[n-1], r->cmds[n-3]) > 0.82
-              && sim_ratio(r->cmds[n-2], r->cmds[n-4]) > 0.82) { *clen = 4; return "p2"; }
-    if (n >= 6 && sim_ratio(r->cmds[n-1], r->cmds[n-4]) > 0.82
-              && sim_ratio(r->cmds[n-2], r->cmds[n-5]) > 0.82
-              && sim_ratio(r->cmds[n-3], r->cmds[n-6]) > 0.82) { *clen = 6; return "p3"; }
-    if (n >= 5) {
-        int cnt = 0, lo = n - 8 < 0 ? 0 : n - 8;
-        for (int i = lo; i < n - 1; i++)
-            if (sim_ratio(r->cmds[i], r->cmds[n-1]) > 0.88) cnt++;
-        if (cnt >= 3) { *clen = 3; return "rep"; }
-    }
-    return NULL;
-}
 
 static char *gate_out(const Profile *prof, const char *cwd) {
     if (!prof->gate_cmd) return str_dup("");
@@ -267,7 +237,7 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
             }
             emit(ui, ui->emit_out, out);
             msgs_push_tool(msgs, cJSON_IsString(id) ? id->valuestring : "", out);
-            rec_push(&rec, reckey);
+            rec_push(&rec, reckey, out);
             if (tr) {
                 cJSON *e = cJSON_CreateObject();
                 cJSON_AddStringToObject(e, "tool_out", out);
@@ -310,7 +280,7 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
             escape_turns = 2;
             char *go = gate_out(prof, g_cfg.cwd);
             char *files = run_bash(
-                "find . -maxdepth 3 -path ./node_modules -prune -o -type f \\( -name '*.ts' -o -name '*.tsx' -o -name '*.py' -o -name '*.go' -o -name '*.rs' -o -name '*.js' \\) -print | head -25",
+                "find . -maxdepth 3 \\( -name node_modules -o -name .git \\) -prune -o -type f -print | head -40",
                 g_cfg.cwd, 10);
             char pb[8192];
             if (prunes % 2 == 0 && resets < MAXRESETS) {
@@ -357,7 +327,7 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
                  "finish=%s turns=%d prunes=%d gates=%d resets=%d calls=%d tokens=%d secs=%.0f",
                  finish, turns, prunes, gates, resets, calls, toks, secs);
     if (tr) fclose(tr);
-    rec_free(&rec);
+    rec_clear(&rec);
     free(starts);
     free(taskmsg);
     return finish;

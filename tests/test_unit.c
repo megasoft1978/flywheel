@@ -81,6 +81,21 @@ static void test_args_extract(void) {
 static void test_sim(void) {
     T("identical ~1", sim_ratio("abc", "abc") > 0.99);
     T("different low", sim_ratio("abc", "xyz") < 0.4);
+    {
+        static const char *c = "cat > v.pl <<'EOF'\nuse strict; use warnings; sub rc {...} # same boilerplate";
+        static const char *o[] = {"prefix=215 suffix=3376", "forward reconstructs output: NO",
+                                  "num solutions: 104"};
+        Recent r = {0};
+        int len = 0;
+        for (int i = 0; i < 3; i++) rec_push(&r, c, o[i]);
+        T("similar commands, new results: not a loop", !detect_loop(&r, &len));
+        rec_clear(&r);
+        for (int i = 0; i < 3; i++) rec_push(&r, c, o[1]);
+        T("same command, same result: loop", detect_loop(&r, &len) != NULL);
+        for (int i = 0; i < 40; i++) rec_push(&r, c, o[i % 3]);
+        T("history is bounded", r.n == MAXRECENT);
+        rec_clear(&r);
+    }
     T("null-safe a", sim_ratio(NULL, "abc") == 0 || sim_ratio(NULL, "abc") >= 0);
     T("empty safe", sim_ratio("", "") >= 0);
 }

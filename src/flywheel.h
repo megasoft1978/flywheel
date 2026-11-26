@@ -108,6 +108,17 @@ void  args_note_repair(const char *kind);               /* bumps repair stats */
 /* sim.c */
 double sim_ratio(const char *a, const char *b);         /* 0..1, caps at 700 chars each */
 
+/* recent tool calls, for the loop breaker */
+#define MAXRECENT 16
+typedef struct {
+    char *cmds[MAXRECENT];
+    char *outs[MAXRECENT];
+    int n;
+} Recent;
+void rec_push(Recent *r, const char *cmd, const char *out);
+void rec_clear(Recent *r);
+const char *detect_loop(const Recent *r, int *clen);
+
 /* profile.c */
 typedef struct {
     const char *name;
