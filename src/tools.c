@@ -198,15 +198,31 @@ static const char *check_simple(char **v, int n, const char *cwd, int depth) {
     if (!strcmp(base, "sudo") || !strcmp(base, "doas") || !strcmp(base, "shutdown") ||
         !strcmp(base, "reboot") || !strncmp(base, "mkfs", 4))
         return E_RULE;
-    if (one_of(base, shells) || !strcmp(base, "eval")) {
-        bool isev = !strcmp(base, "eval"), c = isev;
+    if (!strcmp(base, "eval")) {                  /* eval joins its arguments */
+        size_t len = 1;
+        for (int k = 0; k < na; k++) len += strlen(a[k]) + 1;
+        char *j = malloc(len), *q = j;
+        for (int k = 0; k < na; k++) q += sprintf(q, "%s ", a[k]);
+        *q = 0;
+        const char *e = strchr(j, OPAQUE) ? E_RULE : scan_script(j, cwd, depth + 1);
+        free(j);
+        return e;
+    }
+    if (one_of(base, shells)) {
+        bool c = false;
         for (int k = 0; k < na; k++) {
-            if (!isev && a[k][0] == '-') { if (a[k][1] != '-' && strchr(a[k], 'c')) c = true; continue; }
+            const char *o = a[k];
+            if ((o[0] == '-' || o[0] == '+') && o[1]) {
+                if (!strcmp(o, "--rcfile") || !strcmp(o, "--init-file")) k++;
+                else if (o[1] != '-') {
+                    if (o[0] == '-' && strchr(o, 'c')) c = true;
+                    if (strchr("oO", o[strlen(o) - 1])) k++;   /* takes a value */
+                }
+                continue;
+            }
             if (!c) break;
-            if (strchr(a[k], OPAQUE)) return E_RULE;   /* would be re-parsed */
-            const char *e = scan_script(a[k], cwd, depth + 1);
-            if (e) return e;
-            if (!isev) break;
+            if (strchr(o, OPAQUE)) return E_RULE;   /* would be re-parsed */
+            return scan_script(o, cwd, depth + 1);
         }
         return NULL;
     }
@@ -262,7 +278,12 @@ static const char *scan_script(const char *s, const char *cwd, int depth) {
         if (c == '#') { while (*p && *p != '\n') p++; continue; }
         if (c == '$' && p[1] == '(' && p[2] == '(') {   /* arithmetic */
             const char *e = strstr(p + 3, "))");
-            if (e) { p = e + 2; continue; }
+            /* skip only plain arithmetic; anything else is scanned */
+            if (e && strspn(p + 3, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                                   "0123456789_ $+-*/%<>=!?:^~.") >= (size_t)(e - p - 3)) {
+                p = e + 2;
+                continue;
+            }
         }
         if (c == '>' || (c == '&' && p[1] == '>')) {
             p += c == '&' ? 2 : 1;

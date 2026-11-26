@@ -708,10 +708,15 @@ static void test_autoallow_expansion(void) {
         static const char *blocked[] = {"echo x > $'\\x2fetc/evil'", "echo x > $\"/etc/evil\"",
             "echo x > $'/etc/evil'", "rm -rf {..,x}", "rm -rf .*", "rm -rf sub/.?",
             "$'\\x73udo' ls", "$'sudo' ls",
-            "bash -c $'rm\\t-rf\\t/etc;true'", "eval $'sudo\\x20ls\\ntrue'", NULL};
+            "bash -c $'rm\\t-rf\\t/etc;true'", "eval $'sudo\\x20ls\\ntrue'",
+            "eval sudo ls", "eval rm '-rf /etc'", "bash -o pipefail -c 'rm -rf /etc'",
+            "bash -eo pipefail -c 'sudo ls'", "bash +O extglob -c 'sudo ls'",
+            "bash --rcfile x -c 'sudo ls'", "echo $(( $(sudo ls) ))", "echo $((sudo ls); (true))",
+            "x=$(( `sudo ls` ))", NULL};
         for (int i = 0; blocked[i]; i++) T(blocked[i], deny_check(blocked[i], projdir) != NULL);
         static const char *fine[] = {"rm -rf build/*", "echo x > out.txt", "printf $'a\\n' > o",
-            "rm -f .env.bak", "rm -rf .next*", "mv .eslintrc* config", "echo x > ${HOME_X}f", NULL};
+            "rm -f .env.bak", "rm -rf .next*", "mv .eslintrc* config",
+            "echo $((1 << 2))", "echo $(( n > 3 ))", "bash -o pipefail -c 'ls | head'", "echo x > ${HOME_X}f", NULL};
         for (int i = 0; fine[i]; i++) T(fine[i], deny_check(fine[i], projdir) == NULL);
         static char many[20000];
         strcpy(many, "rm -rf");
