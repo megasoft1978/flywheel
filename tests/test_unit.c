@@ -707,7 +707,8 @@ static void test_autoallow_expansion(void) {
     {
         static const char *blocked[] = {"echo x > $'\\x2fetc/evil'", "echo x > $\"/etc/evil\"",
             "echo x > $'/etc/evil'", "rm -rf {..,x}", "rm -rf .*", "rm -rf sub/.?",
-            "$'\\x73udo' ls", "$'sudo' ls", NULL};
+            "$'\\x73udo' ls", "$'sudo' ls",
+            "bash -c $'rm\\t-rf\\t/etc;true'", "eval $'sudo\\x20ls\\ntrue'", NULL};
         for (int i = 0; blocked[i]; i++) T(blocked[i], deny_check(blocked[i], projdir) != NULL);
         static const char *fine[] = {"rm -rf build/*", "echo x > out.txt", "printf $'a\\n' > o",
             "rm -f .env.bak", "rm -rf .next*", "mv .eslintrc* config", "echo x > ${HOME_X}f", NULL};

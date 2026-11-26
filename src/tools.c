@@ -203,6 +203,7 @@ static const char *check_simple(char **v, int n, const char *cwd, int depth) {
         for (int k = 0; k < na; k++) {
             if (!isev && a[k][0] == '-') { if (a[k][1] != '-' && strchr(a[k], 'c')) c = true; continue; }
             if (!c) break;
+            if (strchr(a[k], OPAQUE)) return E_RULE;   /* would be re-parsed */
             const char *e = scan_script(a[k], cwd, depth + 1);
             if (e) return e;
             if (!isev) break;
