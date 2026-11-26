@@ -87,10 +87,12 @@ char *deny_check(const char *cmd, const char *cwd);              /* NULL=ok, els
 char *heredoc_fix(const char *cmd);                              /* returns new or copy */
 bool  cmd_is_write(const char *cmd);
 
-/* permission rules: builtin safe reads + ~/.config/flywheel/allow + .flywheel.allow */
+/* permission rules: builtin safe reads + ~/.config/flywheel/allow +
+   ~/.config/flywheel/projects/<project>.allow (never read from the project) */
 bool  perm_allowed(const char *cmd);   /* rule match — no prompt needed */
 void  perm_load(void);                 /* load rule files once */
-void  perm_add_rule(const char *rule); /* remember + persist to project file */
+void  perm_add_rule(const char *rule); /* remember + persist per project */
+bool  perm_project_file(char *out, size_t cap); /* path of this project's rules */
 char *perm_prefix(const char *cmd);    /* derived prefix rule for "always" (malloc'd) */
 void  perm_free(void);
 
@@ -100,6 +102,7 @@ char *args_extract_key(const char *raw_args_json, const char *key);  /* malloc'd
 const char *resolve_confined(const char *cwd, const char *path, char *out, size_t cap, bool for_write);
 char *tool_write_file(const char *cwd, const char *path, const char *content);   /* malloc'd status */
 char *tool_edit_file(const char *cwd, const char *path, const char *old_str, const char *new_str);
+cJSON *args_parse_strict(const char *raw);  /* complete JSON object or NULL */
 void  args_note_repair(const char *kind);               /* bumps repair stats */
 
 /* sim.c */
@@ -152,6 +155,7 @@ int   fw_do_setup(void);
 char *fw_build_system(bool interactive);
 
 /* bench.c — suite runner; argv[0]=suite-dir, argv[1]=tag, rest=task ids */
+int   fw_copy_file(const char *src, const char *dst);  /* binary-safe, keeps mode */
 int   fw_do_bench(int argc, char **argv);
 
 /* util */
@@ -160,6 +164,8 @@ char *str_ndup(const char *, size_t);
 char *read_file(const char *path);                  /* NULL on fail */
 void  ftrim_mid(char *s, int head, int tail);       /* keep head+tail chars, mark middle */
 void  utf8_sanitize(char *s);                       /* tools.c — JSON-safe bytes */
+char *clean_text(const char *s, bool crlf, bool strict); /* terminal-safe copy, malloc'd */
+char *tty_text(const char *s, bool crlf);           /* clean_text only if stdout is a tty */
 
 #define DIM   "\033[2m"
 #define BOLD  "\033[1m"
@@ -173,4 +179,5 @@ void  utf8_sanitize(char *s);                       /* tools.c — JSON-safe byt
 #define RESET "\033[0m"
 #define CLR_LINE "\033[2K\r"
 
+bool safe_repo_filename(const char *s);
 #endif

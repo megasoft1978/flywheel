@@ -1,3 +1,4 @@
+#define _DARWIN_C_SOURCE 1   /* O_NOFOLLOW */
 #include "flywheel.h"
 #ifndef FW_MINI_HTTP
 #include <curl/curl.h>
@@ -7,11 +8,15 @@
 #include <signal.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
 
 Cfg g_cfg;
 volatile sig_atomic_t g_abort = 0;
 
 static void on_sigint(int s) { (void)s; g_abort = 1; }
+/* a handler, not SIG_IGN: exec'd commands get the default SIGPIPE back */
+static void on_sigpipe(int s) { (void)s; }
 
 static void usage(FILE *f) {
     fprintf(f,
@@ -101,15 +106,32 @@ static char *build_system(const Profile *prof, bool interactive) {
 }
 
 /* non-interactive output: plain, claude-code-ish glyphs */
-static void p_text(const char *s, void *ud) { (void)ud; fputs(s, stdout); fflush(stdout); }
-static void p_think(const char *s, void *ud) { (void)ud; if (!g_cfg.quiet) { printf(DIM "%s" RESET, s); fflush(stdout); } }
-static void p_tool(const char *name, const char *c, void *ud) { (void)ud; if (!g_cfg.quiet) { printf(CYAN "⏺" RESET " %s(%.100s%s)\n", name ? name : "Bash", c, strlen(c) > 100 ? "…" : ""); fflush(stdout); } }
+static void p_text(const char *s, void *ud) { (void)ud;
+    char *c = tty_text(s, true);
+    fputs(c, stdout); fflush(stdout);
+    free(c);
+}
+static void p_think(const char *s, void *ud) { (void)ud;
+    if (g_cfg.quiet) return;
+    char *c = tty_text(s, true);
+    printf(DIM "%s" RESET, c); fflush(stdout);
+    free(c);
+}
+static void p_tool(const char *name, const char *cmd, void *ud) { (void)ud;
+    if (g_cfg.quiet) return;
+    char *c = tty_text(cmd, false);
+    printf(CYAN "⏺" RESET " %s(%.100s%s)\n", name ? name : "Bash", c, strlen(c) > 100 ? "…" : "");
+    fflush(stdout);
+    free(c);
+}
 static void p_out(const char *o, void *ud) { (void)ud;
     if (g_cfg.quiet) return;
-    int nl = 0; const char *s = o;
-    for (const char *p = o; *p; p++) if (*p == '\n') nl++;
+    char *c = tty_text(o, true);
+    int nl = 0; const char *s = c;
+    for (const char *p = c; *p; p++) if (*p == '\n') nl++;
     if (nl > 8) { int k = nl - 8; while (k-- && (s = strchr(s, '\n'))) s++; }
     printf(GRAY "  ⎿  %.3000s" RESET "\n", s); fflush(stdout);
+    free(c);
 }
 static void p_status(const char *s, void *ud) { (void)s; (void)ud; }
 static void p_event(const char *k, const char *d, void *ud) { (void)ud;
@@ -223,6 +245,9 @@ static int hf_download(const char *repo, const char *dir) {
         cJSON *name = cJSON_GetObjectItemCaseSensitive(f, "rfilename");
         if (!cJSON_IsString(name)) continue;
         if (strstr(name->valuestring, ".git")) continue;
+        if (!safe_repo_filename(name->valuestring)) {   /* goes into system() */
+            fprintf(stderr, "refusing unsafe file name from server\n"); rc = 1; break;
+        }
         char cmd[2048];
         snprintf(cmd, sizeof cmd,
             "aria2c -x 4 -s 4 -k 1M -c -d \"%s\" -o \"%s\" \"https://huggingface.co/%s/resolve/main/%s\"",
@@ -305,10 +330,11 @@ int fw_do_init(void) {
     printf("gate:    %s\n", prof->gate_cmd ? prof->gate_cmd : "(none)");
     char md[1024];
     snprintf(md, sizeof md, "%s/.flywheel.md", g_cfg.cwd);
-    struct stat st;
-    if (stat(md, &st) != 0) {
+    /* O_EXCL: a symlink planted by the project is never written through */
+    int fd = open(md, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0666);
+    if (fd >= 0) {
         const char *base = strrchr(g_cfg.cwd, '/');
-        FILE *f = fopen(md, "w");
+        FILE *f = fdopen(fd, "w");
         if (f) {
             fprintf(f,
                 "# %s — flywheel project notes\n\n"
@@ -321,7 +347,9 @@ int fw_do_init(void) {
             fclose(f);
             printf("wrote:   %s (edit to taste — loaded into the system prompt)\n", md);
         }
-    } else printf("exists:  %s (left untouched)\n", md);
+        else close(fd);
+    } else if (errno == EEXIST) printf("exists:  %s (left untouched)\n", md);
+    else printf("failed:  %s: %s\n", md, strerror(errno));
     char *models = http_get("/models");
     if (!models) {
         printf("engine:  %s — " RED "unreachable" RESET "\n", g_cfg.endpoint);
@@ -340,6 +368,7 @@ int fw_do_init(void) {
 }
 
 int main(int argc, char **argv) {
+    signal(SIGPIPE, on_sigpipe);
     setlocale(LC_CTYPE, "");
     /* GUI-launched terminals often have no LANG in env; fall back to explicit
        UTF-8 so wcwidth/mbrtowc decode emoji + box glyphs correctly */
@@ -365,7 +394,18 @@ int main(int argc, char **argv) {
         #define REQD(d) (i + 1 < argc ? argv[++i] : (d))
         if (!strcmp(a, "-e")) g_cfg.endpoint = str_dup(REQ);
         else if (!strcmp(a, "-m")) g_cfg.model = str_dup(REQ);
-        else if (!strcmp(a, "-C")) { g_cfg.cwd = str_dup(REQ); }
+        else if (!strcmp(a, "-C")) {
+            const char *dir = REQ;
+            char *real = dir ? realpath(dir, NULL) : NULL;
+            struct stat st;
+            if (!real || stat(real, &st) || !S_ISDIR(st.st_mode)) {
+                fprintf(stderr, dir ? "-C: not a directory: %s\n" : "-C needs a directory argument\n", dir);
+                free(real);
+                return 2;
+            }
+            free(g_cfg.cwd);
+            g_cfg.cwd = real;
+        }
         else if (!strcmp(a, "-P")) g_cfg.profile = str_dup(REQ);
         else if (!strcmp(a, "-f")) g_cfg.prompt_file = str_dup(REQ);
         else if (!strcmp(a, "-T")) g_cfg.maxturns = atoi(REQD("60"));
@@ -429,7 +469,9 @@ int main(int argc, char **argv) {
                  .interactive = false};
         char sum[256];
         const char *fin = agent_run(&msgs, &ui, sum, sizeof sum);
-        printf("\n" GREEN "●" RESET " flywheel: %s\n", sum);
+        char *safe = tty_text(sum, false);   /* finish carries server text */
+        printf("\n" GREEN "●" RESET " flywheel: %s\n", safe);
+        free(safe);
         msgs_free(&msgs);
         #ifndef FW_MINI_HTTP
         curl_global_cleanup();

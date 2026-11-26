@@ -55,7 +55,7 @@ static const struct { const char *cmd, *desc; } SLASH[] = {
     {"/init",   "write .flywheel.md project notes + check engine"},
     {"/clear",  "clear conversation and screen"},
     {"/model",  "show or switch model (/model NAME)"},
-    {"/allow",  "list permission rules (.flywheel.allow)"},
+    {"/allow",  "list this project's permission rules"},
     {"/status", "engine, model, profile, conversation size"},
     {"/help",   "keys, mouse, and commands"},
     {"/exit",   "quit flywheel"},
@@ -101,6 +101,9 @@ typedef struct {
     int nopts;
     int sel;
     int opt_row_start;        /* 0-based screen row of option 0 (for mouse click) */
+    bool approval;            /* every option but the last one grants something */
+    int body_scroll, body_vis, body_total, body_w;
+    int body_seen;            /* body lines 0..body_seen-1 have been on screen */
 } Modal;
 
 static Modal *active_modal = NULL;
@@ -143,10 +146,39 @@ static void fmt_toks(int n, char *out, size_t cap) {
     else snprintf(out, cap, "%d", n);
 }
 
+/* ---------- untrusted text ---------- */
+
+static int utf8_cell_width(const char *s, int max, int *blen);
+
+/* single-line variant into a fixed buffer */
+static const char *clean_line_x(char *dst, size_t cap, const char *s, bool strict) {
+    char *c = clean_text(s, false, strict);
+    for (char *p = c; *p; p++) if (*p == '\n' || *p == '\t') *p = ' ';
+    snprintf(dst, cap, "%s", c);
+    free(c);
+    return dst;
+}
+
+static const char *clean_line(char *dst, size_t cap, const char *s) {
+    return clean_line_x(dst, cap, s, false);
+}
+
+/* bytes of s that fit in width terminal cells */
+static int fit_bytes(const char *s, int width) {
+    int len = (int)strlen(s), i = 0, w = 0;
+    while (i < len) {
+        int bl = 0;
+        w += utf8_cell_width(s + i, len - i, &bl);
+        if (w > width) break;
+        i += bl > 0 ? bl : 1;
+    }
+    return i;
+}
+
 static void detect_project_meta(void) {
     const char *base = strrchr(g_cfg.cwd, '/');
-    snprintf(g_stat.proj_name, sizeof g_stat.proj_name, "%s",
-             (base && base[1]) ? base + 1 : g_cfg.cwd);
+    clean_line(g_stat.proj_name, sizeof g_stat.proj_name,
+               (base && base[1]) ? base + 1 : g_cfg.cwd);
     g_stat.git_branch[0] = 0;
     char *br = run_bash("git rev-parse --abbrev-ref HEAD 2>/dev/null", g_cfg.cwd, 2);
     if (br) {
@@ -154,7 +186,7 @@ static void detect_project_meta(void) {
         if (nl) *nl = 0;
         if (*br && strcmp(br, "HEAD") && strncmp(br, "(no output)", 11) && strncmp(br, "fatal:", 6) &&
             strncmp(br, "error:", 6) && !strstr(br, "exit ")) {
-            snprintf(g_stat.git_branch, sizeof g_stat.git_branch, "%.60s", br);
+            clean_line(g_stat.git_branch, 61, br);
         }
         free(br);
     }
@@ -288,6 +320,7 @@ static int layout_input(VLine *vlines, int maxv, int inner_w, int *cur_vl, int *
         }
         int bl = 0;
         int cw = utf8_cell_width(inbuf + i, ilen - i, &bl);
+        if (inbuf[i] == '\t') cw = 1;   /* drawn as one space */
         if (bl <= 0) bl = 1;
         if (w + cw > inner_w && i > ls) {
             if (nv < maxv) { vlines[nv].start = ls; vlines[nv].len = i - ls; nv++; }
@@ -363,6 +396,8 @@ static void vb_wrap(VBuf *vb, const char *text, const char *prefix0, int p0_w,
 
     const char *p = text;
     bool first = true;
+    const char *link = NULL;   /* OSC 8 opener still open at the end of a row */
+    size_t link_len = 0;
     for (;;) {
         size_t lw = 0;
         const char *pfx = first ? prefix0 : prefix_cont;
@@ -377,6 +412,11 @@ static void vb_wrap(VBuf *vb, const char *text, const char *prefix0, int p0_w,
         if (style_open && *style_open) {
             size_t sl = strlen(style_open);
             if (lw + sl < lcap - 64) { memcpy(line + lw, style_open, sl); lw += sl; }
+        }
+        if (link && lw + link_len + 16 < lcap - 64) {
+            memcpy(line + lw, link, link_len); lw += link_len;
+            lw += (size_t)snprintf(line + lw, lcap - lw, "\033[4m" CYAN);
+            had_esc = true;
         }
 
         while (*p) {
@@ -398,7 +438,15 @@ static void vb_wrap(VBuf *vb, const char *text, const char *prefix0, int p0_w,
                     if (*p == '\007') p++;
                 } else if (*p) p++;
                 size_t el = (size_t)(p - s0);
-                if (lw + el < lcap - 64) { memcpy(line + lw, s0, el); lw += el; }
+                if (lw + el < lcap - 64) {
+                    memcpy(line + lw, s0, el); lw += el;
+                    if (el > 5 && !memcmp(s0, "\033]8;", 4)) {
+                        const char *u = memchr(s0 + 4, ';', el - 4);
+                        bool opens = u && u[1] != '\033' && u[1] != '\007';
+                        link = opens ? s0 : NULL;
+                        link_len = opens ? el : 0;
+                    }
+                }
                 continue;
             }
             if (*p == '\t') {
@@ -417,6 +465,8 @@ static void vb_wrap(VBuf *vb, const char *text, const char *prefix0, int p0_w,
             col += cw;
             p += bl;
         }
+        if (link)   /* close now, reopen on the continuation row */
+            lw += (size_t)snprintf(line + lw, lcap - lw, "\033]8;;\033\\\033[24m\033[39m");
         if (style_close && *style_close) {
             size_t sl = strlen(style_close);
             if (lw + sl < lcap - 16) { memcpy(line + lw, style_close, sl); lw += sl; }
@@ -722,6 +772,7 @@ static void md_render_table(VBuf *vb, const char **lines, const size_t *lens, in
                 w += cw;
                 p += bl;
             }
+            if (*p) md_cat(&row, "\033]8;;\033\\" RESET);   /* cut inside a link */
             if (r == 0) md_cat(&row, RESET);
             while (w < colw[c]) { md_cat(&row, " "); w++; }
             md_cat(&row, " " DIM "│" RESET);
@@ -785,6 +836,8 @@ static void vb_markdown(VBuf *vb, const char *text) {
                 md_cat(&h, "  " DIM "╭");
                 int used = 3;
                 if (llen > 0) {
+                    if ((int)llen > rule_w - 8) llen = (size_t)(rule_w > 8 ? rule_w - 8 : 0);
+                    while (llen > 0 && ((unsigned char)lang[llen] & 0xC0) == 0x80) llen--;
                     md_cat(&h, "─ ");
                     md_catn(&h, lang, llen);
                     md_cat(&h, " ");
@@ -912,9 +965,7 @@ static int count_lines(const char *s) {
     return n;
 }
 
-static void build_transcript(VBuf *vb) {
-    for (int i = 0; i < nitems; i++) {
-        TItem *it = &items[i];
+static void build_item(VBuf *vb, const TItem *it, int i) {
         if (it->kind == T_RAW) {
             vb_wrap(vb, it->text ? it->text : "", "", 0, "", 0, "", "", -1);
         } else if (it->kind == T_USER) {
@@ -974,7 +1025,7 @@ static void build_transcript(VBuf *vb) {
                      (strchr(c, '\n') || strlen(c) > 140) ? "…" : "", tail);
             vb_wrap(vb, hdr, "", 0, "  ", 2, "", "", i);
 
-            if (!it->out) continue;
+            if (!it->out) return;
             int nl = count_lines(it->out);
             if (!it->expanded) {
                 /* Collapsed view (Claude Code style): up to 2 preview lines + "+N lines" hint */
@@ -1020,32 +1071,47 @@ static void build_transcript(VBuf *vb) {
                 vb_push(vb, hint, i);
             }
         }
+}
+
+static void build_transcript(VBuf *vb) {
+    for (int i = 0; i < nitems; i++) {
+        TItem v = items[i];
+        if (v.kind == T_RAW) { build_item(vb, &v, i); continue; }
+        v.text = clean_text(items[i].text, true, false);
+        v.out = items[i].out ? clean_text(items[i].out, true, false) : NULL;
+        build_item(vb, &v, i);
+        free(v.text);
+        free(v.out);
     }
 }
 
-/* word-ish wrap modal body text into fixed-width display lines (render-local buffer) */
-static char mbody_lines[24][160];
-static int wrap_modal_body(const char *body, int width, int maxlines) {
-    int n = 0, w = 0, col = 0;
-    if (!body || !*body) return 0;
-    for (const char *p = body; *p && n < maxlines;) {
-        if (*p == '\n') {
-            mbody_lines[n][w] = 0; n++; w = col = 0; p++;
+/* Wrap the whole (already sanitized) modal body to width cells; nothing is cut. */
+static void wrap_modal_body(VBuf *vb, const char *body, int width) {
+    MdBuf row = {0};
+    md_catn(&row, "", 0);
+    int col = 0, len = (int)strlen(body);
+    for (int i = 0; i < len;) {
+        if (body[i] == '\n') {
+            vb_push(vb, row.b, -1);
+            row.n = 0; row.b[0] = 0; col = 0; i++;
             continue;
         }
-        int bl = 0;
-        int cw = utf8_cell_width(p, (int)strlen(p), &bl);
-        if (bl <= 0) { p++; continue; }
-        if (col + cw > width && w > 0) {
-            mbody_lines[n][w] = 0; n++; w = col = 0;
-            if (n >= maxlines) break;
+        int bl = 1, cw = 1;
+        if (body[i] != '\t') cw = utf8_cell_width(body + i, len - i, &bl);
+        if (bl <= 0) bl = 1;
+        if (col + cw > width && col > 0) {
+            vb_push(vb, row.b, -1);
+            row.n = 0; row.b[0] = 0; col = 0;
         }
-        if (w + bl < 159) { memcpy(mbody_lines[n] + w, p, (size_t)bl); w += bl; }
-        col += cw; p += bl;
+        md_catn(&row, body[i] == '\t' ? " " : body + i, (size_t)bl);
+        col += cw; i += bl;
     }
-    if (n < maxlines && (w > 0 || n == 0)) { mbody_lines[n][w] = 0; n++; }
-    return n;
+    if (row.n) vb_push(vb, row.b, -1);
+    free(row.b);
 }
+
+/* lines of an approval body that were never on screen */
+static int modal_unseen(const Modal *m) { return m->body_total - m->body_seen; }
 
 /* ---------- full-screen atomic renderer ---------- */
 
@@ -1165,16 +1231,32 @@ static void render_screen(void) {
     VLine vl[MAX_VLINES];
     int cur_vl = 0, cur_col = 0, nv = 1, vis = 1, vstart = 0;
     int mc = 0, ch = 0;
-    int modal_body_lines = 0;
+    VBuf mb = {0};
+    int modal_blank = 0;
 
     if (active_modal) {
-        int bcap = rows / 3;
-        if (bcap < 2) bcap = 2;
-        if (bcap > 24) bcap = 24;
-        int bn = wrap_modal_body(active_modal->body, inner_w > 4 ? inner_w - 4 : inner_w, bcap);
-        modal_body_lines = bn > 0 ? bn + 1 : 0; /* wrapped body rows + blank */
-        ch = 2 /*borders*/ + modal_body_lines + 1 /*prompt*/ + active_modal->nopts + 1 /*status*/;
-        if (ch > rows - 2) { modal_body_lines = 0; ch = 2 + 1 + active_modal->nopts + 1; }
+        Modal *m = active_modal;
+        if (m->body && *m->body) {
+            char *body = clean_text(m->body, false, true);
+            wrap_modal_body(&mb, body, inner_w);
+            free(body);
+        }
+        if (m->body_w != inner_w) { m->body_w = inner_w; m->body_scroll = m->body_seen = 0; }
+        int fixed = 2 /*borders*/ + 1 /*prompt*/ + m->nopts + 1 /*status*/;
+        int vis_b = rows - fixed;
+        if (vis_b > mb.n) vis_b = mb.n;
+        if (vis_b < 0) vis_b = 0;
+        m->body_vis = vis_b;
+        m->body_total = mb.n;
+        if (m->body_scroll > mb.n - vis_b) m->body_scroll = mb.n - vis_b;
+        if (m->body_scroll < 0) m->body_scroll = 0;
+        modal_blank = mb.n > 0 && rows - fixed > vis_b;
+        ch = fixed + vis_b + modal_blank;
+        /* count lines as seen only if the real terminal can hold the modal */
+        struct winsize ws;
+        bool fits = ioctl(1, TIOCGWINSZ, &ws) != 0 || (ws.ws_row >= fixed + vis_b && ws.ws_col >= cols);
+        if (fits && m->body_scroll <= m->body_seen && m->body_scroll + vis_b > m->body_seen)
+            m->body_seen = m->body_scroll + vis_b;
     } else {
         nv = layout_input(vl, MAX_VLINES, inner_w, &cur_vl, &cur_col);
         vis = nv > 4 ? 4 : nv;
@@ -1188,7 +1270,7 @@ static void render_screen(void) {
     }
 
     int view_h = rows - ch;
-    if (view_h < 1) view_h = 1;
+    if (view_h < 1) view_h = active_modal ? 0 : 1;
 
     /* Build transcript visual rows & clamp scroll_off */
     VBuf vb = {0};
@@ -1232,37 +1314,49 @@ static void render_screen(void) {
         printf("\033[%d;1H" CLR_LINE, r++);
         draw_titled_top(m->title, box_w);
 
-        if (modal_body_lines > 0) {
-            int bn = modal_body_lines - 1;
-            for (int bi = 0; bi < bn; bi++, r++)
-                printf("\033[%d;1H" CLR_LINE YELLOW "│" RESET " " BOLD "%s" RESET "\033[%d;%dH" YELLOW "│" RESET,
-                       r, mbody_lines[bi], r, cols);
+        for (int bi = 0; bi < m->body_vis; bi++, r++)
+            printf("\033[%d;1H" CLR_LINE YELLOW "│" RESET " " BOLD "%s" RESET "\033[%d;%dH" YELLOW "│" RESET,
+                   r, mb.v[m->body_scroll + bi].s, r, cols);
+        if (modal_blank) {
             printf("\033[%d;1H" CLR_LINE YELLOW "│" RESET "\033[%d;%dH" YELLOW "│" RESET, r, r, cols);
             r++;
         }
 
+        char line[4096];
+        clean_line_x(line, sizeof line, m->prompt, true);
         printf("\033[%d;1H" CLR_LINE YELLOW "│" RESET " %.*s\033[%d;%dH" YELLOW "│" RESET,
-               r, inner_w, m->prompt ? m->prompt : "", r, cols);
+               r, fit_bytes(line, inner_w), line, r, cols);
         r++;
 
         m->opt_row_start = r - 1;   /* 0-based screen row of option 0 */
         for (int i = 0; i < m->nopts; i++, r++) {
             int omax = inner_w - 6;
             if (omax < 10) omax = 10;
+            clean_line_x(line, sizeof line, m->opts[i], true);
             if (i == m->sel)
                 printf("\033[%d;1H" CLR_LINE YELLOW "│" RESET " " CYAN BOLD "▸ %d. %.*s" RESET "\033[%d;%dH" YELLOW "│" RESET,
-                       r, i + 1, omax, m->opts[i], r, cols);
+                       r, i + 1, fit_bytes(line, omax), line, r, cols);
             else
                 printf("\033[%d;1H" CLR_LINE YELLOW "│" RESET "   " DIM "%d. " RESET "%.*s\033[%d;%dH" YELLOW "│" RESET,
-                       r, i + 1, omax, m->opts[i], r, cols);
+                       r, i + 1, fit_bytes(line, omax), line, r, cols);
         }
 
         printf("\033[%d;1H" CLR_LINE YELLOW "╰", r++);
         for (int i = 0; i < box_w; i++) fputs("─", stdout);
         fputs("╯" RESET, stdout);
 
-        printf("\033[%d;1H" CLR_LINE DIM " ↑↓ choose · Enter/1-%d or click · Esc cancel" RESET,
-               rows, m->nopts);
+        int below = m->body_total - m->body_scroll - m->body_vis;
+        if (m->body_total > m->body_vis) {
+            if (m->approval && modal_unseen(m) > 0)
+                snprintf(line, sizeof line, " ▲%d ▼%d lines hidden · PgDn/Space/wheel · view all to allow",
+                         m->body_scroll, below);
+            else
+                snprintf(line, sizeof line, " ▲%d ▼%d lines hidden · PgUp/PgDn · Enter · Esc cancel",
+                         m->body_scroll, below);
+        } else {
+            snprintf(line, sizeof line, " ↑↓ choose · Enter/1-%d or click · Esc cancel", m->nopts);
+        }
+        printf("\033[%d;1H" CLR_LINE DIM "%.*s" RESET, rows, fit_bytes(line, cols - 1), line);
         /* Hide cursor on modal menu (or park at selected row) */
         printf("\033[%d;3H", m->opt_row_start + m->sel + 1);
     } else {
@@ -1279,7 +1373,8 @@ static void render_screen(void) {
                 fputs(CYAN BOLD "›" RESET " ", stdout);
                 if (ilen == 0) fputs(DIM "Type a message, / for commands" RESET, stdout);
             } else fputs("  ", stdout);
-            if (l->len > 0) fwrite(inbuf + l->start, 1, (size_t)l->len, stdout);
+            for (int k = 0; k < l->len; k++)
+                putchar(inbuf[l->start + k] == '\t' ? ' ' : inbuf[l->start + k]);
             printf("\033[%d;%dH" DIM "│" RESET, r, cols);
         }
 
@@ -1320,9 +1415,10 @@ static void render_screen(void) {
 
     end_sync();
     vb_free(&vb);
+    vb_free(&mb);
 }
 
-static void set_status(const char *s) { snprintf(status, sizeof status, "%s", s); }
+static void set_status(const char *s) { clean_line(status, sizeof status, s); }
 
 /* Toggle latest tool output (Ctrl+O) or specific tool index (mouse click). */
 static bool item_toggleable(const TItem *it) {
@@ -1400,17 +1496,35 @@ static int read_esc_seq(unsigned char *buf, int cap) {
     return n;
 }
 
-/* Reusable Claude-Code-style modal menu: returns chosen index 0..nopts-1, or -1 on Esc/cancel. */
+static void modal_scroll(Modal *m, int delta) {
+    m->body_scroll += delta;   /* render_screen clamps */
+    render_screen();
+}
+
+#define MODAL_GUARD_S 0.5
+
+/* Reusable Claude-Code-style modal menu: returns chosen index 0..nopts-1, or -1 on Esc/cancel.
+   approval=true: the last option (No) is preselected, input typed ahead or arriving
+   just after opening is dropped, and the other options stay locked until the
+   whole body has been on screen. */
 static int tui_choose_menu(const char *title, const char *body, const char *prompt,
-                           const char **opts, int nopts, const char *shortcuts) {
+                           const char **opts, int nopts, const char *shortcuts, bool approval) {
     Modal m = {
         .title = title, .body = body, .prompt = prompt,
-        .opts = opts, .nopts = nopts, .sel = 0, .opt_row_start = -1
+        .opts = opts, .nopts = nopts, .sel = approval ? nopts - 1 : 0, .opt_row_start = -1,
+        .approval = approval
     };
     active_modal = &m;
     render_screen();
+    if (approval) {
+        tcflush(0, TCIFLUSH);
+        pasting = false;      /* the end marker of a cut paste may be gone */
+        paste_start = -1;
+    }
+    double opened = mono_now();
 
     int result = -1;
+    bool in_paste = false;    /* pasted text never answers a menu */
     for (;;) {
         if (g_resized) { g_resized = 0; render_screen(); }
         fd_set rf;
@@ -1421,43 +1535,66 @@ static int tui_choose_menu(const char *title, const char *body, const char *prom
 
         unsigned char ch = 0;
         if (read(0, &ch, 1) != 1) continue;
+        bool guard = approval && mono_now() - opened < MODAL_GUARD_S;
+        bool overflow = m.body_total > m.body_vis;
+        int page = m.body_vis > 0 ? m.body_vis : 1;   /* never skips a line */
+        int pick = -1;
 
         if (ch == 27) {
             unsigned char eb[32];
             int en = read_esc_seq(eb, sizeof eb);
             if (en == 1) { result = -1; break; }
+            if (en >= 6 && !memcmp(eb, "\033[200~", 6)) { in_paste = true; continue; }
+            if (en >= 6 && !memcmp(eb, "\033[201~", 6)) { in_paste = false; continue; }
+            if (in_paste) continue;
+            if (overflow && en >= 6 && eb[1] == '[' && eb[2] == '<') {
+                int btn = atoi((const char *)eb + 3);
+                if (btn == 64 || btn == 65) {
+                    int step = page < 3 ? page : 3;
+                    modal_scroll(&m, btn == 64 ? -step : step);
+                    continue;
+                }
+            }
             int clicked = -1;
             if (handle_mouse_seq(eb, en, &clicked)) {
-                if (clicked >= m.opt_row_start && clicked < m.opt_row_start + m.nopts) {
-                    result = clicked - m.opt_row_start;
-                    break;
-                }
-                continue;
-            }
-            if (eb[1] == '[' || eb[1] == 'O') {
+                if (!guard && clicked >= m.opt_row_start && clicked < m.opt_row_start + m.nopts)
+                    pick = clicked - m.opt_row_start;
+            } else if (eb[1] == '[' || eb[1] == 'O') {
                 char k = (char)eb[en - 1];
-                if (k == 'A') { m.sel = (m.sel > 0) ? m.sel - 1 : m.nopts - 1; render_screen(); }
+                bool pgup = k == '~' && en >= 3 && eb[2] == '5';
+                bool pgdn = k == '~' && en >= 3 && eb[2] == '6';
+                if (pgup || pgdn) {
+                    if (overflow) modal_scroll(&m, pgup ? -page : page);
+                    else { scroll_off += pgup ? 8 : -8; render_screen(); }
+                }
+                else if (guard) continue;
+                else if (k == 'A') { m.sel = (m.sel > 0) ? m.sel - 1 : m.nopts - 1; render_screen(); }
                 else if (k == 'B') { m.sel = (m.sel + 1) % m.nopts; render_screen(); }
-                else if (k == '~' && en >= 3 && eb[2] == '5') { scroll_off += 8; render_screen(); }
-                else if (k == '~' && en >= 3 && eb[2] == '6') { scroll_off -= 8; render_screen(); }
             }
-            continue;
-        }
-        if (ch == 3) { result = -1; break; }               /* ^C cancels */
-        if (ch == 15) { toggle_tool(-1); continue; }       /* ^O toggles last command */
-        if (ch == '\r' || ch == '\n') { result = m.sel; break; }
-        if (ch >= '1' && ch < '1' + nopts) { result = ch - '1'; break; }
-        if (shortcuts) {
-            for (int i = 0; i < nopts && shortcuts[i]; i++) {
-                if (ch == (unsigned char)shortcuts[i] ||
-                    (shortcuts[i] >= 'a' && shortcuts[i] <= 'z' && ch == (unsigned char)(shortcuts[i] - 32))) {
-                    result = i;
-                    goto done;
+            if (pick < 0) continue;
+        } else {
+            if (ch == 3) { result = -1; break; }               /* ^C cancels */
+            if (in_paste) continue;
+            if (ch == 15) { toggle_tool(-1); continue; }       /* ^O toggles last command */
+            if (ch == ' ' && overflow) { modal_scroll(&m, page); continue; }
+            if (guard) continue;
+            if (ch == '\r' || ch == '\n') pick = m.sel;
+            else if (ch >= '1' && ch < '1' + nopts) pick = ch - '1';
+            else if (shortcuts) {
+                for (int i = 0; i < nopts && shortcuts[i]; i++) {
+                    if (ch == (unsigned char)shortcuts[i] ||
+                        (shortcuts[i] >= 'a' && shortcuts[i] <= 'z' && ch == (unsigned char)(shortcuts[i] - 32))) {
+                        pick = i;
+                        break;
+                    }
                 }
             }
+            if (pick < 0) continue;
         }
+        if (approval && pick < nopts - 1 && modal_unseen(&m) > 0) continue;
+        result = pick;
+        break;
     }
-done:
     active_modal = NULL;
     render_screen();
     return result;
@@ -1543,7 +1680,9 @@ static void ui_out(const char *out, void *ud) {
         it->done = true;
     } else {
         TItem *r = item_new(T_RAW);
-        item_append(r, out ? out : "");
+        char *c = clean_text(out, true, false);
+        item_append(r, c);
+        free(c);
     }
     render_screen();
 }
@@ -1552,7 +1691,9 @@ static void ui_status(const char *s, void *ud) { (void)ud; set_status(s); render
 
 static void ui_event(const char *kind, const char *detail, void *ud) {
     (void)ud;
-    char b[512];
+    char b[512], safe_kind[64], safe_detail[480];
+    kind = clean_line(safe_kind, sizeof safe_kind, kind);
+    detail = clean_line(safe_detail, sizeof safe_detail, detail);
     if (!strcmp(kind, "prune")) snprintf(b, sizeof b, YELLOW "  ✂ loop pruned (%s)" RESET, detail);
     else if (!strcmp(kind, "reset")) snprintf(b, sizeof b, YELLOW "  ↺ context reset (%s)" RESET, detail);
     else if (!strcmp(kind, "gate")) snprintf(b, sizeof b, BLUE "  ○ %s" RESET, detail);
@@ -1560,6 +1701,21 @@ static void ui_event(const char *kind, const char *detail, void *ud) {
     TItem *r = item_new(T_RAW);
     item_append(r, b);
     render_screen();
+}
+
+/* Would an "always" rule silence this prompt next time? Ask perm_allowed itself
+   (it always prompts for shell metacharacters and mutating flags) with the rule
+   added in memory only: without a cwd nothing is persisted. */
+static bool can_remember(const char *cmd, const char *rule) {
+    if (!rule || !*rule) return false;
+    perm_load();
+    char *cwd = g_cfg.cwd;
+    g_cfg.cwd = NULL;
+    perm_add_rule(rule);
+    g_cfg.cwd = cwd;
+    bool ok = perm_allowed(cmd);
+    perm_free();              /* drop the probe; the next check reloads from disk */
+    return ok;
 }
 
 /* Claude-Code-style approval modal menu. */
@@ -1570,22 +1726,26 @@ static bool ui_approve(const char *cmd, void *ud) {
     fflush(stdout);
 
     char *rule = perm_prefix(cmd);
+    bool remember = can_remember(cmd, rule);
     char opt2[256];
     snprintf(opt2, sizeof opt2, "Yes, and don't ask again for `%s` commands", rule ? rule : cmd);
-    const char *opts[3] = {
-        "Yes",
-        opt2,
-        "No"
-    };
-    int pick = tui_choose_menu("⚠ Bash command", cmd, "Do you want to proceed?", opts, 3, "yan");
+    const char *opts[3];
+    int n = 0;
+    opts[n++] = "Yes";
+    if (remember) opts[n++] = opt2;
+    opts[n++] = "No";
+    int pick = tui_choose_menu("⚠ Bash command", cmd, "Do you want to proceed?", opts, n,
+                               remember ? "yan" : "yn", true);
     if (pick == 0) {
         set_status("approved once");
         free(rule);
         return true;
     }
-    if (pick == 1) {
-        if (rule) perm_add_rule(rule);
-        snprintf(status, sizeof status, "always allowed: %s", rule ? rule : "");
+    if (remember && pick == 1) {
+        perm_add_rule(rule);
+        char b[300];
+        snprintf(b, sizeof b, "always allowed: %s", rule);
+        set_status(b);
         free(rule);
         return true;
     }
@@ -1658,7 +1818,9 @@ void tui_run_task(const char *prompt) {
                  g_stat.last_final.turns, g_stat.last_final.turns == 1 ? "" : "s",
                  g_stat.last_final.calls, tb, tps_s, extras, wall_dt);
     } else {
-        snprintf(done, sizeof done, YELLOW "✗ %s" RESET DIM " · %.1fs" RESET, fin, wall_dt);
+        char why[200];
+        snprintf(done, sizeof done, YELLOW "✗ %s" RESET DIM " · %.1fs" RESET,
+                 clean_line(why, sizeof why, fin), wall_dt);
     }
     TItem *d = item_new(T_RAW);
     item_append(d, done);
@@ -1706,8 +1868,8 @@ static void run_slash(const char *cmd) {
         if (cmd[6] == ' ' && cmd[7]) {
             free(g_cfg.model);
             g_cfg.model = str_dup(cmd + 7);
-            char b[300];
-            snprintf(b, sizeof b, "  model: " CYAN "%s" RESET, g_cfg.model);
+            char b[300], m[256];
+            snprintf(b, sizeof b, "  model: " CYAN "%s" RESET, clean_line(m, sizeof m, g_cfg.model));
             push_raw(b);
         } else {
             /* Fetch served models and show interactive picker if >1, else show current */
@@ -1725,42 +1887,44 @@ static void run_slash(const char *cmd) {
                 }
             }
             if (nm > 1) {
-                int pick = tui_choose_menu("Model", NULL, "Choose a model:", mnames, nm, NULL);
+                int pick = tui_choose_menu("Model", NULL, "Choose a model:", mnames, nm, NULL, false);
                 if (pick >= 0 && pick < nm) {
                     free(g_cfg.model);
                     g_cfg.model = str_dup(mnames[pick]);
                 }
             }
-            char b[300];
-            snprintf(b, sizeof b, "  model: " CYAN "%s" RESET, g_cfg.model);
+            char b[300], m[256];
+            snprintf(b, sizeof b, "  model: " CYAN "%s" RESET, clean_line(m, sizeof m, g_cfg.model));
             push_raw(b);
             if (root) cJSON_Delete(root);
         }
     } else if (!strcmp(cmd, "/allow")) {
-        perm_load();
-        char p[1024];
-        snprintf(p, sizeof p, "%s/.flywheel.allow", g_cfg.cwd);
-        char *c = read_file(p);
+        char p[4096];
+        char *c = perm_project_file(p, sizeof p) ? read_file(p) : NULL;
         if (c) {
-            char b[4200];
-            snprintf(b, sizeof b, "  permission rules (.flywheel.allow + builtin read-only):\n%.3900s", c);
+            char *safe = clean_text(c, true, false);
+            char b[8600], sp[4096];
+            snprintf(b, sizeof b, "  permission rules (builtin read-only +) %s:\n%.3900s",
+                     clean_line(sp, sizeof sp, p), safe);
             push_raw(b);
+            free(safe);
             free(c);
         } else {
-            push_raw("  permission rules (.flywheel.allow): (none yet — approve with option 2 to add)");
+            push_raw("  permission rules for this project: (none yet — \"don't ask again\" adds one)");
         }
     } else if (!strcmp(cmd, "/status")) {
         char b[600];
         const Profile *prof = profile_detect(g_cfg.cwd, g_cfg.profile);
         char *models = http_get("/models");
+        char e[200], m[200];
         snprintf(b, sizeof b, "  engine: %s %s · model: " CYAN "%s" RESET " · profile: %s · msgs: %d",
-                 g_cfg.endpoint, models ? GREEN "up" RESET : RED "down" RESET,
-                 g_cfg.model, prof->name, g_msgs->n);
+                 clean_line(e, sizeof e, g_cfg.endpoint), models ? GREEN "up" RESET : RED "down" RESET,
+                 clean_line(m, sizeof m, g_cfg.model), prof->name, g_msgs->n);
         free(models);
         push_raw(b);
     } else {
-        char b[300];
-        snprintf(b, sizeof b, "  unknown command: %.200s (try /help)", cmd);
+        char b[300], c[201];
+        snprintf(b, sizeof b, "  unknown command: %s (try /help)", clean_line(c, sizeof c, cmd));
         push_raw(b);
     }
 }
@@ -1926,11 +2090,14 @@ static void push_welcome_card(const Profile *prof) {
     md_cat(&card, "╮" RESET "\n");
 
     char r1[256], r2[512], r3[512], r4[512], r5[256];
+    char model_s[200], endp_s[200];
+    clean_line(model_s, sizeof model_s, g_cfg.model);
+    clean_line(endp_s, sizeof endp_s, g_cfg.endpoint);
     snprintf(r1, sizeof r1, "    " CYAN "╭─┴─╮" RESET "     " CYAN BOLD "F L Y W H E E L" RESET "  " DIM "v" FW_VERSION RESET);
     snprintf(r2, sizeof r2, "  " CYAN "╭─┤ " YELLOW "◎" CYAN " ├─╮" RESET "   " DIM "model  " RESET " " BOLD "%s" RESET DIM " · %s ctx" RESET,
-             g_cfg.model, ctxs);
+             model_s, ctxs);
     snprintf(r3, sizeof r3, "    " CYAN "╰─┬─╯" RESET "     " DIM "engine " RESET " %s" DIM " · %s" RESET,
-             online ? (GREEN "● online" RESET) : (RED "○ offline" RESET), g_cfg.endpoint);
+             online ? (GREEN "● online" RESET) : (RED "○ offline" RESET), endp_s);
     snprintf(r4, sizeof r4, "   " YELLOW "⚡" RESET DIM " ───" RESET "     " DIM "project" RESET " %s", proj_s);
     snprintf(r5, sizeof r5, "              " DIM "tips    /help · click or ^O cmds · ↑↓ history" RESET);
 
@@ -2052,6 +2219,7 @@ if (busy) {
         ilen -= icur - s; icur = s; inbuf[ilen] = 0;
         render_screen(); return;
     }
+    if (ch == '\t' && pasting) { ins("\t", 1); paste_bytes++; return; }
     if (ch == '\t') {   /* tab completes slash */
         const char *m[8];
         int nm = menu_matches(m, 8);
@@ -2185,7 +2353,7 @@ void tui_repl(void) {
         };
         char prompt[1200];
         snprintf(prompt, sizeof prompt, "No .flywheel.md or AGENTS.md in %s:", g_cfg.cwd);
-        int pick = tui_choose_menu("Project setup", NULL, prompt, opts, 2, "yn");
+        int pick = tui_choose_menu("Project setup", NULL, prompt, opts, 2, "yn", false);
         if (pick == 0) run_slash("/init");
     }
 

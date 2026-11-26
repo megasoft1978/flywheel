@@ -63,6 +63,10 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
     int escape_turns = 0;
     time_t wall0 = time(NULL);
     const char *finish = "turns";
+    /* the current task is the newest user message (a REPL has older ones) */
+    int task = msgs->n - 1;
+    while (task > 0 && strcmp(msgs->v[task].role, "user")) task--;
+    char *taskmsg = str_dup(task >= 0 && msgs->v[task].content ? msgs->v[task].content : "");
     FILE *tr = g_cfg.transcript ? fopen(g_cfg.transcript, "a") : NULL;
 
     for (int turn = 0; turn < g_cfg.maxturns; turn++) {
@@ -162,7 +166,7 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
                 char *go = gate_out(prof, g_cfg.cwd);
                 if (gate_fails(prof, go) && turn < g_cfg.maxturns - 2) {
                     snprintf(gbuf, sizeof gbuf,
-                        "`%s` failed. Fix all errors and remove broken scratch files, then verify and reply DONE:\n%.1800s",
+                        "`%s` failed. Fix all errors, remove only broken scratch files you created yourself, then verify and reply DONE:\n%.1800s",
                         prof->gate_cmd, go);
                     msgs_push(msgs, "user", gbuf);
                     free(go); chat_resp_free(r);
@@ -173,12 +177,14 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
             if ((!ui->interactive || wrote) && !strcmp(r->finish, "stop") && gates < g_cfg.max_gates && turn < g_cfg.maxturns - 4) {
                 gates++;
                 msgs_push(msgs, "user",
-                    "Before finishing: list every requirement bullet in the task prompt and verify each one with a quick script or test run against your code (edge cases, error classes/shapes, concurrency, ordering, cleanup, defaults). Fix any mismatch, remove scratch files, make sure the type check is clean, then reply DONE.");
+                    "Before finishing: list every requirement bullet in the task prompt and verify each one with a quick script or test run against your code (edge cases, error classes/shapes, concurrency, ordering, cleanup, defaults). Fix any mismatch, remove only scratch files you created yourself (never delete files you did not create), make sure the type check is clean, then reply DONE.");
                 event(ui, "gate", "verification pass");
                 chat_resp_free(r);
                 continue;
             }
-            finish = !strcmp(r->finish, "stop") ? "done" : (r->finish[0] ? r->finish : "stop");
+            static char fbuf[64];   /* r is freed below */
+            snprintf(fbuf, sizeof fbuf, "%s", r->finish[0] ? r->finish : "stop");
+            finish = !strcmp(fbuf, "stop") ? "done" : fbuf;
             chat_resp_free(r);
             break;
         }
@@ -196,38 +202,62 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
             char *out = NULL;
             char reckey[1200] = "";
 
-            if (!strcmp(tname, "write_file") || !strcmp(tname, "edit_file")) {
+            /* Esc stops the rest of the batch; a cut-off response is never run */
+            const char *skip = g_abort ? "error: aborted by user — not executed"
+                : !strcmp(r->finish, "length")
+                ? "error: response was cut off (finish=length) — tool call not executed; resend a shorter, complete call"
+                : NULL;
+            if (skip) {
+                out = str_dup(skip);
+                snprintf(reckey, sizeof reckey, "skipped:%.40s", tname);
+            } else if (!strcmp(tname, "write_file") || !strcmp(tname, "edit_file")) {
                 bool iswrite = !strcmp(tname, "write_file");
-                char *path = args_extract_key(rawargs, "path");
-                char *a = args_extract_key(rawargs, iswrite ? "content" : "old_string");
-                char *b = iswrite ? NULL : args_extract_key(rawargs, "new_string");
+                cJSON *args = args_parse_strict(rawargs);
+                cJSON *jp = cJSON_GetObjectItemCaseSensitive(args, "path");
+                cJSON *ja = cJSON_GetObjectItemCaseSensitive(args, iswrite ? "content" : "old_string");
+                cJSON *jb = iswrite ? NULL : cJSON_GetObjectItemCaseSensitive(args, "new_string");
+                const char *path = cJSON_IsString(jp) ? jp->valuestring : "";
+                const char *a = cJSON_IsString(ja) ? ja->valuestring : "";
                 if (ui->emit_tool) ui->emit_tool(iswrite ? "Write" : "Edit", path, ui->ud);
-                char permstr[1200];
-                snprintf(permstr, sizeof permstr, "%s %s", tname, path);
-                bool unapproved = ui->approve_cmd && !perm_allowed(permstr) && !ui->approve_cmd(permstr, ui->ud);
-                if (!*path) out = str_dup("error: bad arguments, need \"path\"");
+                size_t permlen = strlen(tname) + strlen(path) + 2;
+                char *permstr = malloc(permlen);   /* approval sees the whole path */
+                snprintf(permstr, permlen, "%s %s", tname, path);
+                if (!args) out = str_dup("error: bad arguments: not complete valid JSON (truncated?) — nothing was changed; resend the whole call");
+                else if (!*path) out = str_dup("error: bad arguments, need \"path\"");
                 else if (!*a) out = str_dup(iswrite
                     ? "error: bad arguments, need \"content\" — write the complete file content"
                     : "error: bad arguments, need \"old_string\"");
-                else if (unapproved) out = str_dup("error: user denied this — adapt, explain why it is needed, or try another approach");
+                else if (!iswrite && !cJSON_IsString(jb)) out = str_dup("error: bad arguments, need \"new_string\"");
+                else if (ui->approve_cmd && !perm_allowed(permstr) && !ui->approve_cmd(permstr, ui->ud))
+                    out = str_dup("error: user denied this — adapt, explain why it is needed, or try another approach");
+                else if (g_abort) out = str_dup("error: aborted by user — not executed");
                 else out = iswrite ? tool_write_file(g_cfg.cwd, path, a)
-                                   : tool_edit_file(g_cfg.cwd, path, a, b ? b : "");
+                                   : tool_edit_file(g_cfg.cwd, path, a, jb->valuestring);
                 if (!strncmp(out, "ok:", 3)) wrote = true;
-                snprintf(reckey, sizeof reckey, "%s", permstr);
-                free(path); free(a); free(b);
+                snprintf(reckey, sizeof reckey, "%.1100s", permstr);
+                free(permstr);
+                cJSON_Delete(args);
             } else if (!strcmp(tname, "bash") || !strcmp(tname, "shell")) {
-                char *command = args_extract_command(rawargs);
-                char *fixed = heredoc_fix(command);
-                free(command);
+                /* strict: an auto-closed or key-scanned command is never run */
+                cJSON *args = args_parse_strict(rawargs);
+                cJSON *jc = cJSON_GetObjectItemCaseSensitive(args, "command");
+                char *fixed = heredoc_fix(cJSON_IsString(jc) ? jc->valuestring : "");
+                cJSON_Delete(args);
                 if (ui->emit_tool) ui->emit_tool("Bash", fixed, ui->ud);
-                const char *denied = deny_check(fixed, g_cfg.cwd);
-                bool unapproved = ui->approve_cmd && !perm_allowed(fixed) && !ui->approve_cmd(fixed, ui->ud);
-                if (!*fixed) out = str_dup("error: bad arguments, need {\"command\": ...}");
-                else if (denied) out = str_dup(denied);
-                else if (unapproved) out = str_dup("error: user denied this command — adapt, explain why it is needed, or try another approach");
-                else out = run_bash(fixed, g_cfg.cwd, g_cfg.cmd_timeout);
-                if (cmd_is_write(fixed)) wrote = true;
-                snprintf(reckey, sizeof reckey, "%.1100s", fixed);
+                if (!*fixed) {
+                    out = str_dup("error: bad arguments: need {\"command\": ...}, not complete valid JSON "
+                                  "(truncated?) or empty — not executed; resend the whole call");
+                    snprintf(reckey, sizeof reckey, "badargs:%.1100s", rawargs);
+                } else {
+                    const char *denied = deny_check(fixed, g_cfg.cwd);
+                    bool unapproved = ui->approve_cmd && !perm_allowed(fixed) && !ui->approve_cmd(fixed, ui->ud);
+                    if (denied) out = str_dup(denied);
+                    else if (unapproved) out = str_dup("error: user denied this command — adapt, explain why it is needed, or try another approach");
+                    else if (g_abort) out = str_dup("error: aborted by user — not executed");
+                    else out = run_bash(fixed, g_cfg.cwd, g_cfg.cmd_timeout);
+                    if (cmd_is_write(fixed)) wrote = true;
+                    snprintf(reckey, sizeof reckey, "%.1100s", fixed);
+                }
                 free(fixed);
             } else {
                 char eb[200];
@@ -247,6 +277,7 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
             free(out);
         }
         chat_resp_free(r);
+        if (g_abort) { finish = "aborted"; break; }
 
         /* periodic gate */
         if (g_cfg.gate_every && wrote && turn % g_cfg.gate_every == g_cfg.gate_every - 1
@@ -269,6 +300,7 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
         if (kind && prunes < MAXPRUNES) {
             int cut = clen < turns ? clen : turns;
             int at = starts[turn - cut + 1];
+            if (at <= task) at = task + 1;   /* never prune the task itself */
             const char *lastout = msgs->n && !strcmp(msgs->v[msgs->n-1].role, "tool")
                                   && msgs->v[msgs->n-1].content ? msgs->v[msgs->n-1].content : "";
             char last600[640]; snprintf(last600, sizeof last600, "%.600s", lastout);
@@ -283,8 +315,11 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
             char pb[8192];
             if (prunes % 2 == 0 && resets < MAXRESETS) {
                 resets++;
-                /* context reset: keep system+task, then a reset msg */
-                msgs_trunc(msgs, 2);
+                /* context reset: keep system + current task, then a reset msg */
+                msgs_trunc(msgs, task > 0 ? 1 : 0);
+                msgs_push(msgs, "user", taskmsg);
+                task = msgs->n - 1;
+                for (int k = 0; k <= turn; k++) starts[k] = msgs->n;
                 snprintf(pb, sizeof pb,
                     "Context reset after repeated %s loop. Your saved files:\n%s\nCurrent type check:\n%.1000s\nRe-read the task prompt carefully. Inspect the existing files, find what is still missing or wrong versus the requirements, fix it with a different approach, verify the type check is clean, and reply DONE.",
                     kind, files, go);
@@ -324,5 +359,6 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
     if (tr) fclose(tr);
     rec_free(&rec);
     free(starts);
+    free(taskmsg);
     return finish;
 }

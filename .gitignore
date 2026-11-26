@@ -2,6 +2,7 @@ flywheel
 flywheel.dSYM/
 *.o
 tests/test_unit
+tests/test_unit_mini
 tests/test_mica_tui
 tests/*.dSYM/
 .flywheel.allow

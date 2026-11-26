@@ -3,7 +3,7 @@
 #ifdef FW_MINI_HTTP
 int fw_mini_post_stream(const char *url, const char *payload, int streaming,
                         size_t (*cb)(char *, size_t, size_t, void *), void *ud,
-                        char *errbuf, size_t errcap);
+                        int *status, char *errbuf, size_t errcap);
 char *fw_mini_get(const char *url);
 #else
 #include <curl/curl.h>
@@ -36,6 +36,7 @@ typedef struct {
     int ptok, ctok;
     StreamCb *cb;
     char err[256];
+    bool done;             /* saw SSE [DONE] */
 } Acc;
 
 static void acc_tool_delta(Acc *a, cJSON *tcarr) {
@@ -79,6 +80,12 @@ static void acc_tool_delta(Acc *a, cJSON *tcarr) {
 static void acc_chunk(Acc *a, const char *json) {
     cJSON *j = cJSON_Parse(json);
     if (!j) return;
+    cJSON *je = cJSON_GetObjectItemCaseSensitive(j, "error");
+    if (je && !cJSON_IsNull(je) && !a->err[0]) {
+        char *s = cJSON_PrintUnformatted(je);
+        snprintf(a->err, sizeof a->err, "%s", s ? s : "server error");
+        free(s);
+    }
     cJSON *ch = cJSON_GetObjectItemCaseSensitive(j, "choices");
     cJSON *c0 = ch && cJSON_IsArray(ch) ? cJSON_GetArrayItem(ch, 0) : NULL;
     if (c0) {
@@ -112,6 +119,23 @@ static void acc_chunk(Acc *a, const char *json) {
     cJSON_Delete(j);
 }
 
+/* "data:" lines of one SSE event block (modified in place) */
+static void sse_lines(Acc *a, char *block) {
+    for (char *ln = block; ln && *ln;) {
+        char *nl = strchr(ln, '\n');
+        if (nl) *nl = 0;
+        size_t ll = strlen(ln);
+        if (ll && ln[ll - 1] == '\r') ln[ll - 1] = 0;
+        if (!strncmp(ln, "data:", 5)) {
+            const char *d = ln + 5;
+            while (*d == ' ') d++;
+            if (strcmp(d, "[DONE]")) acc_chunk(a, d);
+            else a->done = true;
+        }
+        ln = nl ? nl + 1 : NULL;
+    }
+}
+
 static size_t on_data(char *ptr, size_t sz, size_t nm, void *ud) {
     Acc *a = ud;
     size_t n = sz * nm;
@@ -125,18 +149,7 @@ static size_t on_data(char *ptr, size_t sz, size_t nm, void *ud) {
             if (e2 && (!e || e2 < e)) { e = e2; sep = 4; }
             if (!e) break;
             *e = 0;
-            for (char *ln = a->raw.buf; ln && *ln;) {
-                char *nl = strchr(ln, '\n');
-                if (nl) *nl = 0;
-                size_t ll = strlen(ln);
-                if (ll && ln[ll - 1] == '\r') ln[ll - 1] = 0;
-                if (!strncmp(ln, "data:", 5)) {
-                    const char *d = ln + 5;
-                    while (*d == ' ') d++;
-                    if (strcmp(d, "[DONE]")) acc_chunk(a, d);
-                }
-                ln = nl ? nl + 1 : NULL;
-            }
+            sse_lines(a, a->raw.buf);
             size_t rest = a->raw.len - (size_t)(e - a->raw.buf) - sep;
             memmove(a->raw.buf, e + sep, rest);
             a->raw.len = rest;
@@ -208,6 +221,7 @@ ChatResp *chat(Msgs *msgs, StreamCb *cb) {
     cJSON_AddItemToArray(rqw, cJSON_CreateString("path"));
     cJSON_AddItemToArray(rqw, cJSON_CreateString("content"));
     cJSON_AddItemToObject(pw, "required", rqw);
+    cJSON_AddItemToObject(fw, "parameters", pw);
     cJSON_AddItemToObject(tw, "function", fw);
     cJSON_AddItemToArray(tools, tw);
 
@@ -233,6 +247,7 @@ ChatResp *chat(Msgs *msgs, StreamCb *cb) {
     cJSON_AddItemToArray(rqe, cJSON_CreateString("old_string"));
     cJSON_AddItemToArray(rqe, cJSON_CreateString("new_string"));
     cJSON_AddItemToObject(pe, "required", rqe);
+    cJSON_AddItemToObject(fe, "parameters", pe);
     cJSON_AddItemToObject(te, "function", fe);
     cJSON_AddItemToArray(tools, te);
 
@@ -279,9 +294,12 @@ ChatResp *chat(Msgs *msgs, StreamCb *cb) {
     clock_gettime(CLOCK_MONOTONIC, &t0);
 #ifdef FW_MINI_HTTP
     char merr[256] = "";
-    int mrc = fw_mini_post_stream(url, payload, cb && cb->stream, on_data, &a, merr, sizeof merr);
+    int status = 0;
+    int mrc = fw_mini_post_stream(url, payload, cb && cb->stream, on_data, &a, &status, merr, sizeof merr);
 #else
     CURLcode rc = curl_easy_perform(h);
+    long status = 0;
+    curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &status);
 #endif
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double secs = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
@@ -295,26 +313,42 @@ ChatResp *chat(Msgs *msgs, StreamCb *cb) {
             snprintf(a.err, sizeof a.err, "http: %s", merr[0] ? merr : "transport error");
             r->error = str_dup(a.err);
         }
-    } else if (!cb || !cb->stream) {
+    }
 #else
     if (rc != CURLE_OK) {
         if (g_abort) r->error = str_dup("aborted");
         else snprintf(a.err, sizeof a.err, "curl: %s", curl_easy_strerror(rc)),
              r->error = str_dup(a.err);
-    } else if (!cb || !cb->stream) {
-#endif
-        acc_chunk(&a, a.raw.buf ? a.raw.buf : "{}");
     }
-    /* long http errors land as JSON with error field */
-    if (!r->error && !a.content.len && !a.ntcs && a.raw.buf) {
-        cJSON *j = cJSON_Parse(a.raw.buf);
-        cJSON *e = j ? cJSON_GetObjectItemCaseSensitive(j, "error") : NULL;
-        if (e) {
-            char *s = cJSON_PrintUnformatted(e);
-            r->error = str_dup(s ? s : "server error");
-            free(s);
+#endif
+    else if (status < 200 || status >= 300) {
+        /* "http:" prefix marks it retryable; client errors are final */
+        snprintf(a.err, sizeof a.err, "%sstatus %d %.180s",
+                 status == 429 || status >= 500 ? "http: " : "", (int)status,
+                 a.raw.buf ? a.raw.buf : "");
+        r->error = str_dup(a.err);
+    } else {
+        if (!cb || !cb->stream) acc_chunk(&a, a.raw.buf ? a.raw.buf : "{}");
+        else if (a.raw.len) {
+            /* last event without a blank line; a plain JSON body is not SSE */
+            char *rest = str_dup(a.raw.buf);
+            sse_lines(&a, rest);
+            free(rest);
         }
-        if (j) cJSON_Delete(j);
+        /* long http errors land as JSON with error field */
+        if (!a.err[0] && !a.content.len && !a.ntcs && a.raw.buf) {
+            cJSON *j = cJSON_Parse(a.raw.buf);
+            cJSON *e = j ? cJSON_GetObjectItemCaseSensitive(j, "error") : NULL;
+            if (e) {
+                char *s = cJSON_PrintUnformatted(e);
+                snprintf(a.err, sizeof a.err, "%s", s ? s : "server error");
+                free(s);
+            }
+            if (j) cJSON_Delete(j);
+        }
+        if (a.err[0]) r->error = str_dup(a.err);
+        else if (!a.finish[0] && !a.done)
+            r->error = str_dup("http: response ended without finish_reason or [DONE]");
     }
     r->content = a.content.buf;
     r->reasoning = a.thinking.buf;
@@ -353,6 +387,7 @@ char *http_get_url(const char *url) {
     a.cb = NULL;
     curl_easy_setopt(h, CURLOPT_WRITEDATA, &a);
     curl_easy_setopt(h, CURLOPT_TIMEOUT, 5L);
+    curl_easy_setopt(h, CURLOPT_FAILONERROR, 1L);
     (void)s;
     CURLcode rc = curl_easy_perform(h);
     curl_easy_cleanup(h);

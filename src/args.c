@@ -1,4 +1,5 @@
 #include "flywheel.h"
+#include <ctype.h>
 
 static int repairs[4];
 static const char *repair_names[4] = {"ctrlchar", "autoclose", "keyscan", "fail"};
@@ -18,7 +19,7 @@ void args_repairs_report(char *buf, size_t n) {
    We scan byte-wise tracking string state; inside a string, bare
    <0x20 bytes become \\u00XX (or \\n/\\t shortcuts). */
 static char *escape_ctrl_in_strings(const char *s, bool *changed) {
-    size_t cap = strlen(s) * 2 + 1;
+    size_t cap = strlen(s) * 6 + 1;   /* worst case: every byte -> \u00XX */
     char *out = malloc(cap);
     char *w = out;
     bool instr = false, esc = false;
@@ -101,11 +102,11 @@ static char *scan_key(const char *s, const char *key) {
                 case 'r': *w++ = '\r'; break;
                 case 'u': {
                     /* \uXXXX -> copy utf8-ish: only handle ascii range */
-                    if (p[4]) {
+                    if (isxdigit(p[1]) && isxdigit(p[2]) && isxdigit(p[3]) && isxdigit(p[4])) {
                         int v = (int)strtol((char[]){p[1],p[2],p[3],p[4],0}, NULL, 16);
                         if (v > 0 && v < 128) *w++ = (char)v; else *w++ = '?';
                         p += 4;
-                    }
+                    } else *w++ = '?';   /* truncated escape: stop short */
                     break;
                 }
                 default: *w++ = (char)*p;
@@ -117,6 +118,19 @@ static char *scan_key(const char *s, const char *key) {
     }
     *w = 0;
     return out;
+}
+
+/* No auto-close, no key scanning: for tools that change files, a truncated
+   argument string must never be executed. Raw control chars are tolerated. */
+cJSON *args_parse_strict(const char *raw) {
+    if (!raw || !*raw) return NULL;
+    bool changed;
+    char *fixed = escape_ctrl_in_strings(raw, &changed);
+    cJSON *j = cJSON_ParseWithOpts(fixed, NULL, 1);
+    free(fixed);
+    if (!cJSON_IsObject(j)) { cJSON_Delete(j); return NULL; }
+    if (changed) args_note_repair("ctrlchar");
+    return j;
 }
 
 char *args_extract_key(const char *raw, const char *key) {

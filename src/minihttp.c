@@ -11,6 +11,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <ctype.h>
+#include <strings.h>
 #include <netdb.h>
 #include <sys/socket.h>
 #include <sys/select.h>
@@ -114,7 +116,8 @@ static int feed(size_t (*cb)(char *, size_t, size_t, void *), void *ud,
 }
 
 /* Core request: method POST/GET. Streams body through cb as it arrives.
-   Returns 0 on success (regardless of status code), -1 transport error/abort.
+   Returns 0 when the whole body arrived (regardless of status code), -1 on
+   transport error, truncated/malformed framing or abort.
    status_out receives the HTTP status code. */
 static int mini_request(const char *method, const char *url, const char *payload,
                         int streaming, size_t (*cb)(char *, size_t, size_t, void *),
@@ -158,7 +161,6 @@ static int mini_request(const char *method, const char *url, const char *payload
     for (const char *p = conn; *p; p++) mb_putc(&req, *p);
 
     size_t bodylen = payload ? strlen(payload) : 0;
-    size_t total = req.len + bodylen;
     /* single writev-ish: header then payload */
     size_t sent = 0;
     while (sent < req.len) {
@@ -207,8 +209,12 @@ static int mini_request(const char *method, const char *url, const char *payload
             /* chunk size line */
             int r = read_line(fd, &line, idle);
             if (r != 1) { ret = -1; snprintf(errbuf, errcap, "chunk header read failed"); break; }
-            long csize = strtol(line.buf, NULL, 16);
-            if (csize < 0) { ret = -1; break; }
+            char *end = line.buf;
+            errno = 0;
+            long csize = isxdigit((unsigned char)line.buf[0]) ? strtol(line.buf, &end, 16) : -1;
+            if (csize < 0 || errno || !*end || !strchr("\r\n; \t", *end)) {
+                ret = -1; snprintf(errbuf, errcap, "bad chunk size"); break;
+            }
             if (csize == 0) {
                 /* trailers then final CRLF — drain a couple of lines */
                 for (int i = 0; i < 8; i++) {
@@ -240,8 +246,9 @@ static int mini_request(const char *method, const char *url, const char *payload
             char t[2];
             for (int i = 0; i < 2; i++) {
                 int rr = read_byte(fd, &t[i], idle);
-                if (rr != 1) { ret = -1; goto done; }
+                if (rr != 1) { ret = -1; snprintf(errbuf, errcap, "chunk truncated"); goto done; }
             }
+            if (t[0] != '\r' || t[1] != '\n') { ret = -1; snprintf(errbuf, errcap, "bad chunk framing"); break; }
         }
     } else if (content_length >= 0) {
         long left = content_length;
@@ -256,7 +263,7 @@ static int mini_request(const char *method, const char *url, const char *payload
             if (g_abort) { ret = -1; snprintf(errbuf, errcap, "aborted"); goto done; }
             if (select(fd + 1, &rf, NULL, NULL, &tv) <= 0) { ret = -1; snprintf(errbuf, errcap, "read timeout"); goto done; }
             ssize_t n = read(fd, buf, (size_t)want);
-            if (n <= 0) break;
+            if (n <= 0) { ret = -1; snprintf(errbuf, errcap, "connection closed: short body"); goto done; }
             if (feed(cb, ud, buf, (size_t)n) < 0) { ret = -1; snprintf(errbuf, errcap, "aborted"); goto done; }
             left -= n;
         }
@@ -291,13 +298,8 @@ done:
 
 int fw_mini_post_stream(const char *url, const char *payload, int streaming,
                         size_t (*cb)(char *, size_t, size_t, void *), void *ud,
-                        char *errbuf, size_t errcap) {
-    int status = 0;
-    int rc = mini_request("POST", url, payload, streaming, cb, ud, 3600, &status, errbuf, errcap);
-    if (rc == 0 && status >= 400) {
-        /* body already streamed into the accumulator; http.c parses error json there */
-    }
-    return rc;
+                        int *status, char *errbuf, size_t errcap) {
+    return mini_request("POST", url, payload, streaming, cb, ud, 3600, status, errbuf, errcap);
 }
 
 size_t fw_mini_acc_cb(char *, size_t, size_t, void *);
@@ -307,8 +309,9 @@ char *fw_mini_get(const char *url) {
         char *buf; size_t len, cap;
     } a = {0};
     char err[128] = "";
-    int rc = mini_request("GET", url, NULL, 0, fw_mini_acc_cb, &a, 8, NULL, err, sizeof err);
-    if (rc != 0) { free(a.buf); return NULL; }
+    int status = 0;
+    int rc = mini_request("GET", url, NULL, 0, fw_mini_acc_cb, &a, 8, &status, err, sizeof err);
+    if (rc != 0 || status < 200 || status >= 300) { free(a.buf); return NULL; }
     return a.buf ? a.buf : str_dup("");
 }
 

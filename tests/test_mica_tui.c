@@ -140,6 +140,75 @@ static bool send_sse_chunk(int fd, const char *json) {
     return send_all(fd, buf, (size_t)n);
 }
 
+/* escape for embedding inside a JSON string */
+static void json_esc(const char *s, char *out, size_t cap) {
+    size_t w = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p && w + 8 < cap; p++) {
+        if (*p == '"' || *p == '\\') { out[w++] = '\\'; out[w++] = (char)*p; }
+        else if (*p < 0x20) w += (size_t)snprintf(out + w, cap - w, "\\u%04x", *p);
+        else out[w++] = (char)*p;
+    }
+    out[w] = 0;
+}
+
+static void reply(int cfd, const char *key, const char *val, bool tool) {
+    static char a[4096], b[8192], j[12288];
+    json_esc(val, a, sizeof a);
+    if (tool) {
+        static char args[4200];
+        snprintf(args, sizeof args, "{\"command\":\"%s\"}", a);
+        json_esc(args, b, sizeof b);
+        snprintf(j, sizeof j, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c\",\"type\":\"function\","
+                 "\"function\":{\"name\":\"bash\",\"arguments\":\"%s\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n", b);
+    } else {
+        snprintf(j, sizeof j, "data: {\"choices\":[{\"delta\":{\"%s\":\"%s\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", key, a);
+    }
+    send_all(cfd, j, strlen(j));
+    close(cfd);
+}
+
+/* hostile commands and model text; returns true if it answered */
+static bool handle_security(int cfd, const char *last_msg) {
+    static char cmd[2048];
+    if (strstr(last_msg, "SEC_HIDE")) {
+        size_t w = (size_t)snprintf(cmd, sizeof cmd, "true");
+        for (int i = 0; i < 40; i++) w += (size_t)snprintf(cmd + w, sizeof cmd - w, "\n# step %d", i);
+        snprintf(cmd + w, sizeof cmd - w, "\ntouch HIDDEN_PAYLOAD");
+    } else if (strstr(last_msg, "SEC_WIDE")) {
+        size_t w = (size_t)snprintf(cmd, sizeof cmd, "touch a; : ");
+        memset(cmd + w, 'A', 170); w += 170;
+        snprintf(cmd + w, sizeof cmd - w, "; touch WIDE_PAYLOAD");
+    } else if (strstr(last_msg, "SEC_CTRL")) {
+        snprintf(cmd, sizeof cmd, "ev\x1b[2Jil touch CR_PAYLOAD #\r\x1b[2K\x7f\xc2\x9b""31m ls");
+    } else if (strstr(last_msg, "SEC_OPT")) {
+        snprintf(cmd, sizeof cmd, "ev\x1b[2Jil arg");
+    } else if (strstr(last_msg, "SEC_EARLY")) {
+        snprintf(cmd, sizeof cmd, "touch EARLY_PAYLOAD");
+    } else if (strstr(last_msg, "SEC_META")) {
+        snprintf(cmd, sizeof cmd, "touch meta_a; touch meta_b");
+    } else if (strstr(last_msg, "SEC_MUT")) {
+        snprintf(cmd, sizeof cmd, "find . -name nothing-here -delete");
+    } else if (strstr(last_msg, "SEC_TEXT")) {
+        reply(cfd, "content", "a\x1b]52;c;aGk=\x07""b\x1b[2Jc\n```x\x1b[7mlang\ncode\x1b[8mhid\n```\n[l](ftp://u\x1b[5m)", false);
+        return true;
+    } else if (strstr(last_msg, "SEC_ZWBODY")) {
+        snprintf(cmd, sizeof cmd, "touch zw\xe2\x80\xae\xe2\x80\x8b\xe2\x80\x8d\xef\xb8\x8f\xef\xbb\xbf.x");
+    } else if (strstr(last_msg, "SEC_ZWTEXT")) {
+        reply(cfd, "content", "z\xe2\x80\xae\xe2\x81\xa6\xe2\x80\x8f\xef\xbb\xbfw", false);
+        return true;
+    } else if (strstr(last_msg, "SEC_THINK")) {
+        reply(cfd, "reasoning_content", "th\x1b[2Jink\xc2\x9b""end", false);
+        return true;
+    } else if (strstr(last_msg, "SEC_LINK")) {
+        reply(cfd, "content", "- xx xx xx xx xx xx xx xx xx xx xx xx xx xx xx xx xx xx xx xx xx xx xx "
+              "[wrapping link label that runs over the right edge](https://wrap.example)\n\n"
+              "| K | V |\n| - | - |\n| k | [a very long table link label that is certainly going to be truncated because it is far wider than the whole terminal](https://cell.example) |\n", false);
+        return true;
+    } else return false;
+    reply(cfd, NULL, cmd, true);
+    return true;
+}
+
 static void handle_client(int cfd) {
     char req[65536];
     size_t got = 0;
@@ -188,6 +257,8 @@ static void handle_client(int cfd) {
         close(cfd);
         return;
     }
+
+    if (handle_security(cfd, last_msg)) return;
 
     if (strstr(last_msg, "STREAM_TEST")) {
         const char *think[] = {"Let", "'s", " take", " a", " look", NULL};
@@ -340,6 +411,153 @@ static void assert_box_borders(MicaSession *s, const char *label) {
         mica_session_get_cell(s, r, cols - 1, &c1);
         CHECK(s, "input row side borders aligned", c0.chars[0] == 0x2502 && c1.chars[0] == 0x2502);
     }
+}
+
+/* ---------- security regressions (own session) ---------- */
+
+static void submit(MicaSession *s, const char *msg) {
+    type_str(s, "/clear");
+    mica_session_key(s, VTERM_KEY_ENTER, VTERM_MOD_NONE);
+    pump(s, 120);
+    type_str(s, msg);
+    mica_session_key(s, VTERM_KEY_ENTER, VTERM_MOD_NONE);
+}
+
+static bool open_modal(MicaSession *s, const char *msg) {
+    submit(s, msg);
+    return wait_for_text(s, "Do you want to proceed?", 4000);
+}
+
+static bool made(const char *dir, const char *name) {
+    char p[1400];
+    snprintf(p, sizeof p, "%s/%s", dir, name);
+    return access(p, F_OK) == 0;
+}
+
+static void close_modal(MicaSession *s) {
+    if (find_row(s, "Do you want to proceed?") >= 0) mica_session_key(s, VTERM_KEY_ESCAPE, VTERM_MOD_NONE);
+    wait_for_text(s, "ready", 3000);
+    pump(s, 150);
+}
+
+/* every cell linking to uri must be a label character */
+static bool link_confined(MicaSession *s, const char *uri, int *cells) {
+    bool ok = true;
+    *cells = 0;
+    for (int r = 0; r < mica_session_rows(s); r++)
+        for (int c = 0; c < mica_session_cols(s); c++) {
+            MicaCell mc;
+            if (!mica_session_get_cell(s, r, c, &mc) || !mc.hyperlink_id) continue;
+            const char *u = mica_session_hyperlink_uri(s, mc.hyperlink_id);
+            if (!u || strcmp(u, uri)) continue;
+            (*cells)++;
+            if (c < 2 || mc.chars[0] == 0x2502) ok = false;
+        }
+    return ok;
+}
+
+static void security_tests(const char *dir, const char *cmd) {
+    MicaSession *s = mica_session_create(dir, cmd, 24, 80);
+    assert(s != NULL);
+    CHECK(s, "security session ready", wait_for_text(s, "ready", 3000));
+
+    /* long command: full body scrollable, Yes locked until all of it was shown */
+    CHECK(s, "hide: modal", open_modal(s, "SEC_HIDE"));
+    pump(s, 600);
+    CHECK(s, "hide: hidden-line count shown", find_row(s, "lines hidden") >= 0);
+    CHECK(s, "hide: payload not yet on screen", find_row(s, "HIDDEN_PAYLOAD") < 0);
+    type_str(s, "y");
+    type_str(s, "1");
+    pump(s, 400);
+    CHECK(s, "hide: Yes refused while lines unseen",
+          find_row(s, "Do you want to proceed?") >= 0 && !made(dir, "HIDDEN_PAYLOAD"));
+    for (int i = 0; i < 6; i++) { type_str(s, "\033[6~"); pump(s, 80); }
+    CHECK(s, "hide: scrolling reveals the payload", find_row(s, "touch HIDDEN_PAYLOAD") >= 0);
+    type_str(s, "y");
+    wait_for_text(s, "✓ done", 4000);
+    CHECK(s, "hide: Yes accepted after viewing all", made(dir, "HIDDEN_PAYLOAD"));
+    close_modal(s);
+
+    CHECK(s, "wide: modal", open_modal(s, "SEC_WIDE"));
+    pump(s, 150);
+    CHECK(s, "wide: long line wraps, tail visible", find_row(s, "WIDE_PAYLOAD") >= 0);
+    close_modal(s);
+
+    CHECK(s, "ctrl: modal", open_modal(s, "SEC_CTRL"));
+    pump(s, 150);
+    CHECK(s, "ctrl: CR/ESC/DEL/C1 visible in body", find_row(s, "#^M^[[2K^?\\x9B31m ls") >= 0);
+    CHECK(s, "ctrl: no always option for a CR command", find_row(s, "ask again") < 0);
+    close_modal(s);
+    CHECK(s, "esc option: modal", open_modal(s, "SEC_OPT"));
+    pump(s, 150);
+    CHECK(s, "esc option: option 2 shows ESC visibly", find_row(s, "ask again for `ev^[[2Jil`") >= 0);
+    close_modal(s);
+
+    /* type-ahead */
+    CHECK(s, "early: modal", open_modal(s, "SEC_EARLY"));
+    type_str(s, "y");
+    type_str(s, "1");
+    pump(s, 800);
+    CHECK(s, "early: keys right after open ignored",
+          find_row(s, "Do you want to proceed?") >= 0 && !made(dir, "EARLY_PAYLOAD"));
+    mica_session_paste(s, "y\n1\n", 4);
+    pump(s, 300);
+    CHECK(s, "early: pasted text cannot answer",
+          find_row(s, "Do you want to proceed?") >= 0 && !made(dir, "EARLY_PAYLOAD"));
+    mica_session_key(s, VTERM_KEY_ENTER, VTERM_MOD_NONE);
+    wait_for_text(s, "✓ done", 4000);
+    CHECK(s, "early: Enter on default denies", !made(dir, "EARLY_PAYLOAD"));
+    close_modal(s);
+
+    CHECK(s, "meta: modal", open_modal(s, "SEC_META"));
+    pump(s, 150);
+    CHECK(s, "meta: no always option", find_row(s, "ask again") < 0 && find_row(s, "2. No") >= 0);
+    close_modal(s);
+    CHECK(s, "mutating: modal", open_modal(s, "SEC_MUT"));
+    pump(s, 150);
+    CHECK(s, "mutating: no always option", find_row(s, "ask again") < 0 && find_row(s, "2. No") >= 0);
+    close_modal(s);
+
+    CHECK(s, "zero-width: modal", open_modal(s, "SEC_ZWBODY"));
+    pump(s, 150);
+    CHECK(s, "zero-width: visible in modal body",
+          find_row(s, "touch zw<U+202E><U+200B><U+200D><U+FE0F><U+FEFF>.x") >= 0);
+    close_modal(s);
+    submit(s, "SEC_ZWTEXT");
+    wait_for_text(s, "✓ done", 4000);
+    pump(s, 150);
+    CHECK(s, "bidi: visible in transcript", find_row(s, "z<U+202E><U+2066><U+200F><U+FEFF>w") >= 0);
+
+    submit(s, "SEC_TEXT");
+    wait_for_text(s, "✓ done", 4000);
+    pump(s, 150);
+    CHECK(s, "text: OSC 52 / ED rendered inert", find_row(s, "a^[]52;c;aGk=^Gb^[[2Jc") >= 0);
+    CHECK(s, "text: fence language sanitized", find_row(s, "x^[[7mlang") >= 0);
+    CHECK(s, "text: code line sanitized", find_row(s, "code^[[8mhid") >= 0);
+    CHECK(s, "text: link URL sanitized", find_row(s, "ftp://u^[[5m") >= 0);
+    submit(s, "SEC_THINK");
+    wait_for_text(s, "✓ done", 4000);
+    pump(s, 150);
+    mica_session_text(s, 'o', VTERM_MOD_CTRL);
+    pump(s, 150);
+    CHECK(s, "thinking sanitized", find_row(s, "th^[[2Jink\\x9Bend") >= 0);
+
+    submit(s, "SEC_LINK");
+    wait_for_text(s, "✓ done", 4000);
+    pump(s, 150);
+    int n = 0;
+    CHECK(s, "wrapped link: closed per row, indent unlinked", link_confined(s, "https://wrap.example", &n));
+    CHECK(s, "wrapped link: continuation still linked", n >= 40);
+    CHECK(s, "truncated table link does not bleed", link_confined(s, "https://cell.example", &n) && n > 0 && n < 80);
+
+    submit(s, "");
+    pump(s, 100);
+    mica_session_paste(s, "tab\there", 8);
+    pump(s, 200);
+    CHECK(s, "pasted tab kept", find_row(s, "tab here") >= 0);
+    assert_box_borders(s, "borders intact with pasted tab");
+
+    mica_session_destroy(s);
 }
 
 int main(int argc, char **argv) {
@@ -497,9 +715,9 @@ int main(int argc, char **argv) {
     CHECK(s, "thinking collapsed to summary line", find_row(s, "Thought for") >= 0);
     CHECK(s, "content streamed continuously (not word-per-line)", find_row(s, "Hello world from flywheel!") >= 0);
     CHECK(s, "modal shows titled border", find_row(s, "Bash command") >= 0);
-    CHECK(s, "modal shows option 1 highlighted", find_row(s, "▸ 1. Yes") >= 0);
-    CHECK(s, "modal shows option 2 (always)", find_row(s, "2. Yes, and don't ask again") >= 0);
-    CHECK(s, "modal shows option 3 (No)", find_row(s, "3. No") >= 0);
+    CHECK(s, "modal defaults to No", find_row(s, "▸ 2. No") >= 0);
+    CHECK(s, "modal shows option 1 (Yes)", find_row(s, "1. Yes") >= 0);
+    CHECK(s, "no always option for a piped command", find_row(s, "don't ask again") < 0);
     char *notif = mica_session_take_notification(s);
     CHECK(s, "Mica received OSC 9 approval notification", notif != NULL && strstr(notif, "approval") != NULL);
     free(notif);
@@ -507,7 +725,10 @@ int main(int argc, char **argv) {
     /* Navigate approval menu with arrow keys, then click option 1 with mouse */
     mica_session_key(s, VTERM_KEY_DOWN, VTERM_MOD_NONE);
     pump(s, 100);
-    CHECK(s, "arrow down highlights option 2 in modal", find_row(s, "▸ 2. Yes, and don't ask again") >= 0);
+    pump(s, 500);
+    mica_session_key(s, VTERM_KEY_DOWN, VTERM_MOD_NONE);
+    pump(s, 100);
+    CHECK(s, "arrow down highlights option 1 in modal", find_row(s, "▸ 1. Yes") >= 0);
     int opt1_row = find_row(s, "1. Yes");
     CHECK(s, "option 1 row found for click", opt1_row >= 0);
     mica_session_mouse(s, opt1_row, 6, 1, true);
@@ -566,8 +787,10 @@ int main(int argc, char **argv) {
     /* 9. Option 2 (always-allow) persists rule and skips modal next time */
     type_str(s, "ALWAYS_TEST");
     mica_session_key(s, VTERM_KEY_ENTER, VTERM_MOD_NONE);
-    CHECK(s, "first uname opens approval modal", wait_for_text(s, "uname -s", 3000));
-    pump(s, 100);
+    CHECK(s, "first uname opens approval modal", wait_for_text(s, "Do you want to proceed?", 3000));
+    pump(s, 600);
+    CHECK(s, "modal shows option 2 (always)", find_row(s, "2. Yes, and don't ask again") >= 0);
+    CHECK(s, "modal shows option 3 (No) selected", find_row(s, "▸ 3. No") >= 0);
     type_str(s, "2");
     CHECK(s, "first ALWAYS_TEST finishes after pressing 2", wait_for_text(s, "ready", 4000));
     pump(s, 150);
@@ -579,6 +802,13 @@ int main(int argc, char **argv) {
     CHECK(s, "second uname finishes WITHOUT modal", wait_for_text(s, "Darwin", 4000));
     CHECK(s, "no modal shown on second uname", find_row(s, "Do you want to proceed?") < 0);
     wait_for_text(s, "ready", 3000);
+    pump(s, 100);
+
+    type_str(s, "/allow");
+    mica_session_key(s, VTERM_KEY_ENTER, VTERM_MOD_NONE);
+    bool listed = wait_for_text(s, "builtin read-only", 2000);
+    pump(s, 150);
+    CHECK(s, "/allow lists the per-project rule file", listed && find_row(s, "projects/") >= 0);
     pump(s, 100);
 
     /* 10. Esc aborts slow streaming request cleanly */
@@ -694,6 +924,7 @@ int main(int argc, char **argv) {
     CHECK(s, "exit status 0", mica_session_exit_status(s) == 0);
 
     mica_session_destroy(s);
+    security_tests(testdir, cmd);
     stop_mock_server(srv_th);
 
     char rm[1200];

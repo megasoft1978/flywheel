@@ -20,6 +20,7 @@
 #include <dirent.h>
 #include <time.h>
 #include <errno.h>
+#include <fcntl.h>
 
 /* ---------- small fs helpers ---------- */
 
@@ -41,15 +42,24 @@ static void mkdirs(const char *p) {
     mkdir(tmp, 0755);
 }
 
-static int copy_file(const char *src, const char *dst) {
-    char *c = read_file(src);
-    if (!c) return -1;
-    FILE *f = fopen(dst, "wb");
-    if (!f) { free(c); return -1; }
-    fputs(c, f);
-    fclose(f);
-    free(c);
-    return 0;
+int fw_copy_file(const char *src, const char *dst) {
+    int in = open(src, O_RDONLY);
+    if (in < 0) return -1;
+    struct stat st;
+    int out = fstat(in, &st) ? -1 : open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (out < 0) { close(in); return -1; }
+    char buf[65536];
+    ssize_t n;
+    int rc = 0;
+    while (!rc && (n = read(in, buf, sizeof buf)) != 0) {
+        if (n < 0) { rc = -1; break; }
+        for (ssize_t off = 0, w; off < n; off += w)
+            if ((w = write(out, buf + off, (size_t)(n - off))) <= 0) { rc = -1; break; }
+    }
+    if (fchmod(out, st.st_mode & 07777)) rc = -1;
+    close(in);
+    if (close(out)) rc = -1;
+    return rc;
 }
 
 /* recursive copy of directory contents (merge) */
@@ -63,7 +73,7 @@ static void copy_tree(const char *src, const char *dst) {
         snprintf(sp, sizeof sp, "%s/%s", src, e->d_name);
         snprintf(dp, sizeof dp, "%s/%s", dst, e->d_name);
         if (is_dir(sp)) { mkdirs(dp); copy_tree(sp, dp); }
-        else if (is_file(sp)) copy_file(sp, dp);
+        else if (is_file(sp)) fw_copy_file(sp, dp);
     }
     closedir(d);
 }
@@ -132,7 +142,7 @@ static void setup_sandbox(const char *suite, const char *tid, const Manifest *m,
         if (!cJSON_IsString(it)) continue;
         snprintf(src, sizeof src, "%s/%s", suite, it->valuestring);
         snprintf(dst, sizeof dst, "%s/%s", out, it->valuestring);
-        copy_file(src, dst);
+        fw_copy_file(src, dst);
     }
     snprintf(src, sizeof src, "%s/tasks/%s/starter", suite, tid);
     if (is_dir(src)) copy_tree(src, out);
@@ -166,7 +176,7 @@ static void collect_rec(const char *root, const char *rel, const char *dest, con
         snprintf(dpar, sizeof dpar, "%s", dp);
         char *ls = strrchr(dpar, '/');
         if (ls) { *ls = 0; mkdirs(dpar); }
-        copy_file(fp, dp);
+        fw_copy_file(fp, dp);
     }
     closedir(d);
 }
@@ -257,10 +267,11 @@ int fw_do_bench(int argc, char **argv) {
     }
 
     /* task list: explicit ids or scan tasks/ */
-    char tasks[64][256];
-    int ntasks = 0;
+    char (*tasks)[256] = NULL;
+    int ntasks = 0, tcap = 0;
     if (argc > 2) {
-        for (int i = 2; i < argc && ntasks < 64; i++, ntasks++)
+        tasks = malloc((size_t)(argc - 2) * sizeof *tasks);
+        for (int i = 2; i < argc; i++, ntasks++)
             snprintf(tasks[ntasks], 256, "%s", argv[i]);
     } else {
         char td[1400];
@@ -269,11 +280,13 @@ int fw_do_bench(int argc, char **argv) {
         if (!d) { fprintf(stderr, "bench: no tasks/ in %s\n", suite); return 2; }
         /* collect then sort for stable order */
         struct dirent *e;
-        while ((e = readdir(d)) && ntasks < 64) {
+        while ((e = readdir(d))) {
             if (e->d_name[0] == '.') continue;
             char p[1400];
             snprintf(p, sizeof p, "%s/%s", td, e->d_name);
-            if (is_dir(p)) snprintf(tasks[ntasks++], 256, "%s", e->d_name);
+            if (!is_dir(p)) continue;
+            if (ntasks == tcap) tasks = realloc(tasks, (size_t)(tcap = tcap ? tcap * 2 : 64) * sizeof *tasks);
+            snprintf(tasks[ntasks++], 256, "%s", e->d_name);
         }
         closedir(d);
         for (int i = 0; i < ntasks; i++)
@@ -307,7 +320,7 @@ int fw_do_bench(int argc, char **argv) {
         mkdirs(td);
         char pcopy[1400];
         snprintf(pcopy, sizeof pcopy, "%s/prompt.md", td);
-        copy_file(pp, pcopy);
+        fw_copy_file(pp, pcopy);
 
         /* per-task agent config */
         free(g_cfg.cwd);
@@ -385,8 +398,13 @@ int fw_do_bench(int argc, char **argv) {
             if (!strcmp(g->string, "tests_total")) total = g->valueint;
             if (!strcmp(g->string, "tsc_ok")) tsc = cJSON_IsTrue(g);
         }
-        printf("%s %s %d/%d tsc=%s turns=%d fin=%s %.0fs\n", tag, tid, passed, total,
-               tsc ? "true" : "false", turns, fin, dt);
+        char line[1024];
+        snprintf(line, sizeof line, "%s %s %d/%d tsc=%s turns=%d fin=%s %.0fs", tag, tid,
+                 passed, total, tsc ? "true" : "false", turns, fin, dt);
+        char *safe = clean_text(line, false, false);   /* fin carries server text */
+        for (char *p = safe; *p; p++) if (*p == '\n') *p = ' ';
+        puts(safe);
+        free(safe);
         fflush(stdout);
 
         /* cleanup sandbox */
@@ -421,6 +439,7 @@ int fw_do_bench(int argc, char **argv) {
     printf("%s DONE tasks=%d gated=%.2f raw=%.2f full_pass=%d secs=%.0f\n",
            tag, counted, gated, raw, fulls, wall_all);
     manifest_free(&m);
+    free(tasks);
     cJSON_Delete(summary);
     return 0;
 }
