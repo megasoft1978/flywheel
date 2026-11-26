@@ -110,11 +110,13 @@
     <tr><td>Goose</td><td>Claude Haiku 4.5</td><td class="num">35.5%</td></tr>
     <tr><td>Claude Code</td><td>Claude Haiku 4.5</td><td class="num">27.5%</td></tr>
     <tr><td>Dakou Agent</td><td>Qwen3-Coder-480B (cloud)</td><td class="num">27.2%</td></tr>
-    <tr style="outline:1px solid #1f6feb"><td><b>flywheel</b></td><td><b>Qwen3.8-27B — local, $0/token</b></td><td class="num"><b>slice running</b></td></tr>
+    <tr style="outline:1px solid #1f6feb"><td><b>flywheel</b></td><td><b>Qwen3.8-27B — local, $0/token</b></td><td class="num"><b>40%</b>*</td></tr>
   </table>
   <p style="color:var(--dim);margin-top:12px;font-size:13.5px">The bar: the best any published harness extracted from
   Qwen3-Coder-480B — a cloud model ~18&times; larger — is 27.2%. Reproduce with <code>bench-tb/run-slice.sh</code> against any
   OpenAI-compatible engine on <code>:8312</code>.</p>
+  <p style="color:var(--dim);font-size:13px">*first 10-task slice (hand-picked for diversity, not the full 89-task set — indicative):
+  count-dataset-tokens, extract-elf, fix-git, git-multibranch passed. Zero inference cost, first attempt per task, no retries.</p>
 </section>
 
 <section id="quickstart">

@@ -31,7 +31,7 @@ Reference numbers from the official tbench.ai 2.0 leaderboard
 | Terminus 2 | Claude Haiku 4.5 | 28.3% |
 | Claude Code | Claude Haiku 4.5 | 27.5% |
 | Dakou Agent | Qwen3-Coder-**480B** (cloud) | 27.2% |
-| **flywheel** | **Qwen3.8-27B, local, $0/token** | slice in progress |
+| **flywheel** | **Qwen3.8-27B, local, $0/token** | **40%**\* |
 
 The bar flywheel aims at: the best any harness extracted from
 Qwen3-Coder-480B — a cloud model ~18x larger — is 27.2%, and
@@ -39,7 +39,14 @@ Claude Haiku 4.5 tops out at 35.5% across all published harnesses.
 Harness quality is half the product at small scale; that is the
 measured claim, not a slogan.
 
-Reproduce: `bench-tb/run-slice.sh` (10-task slice) — needs Docker
+\*first 10-task slice (hand-picked for diversity, not the full 89-task
+set — indicative, not directly comparable to full-board entries):
+count-dataset-tokens, extract-elf, fix-git and git-multibranch passed;
+the two `hard` tasks, dna-insert/filter-js/gcode-to-text failed, and
+chess-best-move is vision-only (this model is text-only, structurally
+impossible). Zero inference cost, zero retries, first attempt per task.
+
+Reproduce: `bench-tb/run-slice.sh` — needs Docker
 and a local OpenAI-compatible engine on `:8312`. Full task list and
 oracle validation notes in `bench-tb/PLAN.md`.
 
