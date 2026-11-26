@@ -1,6 +1,0 @@
-Agent 'oracle' does not declare an options_model; leftover kwargs are ignored
-Agent 'oracle' does not declare an options_model; leftover kwargs are ignored
-Skipping image OS validation for alexgshaw/circuit-fibsqrt:20251031: docker inspect returned 1
-Skipping image OS validation for alexgshaw/make-mips-interpreter:20251031: docker inspect returned 1
-Collecting main service artifacts
-Collecting main service artifacts
