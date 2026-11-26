@@ -77,7 +77,7 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
         emit(ui, ui->emit_status, stbuf);
 
         StreamCb scb = {.on_text = ui->emit_text, .on_think = ui->emit_think,
-                        .ud = ui->ud, .stream = ui->interactive};
+                        .ud = ui->ud, .stream = 1};
         /* transient transport errors (server busy, connection reset, engine
            restart) must not kill a benchmark run — retry with backoff.
            user aborts and malformed-response errors stay fatal. */

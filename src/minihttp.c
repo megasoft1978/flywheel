@@ -178,7 +178,10 @@ static int mini_request(const char *method, const char *url, const char *payload
     MBuf line = {0};
     int status = 0, chunked = 0;
     long content_length = -1;
-    int idle = timeout_s < 60 ? timeout_s : 60; /* idle ceiling per read; streaming stays warm */
+    /* idle ceiling per read: streaming SSE stays warm with token deltas, but a
+       non-streaming or pre-first-byte wait must tolerate long server-side generation
+       (a 12k-token response at 200tok/s is 60s before the first byte). */
+    int idle = timeout_s < 240 ? timeout_s : 240;
     int rc = 0;
     int header_lines = 0;
     for (;;) {
