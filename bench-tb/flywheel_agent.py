@@ -49,7 +49,7 @@ class FlywheelAgent(BaseAgent):
         binary = DIST / f"flywheel-linux-{arch}"
         if not binary.exists():
             raise FileNotFoundError(
-                f"{binary} missing — run bench-tb/build-linux.sh {arch} first"
+                f"{binary} missing — run bench-tb/build-zig.sh first"
             )
         await environment.upload_file(binary, "/usr/local/bin/flywheel")
         await environment.exec("chmod +x /usr/local/bin/flywheel", timeout_sec=15)

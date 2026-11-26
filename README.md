@@ -1,155 +1,166 @@
 # flywheel
 
-From-scratch C agent harness for local OpenAI-compatible engines
-(tuned for Splash + Qwen3.8-27B on Apple Silicon). Single binary;
-macOS links only libcurl + vendored cJSON, and the Linux build
-(`zig cc -target x86_64-linux-musl`, see `bench-tb/build-zig.sh`)
-is fully static with **zero dependencies** — it speaks HTTP/SSE
-directly over sockets (`src/minihttp.c`).
+**A terminal coding agent written in C, built for a local model on your own machine.**
 
-Build: `make` → `./flywheel`
+flywheel talks to any OpenAI-compatible endpoint and is tuned for Qwen3.8-27B served by
+Splash on Apple Silicon. It is one small binary of about 6k lines of C (plus vendored
+cJSON): macOS links only `libcurl`, and the Linux build is fully static.
 
-## Benchmark: Terminal-Bench 2.0
+[Website](https://megasoft1978.github.io/flywheel/) · [Benchmarks](#benchmarks) · [Safety model](#safety-model) · MIT
 
-Public, harness-agnostic terminal benchmark: the agent runs inside
-Linux Docker containers and end-state tests score the task. flywheel
-competes through a Harbor custom agent (`bench-tb/flywheel_agent.py`):
-the static binary is uploaded into each container and talks back to
-the Splash engine on the host — inference stays on Apple Silicon,
-zero tokens cost nothing.
+```text
+$ flywheel "test_calc.py fails. Fix the bug in calc.py and run the test."
+⏺ Bash(ls -la && cat calc.py test_calc.py)
+⏺ Edit(calc.py)
+  ⎿  ok: edited calc.py at line 2 (32 bytes)
+⏺ Bash(python3 test_calc.py)
+  ⎿  ok
+● flywheel: finish=done turns=4 calls=3 tokens=249 secs=2
+```
 
-Reference numbers from the official tbench.ai 2.0 leaderboard
-(archived 2026-03, best published result per agent+model):
+<sub>Trimmed output of a real run on a deliberately trivial task, with `--gates 0`.</sub>
 
-| harness | model | TB2.0 |
-|---|---|---|
-| ForgeCode | Claude Opus 4.6 | 81.8% |
-| Codex CLI | GPT-5.2 | 62.9% |
-| Claude Code | Claude Opus 4.6 | 58.0% |
-| Claude Code | Claude Sonnet 4.5 | 40.1% |
-| Goose | Claude Haiku 4.5 | 35.5% |
-| Terminus 2 | Claude Haiku 4.5 | 28.3% |
-| Claude Code | Claude Haiku 4.5 | 27.5% |
-| Dakou Agent | Qwen3-Coder-**480B** (cloud) | 27.2% |
-| **flywheel** | **Qwen3.8-27B, local, $0/token** | **40%**\* |
+## Quickstart
 
-The bar flywheel aims at: the best any harness extracted from
-Qwen3-Coder-480B — a cloud model ~18x larger — is 27.2%, and
-Claude Haiku 4.5 tops out at 35.5% across all published harnesses.
-Harness quality is half the product at small scale; that is the
-measured claim, not a slogan.
-
-\*first 10-task slice (hand-picked for diversity, not the full 89-task
-set — indicative, not directly comparable to full-board entries):
-count-dataset-tokens, extract-elf, fix-git and git-multibranch passed;
-the two `hard` tasks, dna-insert/filter-js/gcode-to-text failed, and
-chess-best-move is vision-only (this model is text-only, structurally
-impossible). Zero inference cost, zero retries, first attempt per task.
-
-Reproduce: `bench-tb/run-slice.sh` — needs Docker
-and a local OpenAI-compatible engine on `:8312`. Full task list and
-oracle validation notes in `bench-tb/PLAN.md`.
-
-## Modes
+macOS (Apple Silicon), with `clang` and `libcurl`:
 
 ```bash
-flywheel                          # interactive REPL
-flywheel "fix the bug in x.ts"    # one-shot
+git clone https://github.com/megasoft1978/flywheel
+cd flywheel
+make
+./flywheel setup     # optional: installs the engine and downloads the model, asking first
+./flywheel init      # writes .flywheel.md for the current project
+./flywheel           # interactive session
+```
+
+Already running an OpenAI-compatible server? Skip `setup` and point at it:
+
+```bash
+FW_ENDPOINT=http://127.0.0.1:8312/v1 FW_MODEL=local/qwen-pi4 ./flywheel
+```
+
+Static Linux binaries (x86_64 and aarch64, needs `zig`): `bench-tb/build-zig.sh` → `dist/`.
+
+## Usage
+
+```bash
+flywheel                            # interactive REPL
+flywheel "fix the bug in x.ts"      # one-shot
 flywheel -f prompt.md -T 60 -W 900 --transcript run.jsonl
+flywheel bench <suite-dir> <tag>    # run a benchmark suite
 ```
 
-## Interactive TUI
+| flag | meaning | default |
+|---|---|---|
+| `-e URL` / `-m NAME` | endpoint / model | `http://127.0.0.1:8312/v1` / `local/qwen-pi4` |
+| `-C DIR` | working directory | current |
+| `-P ts\|python\|go\|rust\|generic` | language profile | auto-detected |
+| `-T N` / `-W SEC` / `-t SEC` | max turns / wall clock / command timeout | 60 / off / 30 |
+| `--gates N` | verification passes before finishing | 1 |
+| `--transcript FILE` | JSONL log of the run | off |
 
-- Input never dies: type while the agent works — Enter queues the
-  message, `Esc` interrupts (also during Bash), scrollback stays
-  anchored instead of yanking to bottom (`End` jumps back).
-- Markdown rendered as it streams: headings, bold/italic/code,
-  fenced code boxes, tables, clickable OSC-8 links.
-- Collapsible tool output and thinking: click or `^O` to expand;
-  mouse wheel + PgUp/PgDn scroll.
-- Approval menus for risky commands: `1 yes / 2 always / 3 no`,
-  arrow keys or mouse, persisted per-prefix rules in `.flywheel.allow`.
-- Structured tools `write_file` / `edit_file` (path-confined to the
-  project, unique-match edits) beside `bash`.
-- Slash menu `/init /clear /model /allow /status /help /exit` with
-  live filtering, bracketed paste collapse, clipboard-image paste
-  (ctrl+V), live telemetry: tok/s, context gauge, completion pills.
+`flywheel --help` lists the rest. Settings can also live in `~/.config/flywheel/config`.
+Project instructions are loaded from `.flywheel.md`, `AGENTS.md` or `CLAUDE.md`.
 
-## Learned mitigations (from the tsreact bench, v8 = 11.74→12.66/13)
+## What the harness does for a small model
 
-- **period-1/2/3 + repeat loop breaker**: same-command similarity
-  (Ratcliff gestalt >0.82/0.88) → prune turns, inject corrective msg,
-  2-turn escape temp (0.5 + pp 0.25), alternating context resets.
-- **lenient tool-arg extraction**: escape raw control chars inside
-  JSON strings → auto-close truncated JSON → direct `"command"` key
-  scan fallback; repairs counted in `--transcript`.
-- **heredoc delimiter rewrite**: `<<'EOF'` colliding with payload
-  → `FW_EOF_n`.
-- **auto-gate**: per-language verify command every 8 write-turns and
-  before DONE (ts `tsc --noEmit`, py compileall, go vet, cargo check).
-- **verification gate** (MAX_GATES=1): one enumerate-and-verify pass
-  before finish.
-- **deny rules**: sudo/rm-rf/outside-cwd writes blocked pre-exec.
-- **30s cmd timeout** w/ hang hint, wall clock, turn nudges.
+Small local models fail in repetitive, recoverable ways. flywheel handles them in the harness:
 
-## Language profiles
+- **Loop breaker.** Detects repeated and near-repeated commands, prunes the loop, injects a
+  correction and temporarily raises temperature.
+- **Tool-call repair.** Recovers shell commands from JSON with raw control characters.
+  Truncated or auto-closed arguments are rejected, never executed.
+- **Structured file tools.** `write_file` and `edit_file` with unique-match edits, confined
+  to the project directory.
+- **Verification gate.** Per-language checks (`tsc --noEmit`, `compileall`, `go vet`,
+  `cargo check`) and one requirement-by-requirement pass before finishing.
+- **Failure handling.** HTTP errors and cut-off streams are reported as errors, not success;
+  transient transport errors are retried.
 
-Auto-detected from `package.json | pyproject.toml|setup.py |
-go.mod | Cargo.toml` in `-C` dir; force with `-P ts|python|go|rust|generic`.
-Project instructions auto-loaded from `.flywheel.md | AGENTS.md |
-CLAUDE.md` in the working dir.
+## Interactive terminal UI
 
-## Env / flags
+- Keep typing while the agent works: Enter queues, `Esc` interrupts, scrollback stays put.
+- Streaming markdown, code boxes, tables and links.
+- Tool output and thinking collapse; click or `^O` to expand.
+- Slash menu (`/init /clear /model /allow /status /help /exit`), input history,
+  large-paste collapse, clipboard images with `^V` (macOS).
+- Live tokens per second, context gauge and completion summary.
 
-`FW_ENDPOINT` (def `http://127.0.0.1:8312/v1`), `FW_MODEL`
-(def `local/qwen-pi4`). `-T` turns · `-W` wall · `-t` cmd timeout ·
-`-K` max tokens · `--temp/--topp/--pp` · `--think N` · `--gates N` ·
-`--sys TEXT` · `-q` quiet.
+## Safety model
 
-Server-side thinking budget recommended: Splash
-`--thinking-token-budget 1024` (bench optimum: off→1.70, 512→2.65,
-1024→2.81, 2048→2.81 on the 3-hard suite).
+flywheel runs shell commands on your machine. **It is not a sandbox.**
 
-## Bench mode
+- **Interactive mode** asks before running anything that is not on a short read-only list.
+  Chaining, redirection, shell expansion and write or exec flags always prompt.
+- The approval dialog shows the whole command, with control and invisible characters made
+  visible, and ignores keys typed before it appeared.
+- "Always allow" rules are stored per project under `~/.config/flywheel/`. Rules shipped
+  inside a repository are not trusted.
+- **One-shot and `bench` modes approve commands automatically.** Only the deny rules apply.
+- Deny rules (`sudo`, destructive `rm`, writes outside the project) are best-effort and can
+  be bypassed, for example through an interpreter. Run untrusted tasks in a container or VM.
 
-`flywheel [flags] bench <suite-dir> <tag> [task-id ...]` — pure-C suite runner
-(no Python). Suite layout:
+## Benchmarks
 
+Both results below are early and small. They are published with their limits.
+
+### Terminal-Bench 2.0 pilot: 4 of 10 tasks
+
+flywheel with Qwen3.8-27B running locally, through a [Harbor](https://github.com/harbor-framework/harbor) custom agent.
+
+| passed | failed |
+|---|---|
+| `count-dataset-tokens` | `chess-best-move` (needs vision; the model is text-only) |
+| `extract-elf` | `circuit-fibsqrt` |
+| `fix-git` | `make-mips-interpreter` |
+| `git-multibranch` | `dna-insert` |
+| | `filter-js-from-html` |
+| | `gcode-to-text` |
+
+**This is not a leaderboard score and should not be compared with one.** The 10 tasks were
+hand-picked, not the full set; each ran once; seven were re-run after a Docker network outage
+stopped them from starting; and the two sessions used different builds. It also predates a
+fix for missing file-tool parameter schemas. A full run is still to be done.
+
+### Coding suite: 13 TypeScript and React tasks
+
+A private suite of hidden-test tasks. Score = fraction of tests passing per task, zero if the
+type check fails, summed over 13.
+
+| runner | protocol | first attempt | after retry | tasks fully passing |
+|---|---|---|---|---|
+| flywheel + Qwen3.8-27B (local) | agent loop, one run | 10.15 | — | 8 / 13 |
+| Claude Sonnet 5.5 | one-shot generation, no tools | 12.00 | 13.00 | 13 / 13 |
+| Claude Haiku 5.5 | one-shot generation, no tools | 12.00 | 13.00 | 13 / 13 |
+
+**The frontier models are clearly ahead.** The protocols differ, so this is a reference point
+rather than a head-to-head: the Claude runs wrote code without tools and could retry once;
+flywheel ran as an agent. flywheel was also tuned on this suite, and the suite is not public.
+The flywheel run predates the current build.
+
+### Reproducing the pilot
+
+Needs Docker, Harbor (`uv tool install harbor`), `zig`, and a local engine on `:8312`:
+
+```bash
+bench-tb/build-zig.sh
+bench-tb/run-slice.sh
+bench-tb/harvest.sh
 ```
-<suite>/suite.json          {"copy_files": [...], "clone_dirs": [...],
-                             "skip_deliverables": [...], "grade_script": "run_task.sh",
-                             "grade_timeout": 400}
-<suite>/tasks/<id>/prompt.md     task prompt
-<suite>/tasks/<id>/starter/      optional, copied into the sandbox
-<suite>/tasks/<id>/tests/        hidden tests (never shown to the agent)
-<suite>/run_task.sh <id> <dir>   grader -> one JSON line on stdout
+
+## Development
+
+```bash
+make              # build
+make test-unit    # unit tests, both HTTP transports
+make test         # unit tests + terminal UI tests
+make sanitize     # the same under AddressSanitizer and UBSan
 ```
 
-Per task: fresh `/tmp` sandbox (clone_dirs via `cp -cR` copy-on-write, fallback
-`cp -R`), in-process agent run, deliverables collected (skipping
-skip_deliverables + `*.test.*`/`*.spec.*`), graded, appended to
-`<suite>/runs/<tag>/summary.json`. Scoring: `gated` counts passed/total only
-when tsc/typecheck is clean; `raw` ignores the gate. Output format matches the
-retired Python harness, so scores are directly comparable across runs.
+The terminal UI tests drive the real binary through
+[mica-terminal](https://github.com/megasoft1978/mica-terminal), expected at `../mica-terminal`
+with `build/libvterm.a` built. Without it, `make test` skips them and says so.
 
-## Interactive TUI (v2)
+## License
 
-claude-code-style: pinned rounded input box, status line, scroll-region output,
-line editing (←→ home/end/del, ^W ^U ^K ^A ^E), history (↑↓), alt+enter
-multiline, bracketed paste with large-paste `[paste#N]` collapse, ctrl+V
-clipboard-image paste (macOS, saves `.flywheel/paste-N.png`), slash menu
-(/init /clear /model /allow /status /help /exit) with live filtering.
-
-## Permissions
-
-bash-only agent ⇒ interactive approval: `y` once · `a` always · `n` deny.
-"always" derives a prefix rule (two tokens for git/npx/npm/…) persisted to
-`.flywheel.allow` in the project (+ `~/.config/flywheel/allow` global).
-Builtin auto-allow: read-only commands (ls cat grep rg git status/diff/log…).
-Deny rules (sudo, rm -rf /, writes outside cwd) always win.
-Bench/one-shot modes auto-approve — no behavior change for automation.
-
-## Tests
-
-`make test` — unit (37: deny/heredoc/args/perm/utf8/msgs/sim) + pty integration
-(11: rendering, editing, menu, paste, exit). `make sanitize` — ASan+UBSan build.
+[MIT](LICENSE)
