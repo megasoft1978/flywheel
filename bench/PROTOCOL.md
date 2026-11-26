@@ -15,7 +15,11 @@ The result is published whatever it says.
 
 ## Rules
 - Freeze first: tagged commit, binary hash, engine and model versions, all settings.
-- No tuning on benchmark tasks. Harness work uses a separate development set.
+- No tuning on scored tasks. Harness work uses a development set, one task at a time:
+  run, read the trajectory, fix the general cause in the harness, add a test, re-run.
+- Development set: the 10 pilot tasks, plus more if needed. Everything outside it stays
+  unopened until the freeze. Development tasks are reported separately, never in the score.
+- A fix must be general. Nothing task-specific goes into the harness or its prompts.
 - Everyday tasks are written and frozen before any runner attempts them; each must fail
   untouched and pass with a reference solution.
 - One attempt per task in the first round, labelled as such. More trials later.
