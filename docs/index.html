@@ -102,7 +102,7 @@ footer{border-top:1px solid var(--line);padding:30px 0 56px;color:var(--dim);fon
 <section id="safety">
   <h2>Safety, stated plainly</h2>
   <p class="sub">flywheel runs shell commands on your machine. Here is what it does and does not protect against.</p>
-  <ul class="safe"><li>Asks before anything outside a short read-only list; chaining, redirection, expansion and write flags always prompt.</li><li>The approval dialog shows the whole command, with control and invisible characters made visible.</li><li>Keys typed before the dialog appears are ignored. Permission rules shipped inside a repository are not trusted.</li><li><b>One-shot and bench modes approve automatically.</b> Deny rules are best-effort. This is not a sandbox: run untrusted work in a container.</li></ul>
+  <ul class="safe"><li>Asks before anything outside a short read-only list; chaining, redirection, expansion and write flags always prompt. So does git, since repository config can make it run programs.</li><li>The approval dialog shows the whole command, with control and invisible characters made visible.</li><li>Keys typed before the dialog appears are ignored. Permission rules shipped inside a repository are not trusted.</li><li><b>One-shot and bench modes approve automatically.</b> Deny rules are best-effort. This is not a sandbox: run untrusted work in a container.</li></ul>
 </section>
 
 <section id="benchmarks">

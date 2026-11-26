@@ -71,8 +71,10 @@ static bool in_ranges(const Range *r, int n, const char *p) {
 
 /* ---------- best-effort shell scan (NOT a sandbox) ---------- */
 
-#define MAXWORDS 128
+#define MAXWORDS 4096
 #define MAXHEREDOC 8
+
+#define OPAQUE '\001'   /* word we cannot decode */
 
 /* Read one shell word at *s, removing quotes and backslashes. Stops at an
    unquoted blank or operator. out needs strlen(*s)+1 bytes. *sub is set to
@@ -86,6 +88,17 @@ static void read_word(const char **s, char *out, const char **sub) {
             p++;
             if (*p == '\n') p++;
             else if (*p) *w++ = *p++;
+        } else if (*p == '$' && p[1] == '"') {
+            p++;                                  /* locale quoting == "..." */
+        } else if (*p == '$' && p[1] == '\'') {
+            /* ANSI-C quoting: we do not decode escapes, so mark the word */
+            bool esc = false;
+            for (p += 2; *p && *p != '\''; p++) {
+                if (*p == '\\' && p[1]) { esc = true; *w++ = *p++; }
+                *w++ = *p;
+            }
+            if (*p) p++;
+            if (esc) *w++ = OPAQUE;
         } else if (*p == '\'') {
             for (p++; *p && *p != '\''; ) *w++ = *p++;
             if (*p) p++;
@@ -106,9 +119,24 @@ static void read_word(const char **s, char *out, const char **sub) {
     *s = p;
 }
 
+/* brace expansion or a dot-glob (".*" matches "..") can leave the project */
+static bool expands_unsafely(const char *w) {
+    if (strchr(w, OPAQUE)) return true;
+    for (const char *b = strchr(w, '{'); b; b = strchr(b + 1, '{'))
+        if ((b == w || b[-1] != '$') && strchr(b, '}') && (strchr(b, ',') || strstr(b, "..")))
+            return true;
+    for (const char *c = w; c; c = strchr(c, '/')) {
+        if (*c == '/') c++;
+        if (*c == '.' && c[1] && strchr(".*?[", c[1]) && strcspn(c, "*?[") < strcspn(c, "/"))
+            return true;
+    }
+    return false;
+}
+
 /* may `w` be written/removed? inside cwd, /tmp or harmless /dev nodes */
 static bool path_ok(const char *w, const char *cwd) {
     if (!*w) return true;
+    if (expands_unsafely(w)) return false;
     const char *home = getenv("HOME") ? getenv("HOME") : "/nonexistent-home";
     char ex[PATH_MAX], abs[PATH_MAX], norm[PATH_MAX], real[PATH_MAX];
     const char *rest = NULL;
@@ -163,6 +191,7 @@ static const char *check_simple(char **v, int n, const char *cwd, int depth) {
         wrapped = true;
     }
     if (i >= n) return NULL;
+    if (strchr(v[i], OPAQUE)) return E_RULE;
     char **a = v + i + 1;
     int na = n - i - 1;
 
@@ -217,7 +246,7 @@ static const char *check_simple(char **v, int n, const char *cwd, int depth) {
 /* Walk a script: split into simple commands, check redirect targets, skip
    heredoc payloads and comments (they're data, not shell syntax). */
 static const char *scan_script(const char *s, const char *cwd, int depth) {
-    if (depth > 4) return NULL;
+    if (depth > 4) return E_RULE;   /* too deep to check: fail closed */
     char *arena = malloc(2 * strlen(s) + 2), *top = arena;
     char *v[MAXWORDS];
     char delim[MAXHEREDOC][64];
@@ -297,7 +326,10 @@ static const char *scan_script(const char *s, const char *cwd, int depth) {
             if (!path_ok(w, cwd)) err = E_OUTSIDE;
         } else if (!redir_in) {
             bool fd = *p == '>' && *w && strspn(w, "0123456789") == strlen(w);
-            if (!fd && n < MAXWORDS) v[n++] = w;
+            if (!fd) {
+                if (n < MAXWORDS) v[n++] = w;
+                else err = E_RULE;
+            }
         }
         redir_out = redir_in = false;
     }
@@ -551,8 +583,7 @@ char *run_bash(const char *cmd, const char *cwd, int timeout_s) {
 
 static const char *BUILTIN_ALLOW[] = {
     "ls", "cat", "grep", "rg", "find", "fd", "head", "tail", "wc", "echo",
-    "pwd", "file", "stat", "which", "git status", "git diff", "git log",
-    "git show", "git rev-parse", "git branch", "cd", "true",
+    "pwd", "file", "stat", "which", "cd", "true",
     "printf", "test", "sort", "uniq", "tr", "cut",
     NULL
 };

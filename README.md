@@ -91,7 +91,8 @@ Small local models fail in repetitive, recoverable ways. flywheel handles them i
 flywheel runs shell commands on your machine. **It is not a sandbox.**
 
 - **Interactive mode** asks before running anything that is not on a short read-only list.
-  Chaining, redirection, shell expansion and write or exec flags always prompt.
+  Chaining, redirection, shell expansion and write or exec flags always prompt. So does
+  `git`, because a repository's config and hooks can make even `git status` run a program.
 - The approval dialog shows the whole command, with control and invisible characters made
   visible, and ignores keys typed before it appeared.
 - "Always allow" rules are stored per project under `~/.config/flywheel/`. Rules shipped
