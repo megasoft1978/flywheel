@@ -30,7 +30,7 @@ TIMEOUT_MULT="${TB_TIMEOUT_MULT:-1.0}"    # 1.0 = dataset per-task defaults, no 
 CONCURRENCY=1                             # single-slot local engine
 ATTEMPTS=1                                # one trial per task
 
-usage() { sed -n '2,/^set /{/^set /!p;}' "$0"; }
+usage() { sed -n '2,/^set /{/^set /!p;}' "$(basename "$0")"; }
 need() { [ $# -ge 2 ] && [ -n "$2" ] && [[ "$2" != --* ]] || { echo "$1 needs a value" >&2; exit 2; }; }
 
 HARNESS=""; TASKS_FILE=""
