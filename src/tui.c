@@ -4,6 +4,10 @@
 #include <termios.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <limits.h>
 #include <signal.h>
 #include <wchar.h>
 #include <errno.h>
@@ -15,6 +19,8 @@
    - collapsed Bash(...) command blocks by default; click (SGR mouse ?1000h/?1006h)
      or press ^O to expand/collapse in place
    - mouse wheel + PageUp/PageDown smooth transcript scrolling
+   - /mouse turns mouse reporting off so the terminal can select text again;
+     /copy puts the last reply on the clipboard (pbcopy, or OSC 52 over SSH)
    - interactive Claude-Code-style modal menu for bash approvals & multi-choice
      prompts (↑↓ + Enter, 1-9, y/a/n shortcuts, or mouse click)
    - rounded input box + slash menu below it + status bar pinned at bottom
@@ -27,6 +33,7 @@ static struct termios saved_t;
 static int rows = 24, cols = 80;
 static char status[256] = "ready";
 static bool raw_on, working;
+static bool mouse_on = true;      /* mouse reporting wanted; toggled by /mouse */
 /* one message (collapsed pastes expanded) may hold this much; anything larger
    is refused whole, with a notice in the status bar */
 #define INPUT_MAX (1u << 20)
@@ -76,11 +83,15 @@ static const struct { const char *cmd, *desc; } SLASH[] = {
     {"/model",  "show or switch model (/model NAME)"},
     {"/allow",  "list this project's permission rules"},
     {"/status", "engine, model, profile, conversation size"},
+    {"/copy",   "copy the last reply to the clipboard"},
+    {"/mouse",  "mouse on/off (off: select text natively)"},
     {"/help",   "keys, mouse, and commands"},
     {"/exit",   "quit flywheel"},
     {"/quit",   "quit flywheel"},
     {NULL, NULL}
 };
+
+#define MENU_MAX 16               /* room for every slash command */
 
 /* ---------- structured transcript ---------- */
 
@@ -110,6 +121,7 @@ static int max_scroll = 0;
 static int row_tool_idx[512];    /* screen row (0-based) -> tool item index, or -1 */
 static int slash_menu_top = -1;  /* screen row (0-based) where slash menu starts */
 static int slash_menu_cnt = 0;
+static int slash_menu_off = 0;   /* first command shown when not all fit */
 
 /* active modal menu (approval / multi-choice), NULL when normal input box is shown */
 typedef struct {
@@ -291,6 +303,17 @@ static int utf8_next(const char *s, int len, int pos) {
 
 /* ---------- terminal mode ---------- */
 
+#define MOUSE_ON_SEQ  "\033[?1000h\033[?1006h"
+#define MOUSE_OFF_SEQ "\033[?1006l\033[?1000l"
+
+/* the modifier that makes the terminal select text while it reports the mouse */
+static const char *select_key(void) {
+    const char *t = getenv("TERM_PROGRAM");
+    if (t && !strcmp(t, "Apple_Terminal")) return "Fn";
+    if (t && !strcmp(t, "iTerm.app")) return "Option";
+    return "Shift (iTerm2: Option, Terminal: Fn)";
+}
+
 static void term_raw(bool on) {
     if (on && !raw_on) {
         tcgetattr(0, &saved_t);
@@ -300,11 +323,12 @@ static void term_raw(bool on) {
         t.c_cc[VMIN] = 0; t.c_cc[VTIME] = 1;
         tcsetattr(0, TCSANOW, &t);
         /* bracketed paste + SGR click/wheel mouse reporting */
-        fputs("\033[?2004h\033[?1000h\033[?1006h", stdout);
+        fputs("\033[?2004h", stdout);
+        if (mouse_on) fputs(MOUSE_ON_SEQ, stdout);
         fflush(stdout);
         raw_on = true;
     } else if (!on && raw_on) {
-        fputs("\033[?1006l\033[?1000l\033[?2004l", stdout);
+        fputs(MOUSE_OFF_SEQ "\033[?2004l", stdout);
         fflush(stdout);
         tcsetattr(0, TCSANOW, &saved_t);
         raw_on = false;
@@ -368,9 +392,8 @@ static int menu_matches(const char **out, int max) {
 }
 
 static int menu_count(void) {
-    const char *m[8];
-    int n = menu_matches(m, 8);
-    return n > 6 ? 6 : n;
+    const char *m[MENU_MAX];
+    return menu_matches(m, MENU_MAX);
 }
 
 /* ---------- transcript visual line builder ---------- */
@@ -1066,8 +1089,8 @@ static void build_item(VBuf *vb, const TItem *it, int i) {
                     char hint[160];
                     int hidden = nl - 2;
                     if (hidden < 1) hidden = 1;
-                    snprintf(hint, sizeof hint, "     " DIM "… +%d line%s (click or ^O to expand)" RESET,
-                             hidden, hidden == 1 ? "" : "s");
+                    snprintf(hint, sizeof hint, "     " DIM "… +%d line%s (%s^O to expand)" RESET,
+                             hidden, hidden == 1 ? "" : "s", mouse_on ? "click or " : "");
                     vb_push(vb, hint, i);
                 }
             } else {
@@ -1084,9 +1107,11 @@ static void build_item(VBuf *vb, const TItem *it, int i) {
                 vb_wrap(vb, chunk, "  " GRAY "⎿  ", 5, "     ", 5, GRAY, RESET, i);
                 char hint[160];
                 if (*p)
-                    snprintf(hint, sizeof hint, "     " DIM "… truncated (click or ^O to collapse)" RESET);
+                    snprintf(hint, sizeof hint, "     " DIM "… truncated (%s^O to collapse)" RESET,
+                             mouse_on ? "click or " : "");
                 else
-                    snprintf(hint, sizeof hint, "     " DIM "▴ click or ^O to collapse" RESET);
+                    snprintf(hint, sizeof hint, "     " DIM "▴ %s^O to collapse" RESET,
+                             mouse_on ? "click or " : "");
                 vb_push(vb, hint, i);
             }
         }
@@ -1288,8 +1313,19 @@ static void render_screen(void) {
         if (vstart < 0) vstart = 0;
         mc = menu_count();
         ch = vis + 2 + mc + 1;
-        if (ch > rows - 2) { mc = 0; ch = vis + 3; }
-        if (menu_sel >= mc) menu_sel = mc > 0 ? mc - 1 : 0;
+        if (ch > rows - 2) {      /* short window: show what fits */
+            mc -= ch - (rows - 2);
+            if (mc < 0) mc = 0;
+            ch = vis + 3 + mc;
+        }
+        /* the selection runs over every match; the visible rows follow it */
+        int total = menu_count();
+        if (menu_sel >= total) menu_sel = total > 0 ? total - 1 : 0;
+        if (mc == 0) menu_sel = 0;
+        if (menu_sel < slash_menu_off) slash_menu_off = menu_sel;
+        if (menu_sel >= slash_menu_off + mc) slash_menu_off = menu_sel - mc + 1;
+        if (slash_menu_off > total - mc) slash_menu_off = total - mc;
+        if (slash_menu_off < 0 || mc == 0) slash_menu_off = 0;
     }
 
     int view_h = rows - ch;
@@ -1371,13 +1407,14 @@ static void render_screen(void) {
         int below = m->body_total - m->body_scroll - m->body_vis;
         if (m->body_total > m->body_vis) {
             if (m->approval && modal_unseen(m) > 0)
-                snprintf(line, sizeof line, " ▲%d ▼%d lines hidden · PgDn/Space/wheel · view all to allow",
-                         m->body_scroll, below);
+                snprintf(line, sizeof line, " ▲%d ▼%d lines hidden · PgDn/Space%s · view all to allow",
+                         m->body_scroll, below, mouse_on ? "/wheel" : "");
             else
                 snprintf(line, sizeof line, " ▲%d ▼%d lines hidden · PgUp/PgDn · Enter · Esc cancel",
                          m->body_scroll, below);
         } else {
-            snprintf(line, sizeof line, " ↑↓ choose · Enter/1-%d or click · Esc cancel", m->nopts);
+            snprintf(line, sizeof line, " ↑↓ choose · Enter/1-%d%s · Esc cancel", m->nopts,
+                     mouse_on ? " or click" : "");
         }
         if (m->approval && paste_suspect)
             snprintf(line, sizeof line, " paste interrupted: Esc to deny");
@@ -1409,11 +1446,11 @@ static void render_screen(void) {
 
         /* Slash menu below input box */
         if (mc > 0) {
-            const char *m[8];
-            int nm = menu_matches(m, 8);
+            const char *m[MENU_MAX];
+            int nm = menu_matches(m, MENU_MAX);
             slash_menu_top = r - 1;   /* 0-based */
             slash_menu_cnt = mc < nm ? mc : nm;
-            for (int i = 0; i < slash_menu_cnt; i++, r++) {
+            for (int i = slash_menu_off; i < slash_menu_off + slash_menu_cnt; i++, r++) {
                 const char *desc = "";
                 for (int j = 0; SLASH[j].cmd; j++)
                     if (!strcmp(SLASH[j].cmd, m[i])) { desc = SLASH[j].desc; break; }
@@ -1678,7 +1715,18 @@ static bool handle_mouse_seq(const unsigned char *buf, int len, int *clicked_row
     if (term != 'M' && term != 'm') return false;
     int btn = 0, mx = 0, my = 0;
     if (sscanf((const char *)buf + 3, "%d;%d;%d", &btn, &mx, &my) != 3) return true;
-    if (term != 'M') return true; /* ignore button release */
+    static int press_x, press_y;
+    if (term != 'M') {
+        /* a left drag is an attempt to select text, which reporting swallows */
+        if (btn == 0 && (mx != press_x || my != press_y)) {
+            char b[sizeof notice];
+            snprintf(b, sizeof b, "to select: hold %s and drag, or /mouse", select_key());
+            set_notice(b);
+            render_screen();
+        }
+        return true;
+    }
+    if (btn == 0) { press_x = mx; press_y = my; }
     if (btn == 64) { /* wheel up */
         scroll_off += 3;
         if (scroll_off > max_scroll) scroll_off = max_scroll;
@@ -2123,6 +2171,278 @@ static void push_raw(const char *s) {
     render_screen();
 }
 
+/* ---------- /copy ---------- */
+
+/* longest text sent by OSC 52: about 100,000 base64 bytes, a common terminal limit */
+#define OSC52_MAX 74994
+#define PBCOPY_TIMEOUT_S 5.0
+
+/* bytes of the England, Scotland or Wales flag at p (U+1F3F4, tag letters,
+   U+E007F), else 0: the only tag characters that are not hidden text */
+static int flag_len(const unsigned char *p) {
+    static const char *const FLAGS[] = {"gbeng", "gbsct", "gbwls"};
+    for (size_t f = 0; f < sizeof FLAGS / sizeof *FLAGS; f++) {
+        unsigned char seq[32] = {0xF0, 0x9F, 0x8F, 0xB4};
+        int n = 4;
+        for (const char *t = FLAGS[f]; *t; t++) {
+            seq[n++] = 0xF3; seq[n++] = 0xA0; seq[n++] = 0x81; seq[n++] = (unsigned char)(0x80 + (*t - 0x40));
+        }
+        seq[n++] = 0xF3; seq[n++] = 0xA0; seq[n++] = 0x81; seq[n++] = 0xBF;
+        if (!strncmp((const char *)p, (const char *)seq, (size_t)n)) return n;
+    }
+    return 0;
+}
+
+/* Malloc'd copy of s safe to paste anywhere: escape sequences, control
+   characters (all but newline and tab), invalid UTF-8, bidi/zero-width and tag
+   characters are removed, as are surrounding blank lines. */
+static char *plain_text(const char *s) {
+    size_t o = 0;
+    char *d = malloc(strlen(s) + 1);
+    if (!d) return NULL;
+    const unsigned char *p = (const unsigned char *)s;
+    while (*p) {
+        unsigned char c = *p;
+        if (c == 27) {
+            const unsigned char *q = p + 1;
+            if (*q == '[') {                              /* CSI */
+                q++;
+                while (*q >= 0x20 && *q <= 0x3F) q++;
+                if (*q >= 0x40 && *q <= 0x7E) q++;
+            } else if (*q && strchr("]P_^X", *q)) {       /* string up to BEL or ST */
+                const unsigned char *e = q + 1;
+                while (*e && *e != 7 && *e != 27 && *e != '\n') e++;
+                if (*e == 7) q = e + 1;
+                else if (*e == 27 && e[1] == '\\') q = e + 2;
+                else q++;                                 /* unterminated: keep the text */
+            }   /* anything else: drop only ESC, as what follows may matter */
+            p = q;
+            continue;
+        }
+        if (c < 0x80) {
+            if (c == '\n' || c == '\t' || (c >= 0x20 && c != 0x7F)) d[o++] = (char)c;
+            p++;
+            continue;
+        }
+        int len = c >= 0xC2 && c <= 0xDF ? 2 : (c & 0xF0) == 0xE0 ? 3 : c >= 0xF0 && c <= 0xF4 ? 4 : 0;
+        int k = 1;
+        while (k < len && (p[k] & 0xC0) == 0x80) k++;
+        if (!len || k < len || (c == 0xE0 && p[1] < 0xA0) || (c == 0xED && p[1] > 0x9F) ||
+            (c == 0xF0 && p[1] < 0x90) || (c == 0xF4 && p[1] > 0x8F)) { p++; continue; }
+        unsigned cp = c & (0x7Fu >> len);
+        for (int i = 1; i < len; i++) cp = (cp << 6) | (p[i] & 0x3F);
+        int take = flag_len(p);
+        /* ZWNJ joins Persian and Indic words: it is kept although is_hidden_cp flags it */
+        if (!take && cp >= 0xA0 && !(cp >= 0xE0000 && cp <= 0xE007F) &&
+            (cp == 0x200C || !is_hidden_cp(cp, false)))
+            take = len;                                   /* below A0: C1 controls */
+        memcpy(d + o, p, (size_t)take);
+        o += (size_t)take;
+        p += take ? take : len;
+    }
+    while (o && (d[o - 1] == '\n' || d[o - 1] == ' ' || d[o - 1] == '\t')) o--;
+    d[o] = 0;
+    size_t lead = strspn(d, "\n");
+    memmove(d, d + lead, o - lead + 1);
+    return d;
+}
+
+/* True if path is the project root or below it. Compared by device and inode
+   on each parent, so firmlink and bind aliases of the same directory match. */
+static bool path_within(const char *path, const struct stat *root) {
+    char p[PATH_MAX];
+    snprintf(p, sizeof p, "%s", path);
+    for (;;) {
+        struct stat st;
+        if (!stat(p, &st) && st.st_dev == root->st_dev && st.st_ino == root->st_ino) return true;
+        if (!strcmp(p, "/") || !*p) return false;
+        char *slash = strrchr(p, '/');
+        if (!slash) return false;
+        if (slash == p) strcpy(p, "/");
+        else *slash = 0;
+    }
+}
+
+/* Project root for PATH checks: the nearest ancestor of cwd with a .git entry,
+   else cwd. HOME or / as that ancestor means no repo, so cwd is used. */
+static bool project_root(char root[PATH_MAX], struct stat *rst) {
+    char dir[PATH_MAX], found[PATH_MAX] = "", home[PATH_MAX] = "";
+    if (!realpath(g_cfg.cwd, dir)) return false;
+    char cwd[PATH_MAX];
+    snprintf(cwd, sizeof cwd, "%s", dir);
+    const char *h = getenv("HOME");
+    if (!h || !realpath(h, home)) home[0] = 0;
+    for (;;) {
+        char g[PATH_MAX + 8];
+        struct stat st;
+        snprintf(g, sizeof g, "%s/.git", dir);
+        if (!stat(g, &st)) { snprintf(found, sizeof found, "%s", dir); break; }
+        if (!strcmp(dir, "/")) break;
+        char *slash = strrchr(dir, '/');
+        if (slash == dir) strcpy(dir, "/");
+        else *slash = 0;
+    }
+    bool use_repo = found[0] && strcmp(found, "/") && !(home[0] && !strcmp(found, home));
+    snprintf(root, PATH_MAX, "%s", use_repo ? found : cwd);
+    return !stat(root, rst);
+}
+
+/* First pbcopy on PATH that the project cannot have supplied: empty and
+   relative entries are skipped, as is anything resolving inside the project. */
+static bool find_pbcopy(char out[PATH_MAX]) {
+    char root[PATH_MAX];
+    struct stat rst;
+    const char *p = getenv("PATH");
+    if (!p || !project_root(root, &rst)) return false;
+    while (*p) {
+        size_t n = strcspn(p, ":");
+        char dir[PATH_MAX], file[PATH_MAX + 8], real_dir[PATH_MAX];
+        struct stat st;
+        if (n && n < sizeof dir && *p == '/') {
+            memcpy(dir, p, n);
+            dir[n] = 0;
+            snprintf(file, sizeof file, "%s/pbcopy", dir);
+            if (realpath(dir, real_dir) && !path_within(real_dir, &rst) &&
+                realpath(file, out) && !path_within(out, &rst) &&
+                !stat(out, &st) && S_ISREG(st.st_mode) && !access(out, X_OK))
+                return true;
+        }
+        p += n;
+        if (*p == ':') p++;
+    }
+    return false;
+}
+
+/* Feed s to pbcopy (see find_pbcopy, no shell). True only if it took everything
+   and exited successfully. */
+static bool run_pbcopy(const char *s, size_t n) {
+    int fd[2];
+    char prog[PATH_MAX];
+    if (!find_pbcopy(prog) || pipe(fd)) return false;
+    pid_t pid = fork();
+    if (pid < 0) { close(fd[0]); close(fd[1]); return false; }
+    if (pid == 0) {
+        dup2(fd[0], 0);
+        close(fd[0]);
+        close(fd[1]);
+        int nul = open("/dev/null", O_WRONLY);
+        if (nul >= 0) { dup2(nul, 1); dup2(nul, 2); }
+        /* pbcopy decodes its input by locale; without this non-ASCII is mangled */
+        unsetenv("LC_ALL");
+        setenv("LC_CTYPE", "UTF-8", 1);
+        execv(prog, (char *const[]){"pbcopy", NULL});
+        _exit(127);
+    }
+    close(fd[0]);
+    fcntl(fd[1], F_SETFL, O_NONBLOCK);
+    double end = mono_now() + PBCOPY_TIMEOUT_S;
+    struct timespec nap = {.tv_sec = 0, .tv_nsec = 5000000};
+    size_t off = 0;
+    while (off < n && mono_now() < end) {
+        ssize_t w = write(fd[1], s + off, n - off);
+        if (w > 0) off += (size_t)w;
+        else if (w < 0 && errno != EAGAIN && errno != EINTR) break;
+        else nanosleep(&nap, NULL);
+    }
+    close(fd[1]);
+    int st = 0;
+    pid_t r;
+    while ((r = waitpid(pid, &st, WNOHANG)) == 0 && mono_now() < end) nanosleep(&nap, NULL);
+    if (r == 0) { kill(pid, SIGKILL); waitpid(pid, &st, 0); return false; }
+    return r == pid && off == n && WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+
+static void send_osc52(const char *s, size_t n) {
+    static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    fputs("\033]52;c;", stdout);
+    for (size_t i = 0; i < n; i += 3) {
+        unsigned v = (unsigned)(unsigned char)s[i] << 16;
+        if (i + 1 < n) v |= (unsigned)(unsigned char)s[i + 1] << 8;
+        if (i + 2 < n) v |= (unsigned char)s[i + 2];
+        putchar(b64[v >> 18]);
+        putchar(b64[(v >> 12) & 63]);
+        putchar(i + 1 < n ? b64[(v >> 6) & 63] : '=');
+        putchar(i + 2 < n ? b64[v & 63] : '=');
+    }
+    putchar('\a');
+    fflush(stdout);
+}
+
+/* plain_text of items [from, to): the T_TEXT ones, joined as they streamed */
+static char *reply_text(int from, int to) {
+    size_t n = 0, o = 0;
+    for (int i = from; i < to; i++)
+        if (items[i].kind == T_TEXT) n += items[i].len;
+    char *all = malloc(n + 1);
+    if (!all) return NULL;
+    for (int i = from; i < to; i++)
+        if (items[i].kind == T_TEXT && items[i].len) {
+            memcpy(all + o, items[i].text, items[i].len);
+            o += items[i].len;
+        }
+    all[o] = 0;
+    char *d = plain_text(all);
+    free(all);
+    return d;
+}
+
+static void copy_last_reply(void) {
+    char *text = NULL;
+    /* a reply is a run of text and reasoning items; anything else ends it */
+    for (int end = nitems; end > 0 && !text; ) {
+        int from = end;
+        while (from > 0 && (items[from - 1].kind == T_TEXT || items[from - 1].kind == T_THINK)) from--;
+        if (from == end) { end--; continue; }
+        text = reply_text(from, end);
+        if (text && !text[0]) { free(text); text = NULL; }
+        end = from;
+    }
+    if (!text) { push_raw("  nothing to copy: no assistant reply yet"); return; }
+    size_t n = strlen(text);
+    bool local_mac = false;
+#ifdef __APPLE__
+    local_mac = !getenv("SSH_CONNECTION") && !getenv("SSH_TTY") && !getenv("SSH_CLIENT");
+#endif
+    char b[320];
+    bool sent = true;
+    if (local_mac && run_pbcopy(text, n)) {
+        snprintf(b, sizeof b, GREEN "  ✓ copied the last reply" RESET " (%zu bytes, pbcopy)", n);
+    } else {
+        const char *failed = local_mac ? "pbcopy failed. " : "";
+        if (n > OSC52_MAX) {
+            sent = false;
+            snprintf(b, sizeof b, YELLOW "  not copied:" RESET
+                     " %sThe reply is %zu bytes,\n  over the %d-byte OSC 52 limit.", failed, n, OSC52_MAX);
+        } else {
+            send_osc52(text, n);
+            snprintf(b, sizeof b, YELLOW "  %sSent the last reply (%zu bytes) with OSC 52." RESET
+                     "\n  Not confirmed: the terminal may ignore it, so paste to check.%s",
+                     failed, n, getenv("TMUX") ? "\n  tmux needs set-clipboard on." : "");
+        }
+    }
+    size_t lines = 1;
+    for (const char *p = text; *p; p++) lines += *p == '\n';
+    if (sent && lines > 1)
+        snprintf(b + strlen(b), sizeof b - strlen(b),
+                 "\n  It has several lines (%zu): check before pasting into a shell.", lines);
+    free(text);
+    push_raw(b);
+}
+
+static void toggle_mouse(void) {
+    mouse_on = !mouse_on;
+    fputs(mouse_on ? MOUSE_ON_SEQ : MOUSE_OFF_SEQ, stdout);
+    fflush(stdout);
+    char b[320];
+    if (mouse_on)
+        snprintf(b, sizeof b, "  mouse on: wheel scrolls, click expands.\n  To select text hold %s and drag.",
+                 select_key());
+    else
+        snprintf(b, sizeof b, "  mouse off: drag to select text. The wheel no longer scrolls this view:\n"
+                 "  use PgUp/PgDn. ^O expands the latest block. /mouse turns it back on.");
+    push_raw(b);
+}
+
 static void run_slash(const char *cmd) {
     if (!strcmp(cmd, "/init")) {
         term_raw(false);
@@ -2136,9 +2456,19 @@ static void run_slash(const char *cmd) {
         while (g_msgs->n > 1) msgs_trunc(g_msgs, 1);
         transcript_clear();
         render_screen();
+    } else if (!strcmp(cmd, "/copy")) {
+        copy_last_reply();
+    } else if (!strcmp(cmd, "/mouse")) {
+        toggle_mouse();
     } else if (!strcmp(cmd, "/help")) {
-        push_raw("commands: /init /clear /model /allow /status /help /exit\n"
-                 "keys: ↑↓ history · Alt+Enter newline (Shift+Enter if the terminal sends it) · ^O expand/collapse cmd · PgUp/PgDn or wheel scroll · Esc aborts · ^C clear · ^D quit");
+        char b[700];
+        snprintf(b, sizeof b,
+                 "commands: /init /clear /model /allow /status /copy /mouse /help /exit\n"
+                 "keys: ↑↓ history · Alt+Enter newline (Shift+Enter if the terminal sends it) · ^O expand/collapse cmd · PgUp/PgDn%s scroll · Esc aborts · ^C clear · ^D quit\n"
+                 "copy: /copy takes the last reply · /mouse lets the terminal select text\n"
+                 "mouse on: hold %s and drag to select",
+                 mouse_on ? " or wheel" : "", select_key());
+        push_raw(b);
     } else if (!strncmp(cmd, "/model", 6)) {
         if (cmd[6] == ' ' && cmd[7]) {
             free(g_cfg.model);
@@ -2320,9 +2650,9 @@ static void handle_key(unsigned char ch, bool busy) {
             /* Click on an item in the open slash menu? */
             if (clicked >= 0 && slash_menu_top >= 0 &&
                 clicked >= slash_menu_top && clicked < slash_menu_top + slash_menu_cnt) {
-                const char *m[8];
-                int nm = menu_matches(m, 8);
-                int idx = clicked - slash_menu_top;
+                const char *m[MENU_MAX];
+                int nm = menu_matches(m, MENU_MAX);
+                int idx = slash_menu_off + clicked - slash_menu_top;
                 if (idx < nm) {
                     const char *pick = m[idx];
                     ilen = icur = 0; inbuf[0] = 0; hpos = -1; menu_sel = 0; menu_dismissed = false;
@@ -2404,8 +2734,8 @@ if (busy) {
         render_screen(); return;
     }
     if (ch == '\t') {   /* tab completes slash */
-        const char *m[8];
-        int nm = menu_matches(m, 8);
+        const char *m[MENU_MAX];
+        int nm = menu_matches(m, MENU_MAX);
         if (nm) {
             const char *pick = m[menu_sel < nm ? menu_sel : 0];
             int plen = 0;
@@ -2428,8 +2758,8 @@ if (busy) {
         inbuf[ilen] = 0;
         if (!ilen) { render_screen(); return; }
         if (menu_count() && !strchr(inbuf, ' ')) {
-            const char *m[8];
-            int nm = menu_matches(m, 8);
+            const char *m[MENU_MAX];
+            int nm = menu_matches(m, MENU_MAX);
             if (nm) {
                 const char *pick = m[menu_sel < nm ? menu_sel : 0];
                 int plen = 0;

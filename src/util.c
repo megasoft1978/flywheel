@@ -25,7 +25,7 @@ char *read_file(const char *path) {
 
 /* code points that reorder or hide text. ZWJ and VS16 build ordinary emoji,
    and tag characters flags, so those only show when strict. */
-static bool is_hidden_cp(unsigned cp, bool strict) {
+bool is_hidden_cp(unsigned cp, bool strict) {
     if (cp == 0x200D || cp == 0xFE0F || (cp >= 0xE0000 && cp <= 0xE007F)) return strict;
     return cp == 0x061C || (cp >= 0x200B && cp <= 0x200F) || (cp >= 0x2028 && cp <= 0x202E) ||
            (cp >= 0x2060 && cp <= 0x2069) || cp == 0xFEFF;
