@@ -167,6 +167,34 @@ static void reply(int cfd, const char *key, const char *val, bool tool) {
     close(cfd);
 }
 
+/* report what the model received: decoded length, newlines, control bytes, tail */
+static bool handle_probe(int cfd, const char *last_msg) {
+    const char *p = strstr(last_msg, "\"content\":\"");
+    if (!p) return false;
+    p += 11;
+    if (strncmp(p, "PROBE", 5)) return false;
+    size_t len = 0, nl = 0, ctl = 0;
+    char tail[9] = "        ";
+    while (*p && *p != '"') {
+        char c = *p++;
+        if (c == '\\' && *p) {
+            char e = *p++;
+            if (e == 'n') { c = '\n'; nl++; }
+            else if (e == 't') c = '\t';
+            else if (e == 'u') { c = '?'; ctl++; p += 4; }
+            else if (e == 'r' || e == 'b' || e == 'f') { c = '?'; ctl++; }
+            else c = e;
+        }
+        memmove(tail, tail + 1, 7);
+        tail[7] = c == '\n' ? ' ' : c;
+        len++;
+    }
+    char out[128];
+    snprintf(out, sizeof out, "PROBE len=%zu nl=%zu ctl=%zu end=%s", len, nl, ctl, tail);
+    reply(cfd, "content", out, false);
+    return true;
+}
+
 /* hostile commands and model text; returns true if it answered */
 static bool handle_security(int cfd, const char *last_msg) {
     static char cmd[2048];
@@ -210,7 +238,7 @@ static bool handle_security(int cfd, const char *last_msg) {
 }
 
 static void handle_client(int cfd) {
-    char req[65536];
+    static char req[2 << 20];
     size_t got = 0;
     struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
     setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
@@ -258,6 +286,7 @@ static void handle_client(int cfd) {
         return;
     }
 
+    if (handle_probe(cfd, last_msg)) return;
     if (handle_security(cfd, last_msg)) return;
 
     if (strstr(last_msg, "STREAM_TEST")) {
@@ -558,6 +587,217 @@ static void security_tests(const char *dir, const char *cmd) {
     pump(s, 200);
     CHECK(s, "pasted tab kept", find_row(s, "tab here") >= 0);
     assert_box_borders(s, "borders intact with pasted tab");
+
+    mica_session_destroy(s);
+}
+
+#define PS "\033[200~"
+#define PE "\033[201~"
+
+/* raw bytes in small chunks so Mica's pending-input limit is never hit */
+static void send_big(MicaSession *s, const char *p, size_t n) {
+    while (n > 0) {
+        size_t k = n > 2048 ? 2048 : n;
+        mica_session_write(s, p, k);
+        p += k; n -= k;
+        mica_session_poll(s, 2);
+    }
+}
+
+/* bracketed paste of "PROBE " + fill + "END_TAIL", total bytes long */
+static void paste_probe(MicaSession *s, size_t total) {
+    char *b = malloc(total + 1);
+    memset(b, 'z', total);
+    memcpy(b, "PROBE ", 6);
+    memcpy(b + total - 8, "END_TAIL", 8);
+    type_str(s, PS);
+    send_big(s, b, total);
+    type_str(s, PE);
+    free(b);
+}
+
+static void keys(MicaSession *s, const char *k) { type_str(s, k); pump(s, 200); }
+
+static void fresh(MicaSession *s) {
+    keys(s, "\x03");
+    keys(s, "/clear\r");
+}
+
+static void input_tests(const char *dir, const char *cmd) {
+    MicaSession *s = mica_session_create(dir, cmd, 24, 80);
+    assert(s != NULL);
+    CHECK(s, "input: ready", wait_for_text(s, "ready", 3000));
+    pump(s, 150);
+
+    /* large pastes reach the model intact, also when recalled from history */
+    paste_probe(s, 12000);
+    keys(s, "\r");
+    CHECK(s, "big paste: 12000 bytes sent intact",
+          wait_for_text(s, "PROBE len=12000 nl=0 ctl=0 end=END_TAIL", 5000));
+    pump(s, 300);
+    fresh(s);
+    keys(s, "\033[A");          /* recalls /clear, which opens the menu */
+    keys(s, "\033");            /* close it so Up keeps walking history */
+    keys(s, "\033[A");
+    keys(s, "\r");
+    CHECK(s, "big paste: history recall resends it intact", wait_for_text(s, "PROBE len=12000", 5000));
+    pump(s, 300);
+    fresh(s);
+    paste_probe(s, 600000);
+    pump(s, 300);
+    keys(s, "\r");
+    CHECK(s, "big paste: 600000 bytes sent intact",
+          wait_for_text(s, "PROBE len=600000 nl=0 ctl=0 end=END_TAIL", 20000));
+    pump(s, 500);
+    fresh(s);
+    paste_probe(s, 1100000);
+    CHECK(s, "over cap: visible notice", wait_for_text(s, "over 1 MB", 30000));
+    CHECK(s, "over cap: nothing inserted", find_row(s, "Type a message") >= 0);
+
+    /* pasted content is literal */
+    fresh(s);
+    keys(s, PS "ab\x03" "cd\x04\x15\x0b\x17\x0f\x01\x1b[31mef\x1b[0mgh\x7f\x1bij" PE);
+    CHECK(s, "literal: control bytes and SGR never act", find_row(s, "› abcdefghij ") >= 0);
+    CHECK(s, "literal: ^D in paste does not quit", mica_session_is_running(s));
+    fresh(s);
+    keys(s, PS "PROBE\raa\r\nbb" PE);
+    CHECK(s, "literal: multiline paste collapses, not submitted",
+          find_row(s, "+3 lines]") >= 0 && find_row(s, "PROBE len") < 0);
+    keys(s, "\r");
+    CHECK(s, "literal: CR and CRLF become one newline",
+          wait_for_text(s, "PROBE len=11 nl=2 ctl=0", 4000));
+    pump(s, 300);
+    fresh(s);
+    keys(s, "\033[20");
+    keys(s, "0~SPLIT\x15X\033[2");
+    keys(s, "01~");
+    keys(s, "Y");
+    CHECK(s, "split markers: paste recognised", find_row(s, "› SPLITXY ") >= 0);
+    fresh(s);
+    type_str(s, "\033");
+    pump(s, 60);                  /* gap right after the ESC byte */
+    keys(s, "[200~LATE\x15MARK" PE);
+    CHECK(s, "split marker: gap after ESC", find_row(s, "› LATEMARK ") >= 0);
+    fresh(s);
+    type_str(s, PS "stuck-text");
+    CHECK(s, "unterminated paste: notice after idle", wait_for_text(s, "paste end marker missing", 7000));
+    CHECK(s, "unterminated paste: text kept", find_row(s, "› stuck-text") >= 0);
+    keys(s, "\x03" "after");
+    CHECK(s, "unterminated paste: keys work again",
+          find_row(s, "› after") >= 0 && find_row(s, "stuck-text") < 0);
+
+    /* Shift+Enter encodings */
+    fresh(s);
+    keys(s, "one\033[13;2utwo\033[27;2;13~three");
+    int r = find_row(s, "› one");
+    CHECK(s, "Shift+Enter: CSI-u and modifyOtherKeys insert newlines",
+          r >= 0 && find_row(s, "  two") == r + 1 && find_row(s, "  three") == r + 2);
+
+    /* collapsed tokens are atomic */
+    fresh(s);
+    keys(s, PS "L1\rL2" PE);
+    keys(s, "\x7f");
+    CHECK(s, "token: backspace removes it whole",
+          find_row(s, "[paste#") < 0 && find_row(s, "Type a message") >= 0);
+    keys(s, "\x03" PS "L1\rL2" PE);
+    keys(s, "\x01\033[3~");
+    CHECK(s, "token: delete removes it whole", find_row(s, "Type a message") >= 0);
+    keys(s, "\x03" "word " PS "L1\rL2" PE);
+    keys(s, "\x17");
+    CHECK(s, "token: ^W removes it whole",
+          find_row(s, "[paste#") < 0 && find_row(s, "lines]") < 0 && find_row(s, "› word") >= 0);
+    keys(s, "\x03" "PROBE " PS "L1\rL2" PE);
+    keys(s, "\033[Da\033[Cb");
+    CHECK(s, "token: cursor steps over it",
+          find_row(s, "PROBE a[paste#") >= 0 && find_row(s, "lines]b") >= 0);
+    keys(s, "\r");
+    CHECK(s, "token: expands intact after editing around it", wait_for_text(s, "PROBE len=13 nl=1", 4000));
+    pump(s, 300);
+
+    /* a full queue keeps the message */
+    fresh(s);
+    keys(s, "SLOW_TEST\r");
+    CHECK(s, "queue: stream starts", wait_for_text(s, "tick-0", 3000));
+    for (int i = 0; i < 8; i++) keys(s, "queued-msg\r");
+    keys(s, "ninth-msg\r");
+    CHECK(s, "queue full: visible notice", find_row(s, "queue full") >= 0);
+    CHECK(s, "queue full: message stays in input", find_row(s, "› ninth-msg") >= 0);
+    keys(s, "\x1b");
+    CHECK(s, "queue: abort", wait_for_text(s, "error:aborted", 4000));
+    pump(s, 300);
+    fresh(s);
+    keys(s, "SLOW_TEST\r");
+    CHECK(s, "queue: second stream starts", wait_for_text(s, "tick-0", 3000));
+    paste_probe(s, 20000);
+    keys(s, "\r");
+    CHECK(s, "queued big paste sent intact",
+          wait_for_text(s, "PROBE len=20000 nl=0 ctl=0 end=END_TAIL", 20000));
+    pump(s, 300);
+
+    /* paste never answers the approval dialog */
+    fresh(s);
+    CHECK(s, "modal paste: modal", open_modal(s, "SEC_EARLY"));
+    pump(s, 700);
+    keys(s, PS "\x03" PE);
+    CHECK(s, "modal paste: ^C ignored", find_row(s, "Do you want to proceed?") >= 0);
+    keys(s, PS "x\x1b");
+    keys(s, "1y\r" PE);
+    keys(s, PS "x\x1b\x1b" PE);
+    CHECK(s, "modal paste: ESC and digits ignored",
+          find_row(s, "Do you want to proceed?") >= 0 && !made(dir, "EARLY_PAYLOAD"));
+    pump(s, 700);                /* the guard restarts when a paste ends */
+    keys(s, "\r");
+    CHECK(s, "modal paste: real Enter still answers (default No)",
+          wait_for_text(s, "✓ done", 4000) && !made(dir, "EARLY_PAYLOAD"));
+    close_modal(s);
+    fresh(s);
+    type_str(s, "SEC_EARLY\r" PS "half");
+    CHECK(s, "paste across modal open: modal", wait_for_text(s, "Do you want to proceed?", 4000));
+    pump(s, 700);
+    keys(s, "1y\r");
+    keys(s, PE);
+    CHECK(s, "paste across modal open: never answers",
+          find_row(s, "Do you want to proceed?") >= 0 && !made(dir, "EARLY_PAYLOAD"));
+    pump(s, 700);
+    keys(s, "\r");
+    wait_for_text(s, "✓ done", 4000);
+    close_modal(s);
+
+    /* a forged end marker inside the pasted text */
+    fresh(s);
+    CHECK(s, "forged end: modal", open_modal(s, "SEC_EARLY"));
+    pump(s, 700);
+    keys(s, PS "x" PE "1y\r" PE);
+    CHECK(s, "forged end: following bytes never answer",
+          find_row(s, "Do you want to proceed?") >= 0 && !made(dir, "EARLY_PAYLOAD"));
+    close_modal(s);
+
+    /* ... also when they keep streaming past the guard time */
+    fresh(s);
+    CHECK(s, "forged end stream: modal", open_modal(s, "SEC_EARLY"));
+    pump(s, 700);
+    type_str(s, PS "x" PE);
+    for (int i = 0; i < 5; i++) { type_str(s, "z"); pump(s, 200); }
+    keys(s, "y");
+    pump(s, 500);
+    CHECK(s, "forged end stream: later y never answers",
+          find_row(s, "Do you want to proceed?") >= 0 && !made(dir, "EARLY_PAYLOAD"));
+    close_modal(s);
+
+    /* a stalled paste: the rest of it must not approve */
+    fresh(s);
+    CHECK(s, "stalled paste: modal", open_modal(s, "SEC_EARLY"));
+    pump(s, 700);
+    type_str(s, PS "half");
+    pump(s, 4500);
+    keys(s, "y");
+    keys(s, "1");
+    CHECK(s, "stalled paste: y and 1 run nothing",
+          find_row(s, "Do you want to proceed?") >= 0 && !made(dir, "EARLY_PAYLOAD"));
+    CHECK(s, "stalled paste: dialog says so", find_row(s, "paste interrupted") >= 0);
+    keys(s, "\x1b");
+    CHECK(s, "stalled paste: Esc denies",
+          wait_for_text(s, "✓ done", 4000) && !made(dir, "EARLY_PAYLOAD"));
 
     mica_session_destroy(s);
 }
@@ -937,6 +1177,7 @@ int main(int argc, char **argv) {
 
     mica_session_destroy(s);
     security_tests(testdir, cmd);
+    input_tests(testdir, cmd);
     stop_mock_server(srv_th);
 
     char rm[1200];

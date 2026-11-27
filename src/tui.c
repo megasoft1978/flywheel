@@ -19,15 +19,21 @@
      prompts (↑↓ + Enter, 1-9, y/a/n shortcuts, or mouse click)
    - rounded input box + slash menu below it + status bar pinned at bottom
    - UTF-8 / emoji width via wcwidth(), soft-wrapped input (up to 4 visible rows)
-   - Shift+Enter / Alt+Enter multiline, bracketed paste (?2004h) with [paste#N] collapse
+   - Alt+Enter (and Shift+Enter where the terminal sends it) multiline
+   - bracketed paste (?2004h) taken literally, with [paste#N] collapse
    - SIGWINCH live resize with full transcript re-wrap; Esc aborts streams */
 
 static struct termios saved_t;
 static int rows = 24, cols = 80;
 static char status[256] = "ready";
 static bool raw_on, working;
-static char inbuf[8192];
+/* one message (collapsed pastes expanded) may hold this much; anything larger
+   is refused whole, with a notice in the status bar */
+#define INPUT_MAX (1u << 20)
+static char *inbuf;               /* grows on demand, NUL-terminated */
+static size_t incap;
 static int ilen, icur;
+static char notice[96];           /* replaces the status bar until the next key */
 static volatile sig_atomic_t g_resized = 0;
 
 #define MAXHIST 128
@@ -38,16 +44,31 @@ static void tui_pump(void);
 static char *HIST[MAXHIST];
 static int hist_n, hpos = -1;
 
-#define MAXPASTE 8
-static char *pastes[MAXPASTE];
-static int npastes;
-static int paste_start = -1, paste_bytes;
+typedef struct {
+    char *text;
+    size_t len;
+    char tok[48];                 /* what stands for text in the input box */
+} Paste;
+static Paste *pastes;
+static int npastes, cap_pastes;
+
+/* bracketed paste being received */
+#define PASTE_END "\033[201~"
+#define PASTE_IDLE_S 3.0          /* silence after which a lost end marker is assumed */
+static bool pasting, paste_discard, paste_over;
+/* a paste stopped without its end marker: later bytes may still be pasted ones,
+   so approvals are locked until the marker, Esc or ^C arrives */
+static bool paste_suspect;
+static char *pbuf;
+static size_t plen, pcap;
+static char ptail[6];             /* last bytes seen, to find the end marker */
+static double plast;
 
 /* message queue for input typed while the agent is busy */
-static char qmsg[8][16384];
+#define QMAX 8
+static char *qmsg[QMAX];
 static int qn;
 static bool want_exit;
-static bool pasting;
 
 static const struct { const char *cmd, *desc; } SLASH[] = {
     {"/init",   "write .flywheel.md project notes + check engine"},
@@ -456,7 +477,7 @@ static void vb_wrap(VBuf *vb, const char *text, const char *prefix0, int p0_w,
             }
             if ((unsigned char)*p < 0x20) { p++; continue; }
             int bl = 0;
-            int cw = utf8_cell_width(p, (int)strlen(p), &bl);
+            int cw = utf8_cell_width(p, (int)strnlen(p, 8), &bl);   /* strlen here is quadratic */
             if (bl <= 0) { p++; continue; }
             if (col + cw > maxw && col > (pfx ? pc_w : 0)) break;
             if (lw + (size_t)bl < lcap - 64) { memcpy(line + lw, p, (size_t)bl); lw += (size_t)bl; }
@@ -1149,6 +1170,10 @@ static void draw_status_bar(void) {
     if (qn > 0) snprintf(qtag, sizeof qtag, " · ⎿%d queued", qn);
 
     printf("\033[%d;1H" CLR_LINE, rows);
+    if (notice[0]) {
+        printf(YELLOW "%.*s" RESET, fit_bytes(notice, cols - 1), notice);
+        return;
+    }
     if (working) {
         const char *sp = SPIN_FRAMES[(g_stat.spin++) % 10];
         const char *ico = "⚙";
@@ -1354,6 +1379,8 @@ static void render_screen(void) {
         } else {
             snprintf(line, sizeof line, " ↑↓ choose · Enter/1-%d or click · Esc cancel", m->nopts);
         }
+        if (m->approval && paste_suspect)
+            snprintf(line, sizeof line, " paste interrupted: Esc to deny");
         printf("\033[%d;1H" CLR_LINE DIM "%.*s" RESET, rows, fit_bytes(line, cols - 1), line);
         /* Hide cursor on modal menu (or park at selected row) */
         printf("\033[%d;3H", m->opt_row_start + m->sel + 1);
@@ -1418,6 +1445,211 @@ static void render_screen(void) {
 
 static void set_status(const char *s) { clean_line(status, sizeof status, s); }
 
+/* ---------- input buffer & paste ---------- */
+
+static void set_notice(const char *s) { snprintf(notice, sizeof notice, "%s", s); }
+
+/* make room for n bytes plus the NUL */
+static bool in_reserve(size_t n) {
+    if (n < incap) return true;
+    size_t nc = incap ? incap : 1024;
+    while (nc <= n) nc *= 2;
+    char *p = realloc(inbuf, nc);
+    if (!p) return false;
+    if (!incap) p[0] = 0;
+    inbuf = p;
+    incap = nc;
+    return true;
+}
+
+static bool ins(const char *s, int n) {
+    if ((size_t)ilen + (size_t)n > INPUT_MAX || !in_reserve((size_t)ilen + (size_t)n)) {
+        set_notice("input over 1 MB refused");
+        return false;
+    }
+    memmove(inbuf + icur + n, inbuf + icur, (size_t)(ilen - icur));
+    memcpy(inbuf + icur, s, (size_t)n);
+    icur += n; ilen += n;
+    inbuf[ilen] = 0;
+    menu_dismissed = false;
+    return true;
+}
+
+static void in_set(const char *s) {
+    ilen = icur = 0;
+    inbuf[0] = 0;
+    ins(s, (int)strlen(s));
+}
+
+static void in_delete(int from, int to) {
+    memmove(inbuf + from, inbuf + to, (size_t)(ilen - to));
+    ilen -= to - from;
+    icur = from;
+    inbuf[ilen] = 0;
+}
+
+/* collapsed paste whose token starts at s (len bytes available), or -1 */
+static int paste_at(const char *s, size_t len) {
+    if (len == 0 || *s != '[') return -1;
+    for (int i = 0; i < npastes; i++) {
+        size_t tl = strlen(pastes[i].tok);
+        if (tl <= len && !memcmp(s, pastes[i].tok, tl)) return i;
+    }
+    return -1;
+}
+
+/* start of the token that pos is strictly inside of, else pos */
+static int token_start(int pos) {
+    for (int i = pos - 1; i >= 0 && i > pos - (int)sizeof pastes->tok; i--) {
+        int k = paste_at(inbuf + i, (size_t)(ilen - i));
+        if (k >= 0 && i + (int)strlen(pastes[k].tok) > pos) return i;
+    }
+    return pos;
+}
+
+/* cursor steps: a token counts as one character */
+static int in_prev(int pos) { return token_start(utf8_prev(inbuf, pos)); }
+static int in_next(int pos) {
+    int k = paste_at(inbuf + pos, (size_t)(ilen - pos));
+    return k >= 0 ? pos + (int)strlen(pastes[k].tok) : utf8_next(inbuf, ilen, pos);
+}
+
+/* length of s with every token replaced by its text; writes it to out if given */
+static size_t expand_into(char *out, const char *s) {
+    size_t w = 0, len = strlen(s);
+    for (size_t r = 0; r < len;) {
+        int k = paste_at(s + r, len - r);
+        if (k >= 0) {
+            if (out) memcpy(out + w, pastes[k].text, pastes[k].len);
+            w += pastes[k].len;
+            r += strlen(pastes[k].tok);
+        } else {
+            if (out) out[w] = s[r];
+            w++; r++;
+        }
+    }
+    if (out) out[w] = 0;
+    return w;
+}
+
+/* the message as the model gets it; NULL if it does not fit */
+static char *expand_pastes(const char *s) {
+    size_t n = expand_into(NULL, s);
+    char *out = n <= INPUT_MAX ? malloc(n + 1) : NULL;
+    if (out) expand_into(out, s);
+    return out;
+}
+
+/* keep text, newlines and tabs; CR/CRLF become newlines; other control bytes
+   and escape sequences are removed without touching what follows them */
+static size_t paste_sanitize(char *b, size_t n) {
+    size_t w = 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)b[i];
+        unsigned char d = i + 1 < n ? (unsigned char)b[i + 1] : 0;
+        if (c == '\r') {
+            b[w++] = '\n';
+            if (d == '\n') i++;
+        } else if (c == 27) {
+            if (d != '[') continue;
+            size_t j = i + 2;
+            while (j < n && b[j] >= 0x20 && b[j] <= 0x3F) j++;
+            if (j < n && b[j] >= 0x40 && b[j] <= 0x7E) i = j;   /* complete CSI */
+        } else if (c == 0xC2 && d >= 0x80 && d <= 0x9F) {
+            i++;                                                /* C1 control */
+        } else if ((c >= 32 && c != 127) || c == '\n' || c == '\t') {
+            b[w++] = (char)c;
+        }
+    }
+    return w;
+}
+
+/* put a finished paste into the input box, collapsed when it is big */
+static void paste_insert(const char *text, size_t n) {
+    if (expand_into(NULL, inbuf) + n > INPUT_MAX) {
+        set_notice("paste refused: message would be over 1 MB");
+        return;
+    }
+    size_t lines = 1;
+    for (size_t i = 0; i < n; i++) if (text[i] == '\n') lines++;
+    if (lines == 1 && n < 200) { ins(text, (int)n); return; }
+    if (npastes == cap_pastes) {
+        int nc = cap_pastes ? cap_pastes * 2 : 8;
+        Paste *np = realloc(pastes, (size_t)nc * sizeof *np);
+        if (!np) { set_notice("paste refused: out of memory"); return; }
+        pastes = np;
+        cap_pastes = nc;
+    }
+    Paste *e = &pastes[npastes];
+    e->text = str_ndup(text, n);
+    if (!e->text) { set_notice("paste refused: out of memory"); return; }
+    e->len = n;
+    snprintf(e->tok, sizeof e->tok, "[paste#%d +%zu lines]", npastes + 1, lines);
+    if (ins(e->tok, (int)strlen(e->tok))) npastes++;
+    else free(e->text);
+}
+
+/* discard: swallow the paste (a menu is open) */
+static void paste_begin(bool discard) {
+    pasting = true;
+    paste_discard = discard;
+    paste_over = false;
+    plen = 0;
+    memset(ptail, 0, sizeof ptail);
+    plast = mono_now();
+}
+
+static void paste_finish(bool lost_end) {
+    pasting = false;
+    if (lost_end) paste_suspect = true;
+    if (!paste_discard) {
+        if (paste_over) set_notice("paste over 1 MB refused");
+        else {
+            size_t n = paste_sanitize(pbuf, plen);
+            if (n) paste_insert(pbuf, n);
+            if (lost_end && !notice[0]) set_notice("paste end marker missing: kept what arrived");
+        }
+        menu_sel = 0;
+    }
+    free(pbuf);
+    pbuf = NULL;
+    plen = pcap = 0;
+    render_screen();
+}
+
+static void paste_feed(unsigned char ch) {
+    plast = mono_now();
+    memmove(ptail, ptail + 1, sizeof ptail - 1);
+    ptail[sizeof ptail - 1] = (char)ch;
+    if (!paste_discard && !paste_over) {
+        if (plen == pcap) {
+            size_t nc = pcap ? pcap * 2 : 4096;
+            char *nb = plen < INPUT_MAX + sizeof ptail ? realloc(pbuf, nc) : NULL;
+            if (nb) { pbuf = nb; pcap = nc; }
+            else paste_over = true;
+        }
+        if (plen >= INPUT_MAX + sizeof ptail) paste_over = true;
+        if (!paste_over) pbuf[plen++] = (char)ch;
+    }
+    if (!memcmp(ptail, PASTE_END, sizeof ptail)) {
+        if (!paste_over && !paste_discard) plen -= sizeof ptail;
+        paste_finish(false);
+    }
+}
+
+/* call when no input is pending: an unterminated paste must not wedge the UI */
+static void paste_tick(void) {
+    if (pasting && mono_now() - plast > PASTE_IDLE_S) paste_finish(true);
+}
+
+static void queue_clear(void) {
+    for (int i = 0; i < qn; i++) free(qmsg[i]);
+    qn = 0;
+}
+
+/* a pasted block that starts with '/' is a message, not a command */
+static bool is_slash(const char *s) { return s[0] == '/' && !strchr(s, '\n'); }
+
 /* Toggle latest tool output (Ctrl+O) or specific tool index (mouse click). */
 static bool item_toggleable(const TItem *it) {
     if (it->kind == T_TOOL && it->out) return true;
@@ -1470,18 +1702,34 @@ static bool handle_mouse_seq(const unsigned char *buf, int len, int *clicked_row
     return true;
 }
 
+/* a key that followed a lone Esc too late to be part of it */
+static int esc_late = -1;
+
 /* Collect one escape sequence after reading initial ESC (27). */
 static int read_esc_seq(unsigned char *buf, int cap) {
     int n = 0;
     buf[n++] = 27;
     unsigned char c2;
+    bool slow = false;
+    esc_late = -1;
     while (n < cap - 1) {
         fd_set ef;
         FD_ZERO(&ef);
         FD_SET(0, &ef);
-        struct timeval etv = {.tv_sec = 0, .tv_usec = 25000};
-        if (select(1, &ef, NULL, NULL, &etv) <= 0) break;
+        /* a paste marker may arrive in pieces; do not give up on it early */
+        bool marker = n >= 2 && n < 6 && !memcmp(buf, "\033[200~", (size_t)n);
+        struct timeval etv = {.tv_sec = 0, .tv_usec = marker ? 500000 : 25000};
+        int ready = select(1, &ef, NULL, NULL, &etv);
+        if (ready == 0 && n == 1) {
+            /* the '[' of a split marker may still be on its way */
+            slow = true;
+            FD_SET(0, &ef);
+            etv = (struct timeval){.tv_sec = 0, .tv_usec = 75000};
+            ready = select(1, &ef, NULL, NULL, &etv);
+        }
+        if (ready <= 0) break;
         if (read(0, &c2, 1) != 1) break;
+        if (slow && n == 1 && c2 != '[') { esc_late = c2; break; }
         buf[n++] = c2;
         if (n == 2 && c2 != '[' && c2 != 'O') break; /* e.g. Alt+Enter (\033\r) */
         if (n >= 3 && buf[1] == '[' && buf[2] == '<') {
@@ -1492,6 +1740,24 @@ static int read_esc_seq(unsigned char *buf, int cap) {
     }
     buf[n] = 0;
     return n;
+}
+
+/* drop what was typed ahead of an approval; a paste in it is tracked to its end
+   so the rest of it cannot answer */
+static void drain_typeahead(void) {
+    for (;;) {
+        fd_set rf;
+        FD_ZERO(&rf);
+        FD_SET(0, &rf);
+        struct timeval tv = {0, 0};
+        unsigned char ch, eb[32];
+        if (select(1, &rf, NULL, NULL, &tv) <= 0 || read(0, &ch, 1) != 1) return;
+        if (pasting) paste_feed(ch);
+        else if (ch == 27 && read_esc_seq(eb, sizeof eb) == 6) {
+            if (!memcmp(eb, "\033[200~", 6)) paste_begin(true);
+            else if (!memcmp(eb, PASTE_END, 6)) paste_suspect = false;
+        }
+    }
 }
 
 static void modal_scroll(Modal *m, int delta) {
@@ -1514,26 +1780,33 @@ static int tui_choose_menu(const char *title, const char *body, const char *prom
     };
     active_modal = &m;
     render_screen();
-    if (approval) {
-        tcflush(0, TCIFLUSH);
-        pasting = false;      /* the end marker of a cut paste may be gone */
-        paste_start = -1;
-    }
+    if (approval) drain_typeahead();
     double opened = mono_now();
 
     int result = -1;
-    bool in_paste = false;    /* pasted text never answers a menu */
     for (;;) {
         if (g_resized) { g_resized = 0; render_screen(); }
         fd_set rf;
         FD_ZERO(&rf);
         FD_SET(0, &rf);
         struct timeval tv = {.tv_sec = 0, .tv_usec = 100000};
-        if (select(1, &rf, NULL, NULL, &tv) <= 0) continue;
+        bool was_pasting = pasting;
+        if (select(1, &rf, NULL, NULL, &tv) <= 0) {
+            paste_tick();
+            if (was_pasting && !pasting) opened = mono_now();
+            continue;
+        }
 
         unsigned char ch = 0;
         if (read(0, &ch, 1) != 1) continue;
+        if (pasting) {   /* pasted text never answers a menu */
+            paste_feed(ch);
+            /* the marker may be part of the text: guard what follows it */
+            if (!pasting) opened = mono_now();
+            continue;
+        }
         bool guard = approval && mono_now() - opened < MODAL_GUARD_S;
+        if (guard) opened = mono_now();   /* approving takes this long without input */
         bool overflow = m.body_total > m.body_vis;
         int page = m.body_vis > 0 ? m.body_vis : 1;   /* never skips a line */
         int pick = -1;
@@ -1541,10 +1814,14 @@ static int tui_choose_menu(const char *title, const char *body, const char *prom
         if (ch == 27) {
             unsigned char eb[32];
             int en = read_esc_seq(eb, sizeof eb);
-            if (en == 1) { result = -1; break; }
-            if (en >= 6 && !memcmp(eb, "\033[200~", 6)) { in_paste = true; continue; }
-            if (en >= 6 && !memcmp(eb, "\033[201~", 6)) { in_paste = false; continue; }
-            if (in_paste) continue;
+            if (en == 1) { paste_suspect = false; result = -1; break; }
+            if (en >= 6 && !memcmp(eb, PASTE_END, 6)) {
+                paste_suspect = false;
+                opened = mono_now();
+                render_screen();
+                continue;
+            }
+            if (en >= 6 && !memcmp(eb, "\033[200~", 6)) { paste_begin(true); continue; }
             if (overflow && en >= 6 && eb[1] == '[' && eb[2] == '<') {
                 int btn = atoi((const char *)eb + 3);
                 if (btn == 64 || btn == 65) {
@@ -1571,8 +1848,7 @@ static int tui_choose_menu(const char *title, const char *body, const char *prom
             }
             if (pick < 0) continue;
         } else {
-            if (ch == 3) { result = -1; break; }               /* ^C cancels */
-            if (in_paste) continue;
+            if (ch == 3) { paste_suspect = false; result = -1; break; }   /* ^C cancels */
             if (ch == 15) { toggle_tool(-1); continue; }       /* ^O toggles last command */
             if (ch == ' ' && overflow) { modal_scroll(&m, page); continue; }
             if (guard) continue;
@@ -1589,7 +1865,7 @@ static int tui_choose_menu(const char *title, const char *body, const char *prom
             }
             if (pick < 0) continue;
         }
-        if (approval && pick < nopts - 1 && modal_unseen(&m) > 0) continue;
+        if (approval && pick < nopts - 1 && (paste_suspect || modal_unseen(&m) > 0)) continue;
         result = pick;
         break;
     }
@@ -1841,15 +2117,6 @@ void tui_run_task(const char *prompt) {
     drain_queue();
 }
 
-static void ins(const char *s, int n) {
-    if (ilen + n >= (int)sizeof inbuf - 1) return;
-    memmove(inbuf + icur + n, inbuf + icur, (size_t)(ilen - icur));
-    memcpy(inbuf + icur, s, (size_t)n);
-    icur += n; ilen += n;
-    inbuf[ilen] = 0;
-    menu_dismissed = false;
-}
-
 static void push_raw(const char *s) {
     TItem *r = item_new(T_RAW);
     item_append(r, s);
@@ -1871,7 +2138,7 @@ static void run_slash(const char *cmd) {
         render_screen();
     } else if (!strcmp(cmd, "/help")) {
         push_raw("commands: /init /clear /model /allow /status /help /exit\n"
-                 "keys: ↑↓ history · Shift/Alt+Enter newline · ^O expand/collapse cmd · PgUp/PgDn or wheel scroll · Esc aborts · ^C clear · ^D quit");
+                 "keys: ↑↓ history · Alt+Enter newline (Shift+Enter if the terminal sends it) · ^O expand/collapse cmd · PgUp/PgDn or wheel scroll · Esc aborts · ^C clear · ^D quit");
     } else if (!strncmp(cmd, "/model", 6)) {
         if (cmd[6] == ' ' && cmd[7]) {
             free(g_cfg.model);
@@ -1937,59 +2204,16 @@ static void run_slash(const char *cmd) {
     }
 }
 
-static void collapse_paste_if_big(void) {
-    if (paste_start < 0) return;
-    if (paste_start + paste_bytes > ilen) { paste_start = -1; return; }
-    bool multiline = false;
-    for (int i = paste_start; i < paste_start + paste_bytes; i++)
-        if (inbuf[i] == '\n') multiline = true;
-    if (!multiline && paste_bytes < 200) { paste_start = -1; return; }
-    if (npastes >= MAXPASTE) { paste_start = -1; return; }
-    pastes[npastes] = str_ndup(inbuf + paste_start, (size_t)paste_bytes);
-    char tok[48];
-    int lines = 1;
-    for (const char *p = pastes[npastes]; *p; p++) if (*p == '\n') lines++;
-    snprintf(tok, sizeof tok, "[paste#%d +%d lines]", npastes + 1, lines);
-    npastes++;
-    memmove(inbuf + paste_start, inbuf + paste_start + paste_bytes,
-            (size_t)(ilen - paste_start - paste_bytes));
-    ilen -= paste_bytes;
-    inbuf[ilen] = 0;
-    icur = paste_start;
-    ins(tok, (int)strlen(tok));
-    paste_start = -1;
-}
-
-static void expand_pastes(char *cmd, size_t cap) {
-    char *out = malloc(cap);
-    if (!out) return;
-    size_t w = 0;
-    for (size_t r = 0; cmd[r] && w < cap - 1;) {
-        int slot = -1;
-        size_t adv = 0;
-        if (cmd[r] == '[' && sscanf(cmd + r, "[paste#%d ", &slot) == 1) {
-            const char *close = strchr(cmd + r, ']');
-            if (close && slot >= 1 && slot <= npastes) adv = (size_t)(close - cmd - (ptrdiff_t)r + 1);
-            else slot = -1;
-        }
-        if (slot >= 1 && adv) {
-            const char *pc = pastes[slot - 1];
-            while (*pc && w < cap - 1) out[w++] = *pc++;
-            r += adv;
-        } else out[w++] = cmd[r++];
-    }
-    out[w] = 0;
-    memcpy(cmd, out, w + 1);
-    free(out);
-}
-
 void tui_cleanup(void) {
     transcript_clear();
     free(items); items = NULL; cap_items = 0;
     for (int i = 0; i < hist_n; i++) { free(HIST[i]); HIST[i] = NULL; }
     hist_n = 0;
-    for (int i = 0; i < npastes; i++) { free(pastes[i]); pastes[i] = NULL; }
-    npastes = 0;
+    for (int i = 0; i < npastes; i++) free(pastes[i].text);
+    free(pastes); pastes = NULL; npastes = cap_pastes = 0;
+    queue_clear();
+    free(pbuf); pbuf = NULL; plen = pcap = 0; pasting = false;
+    free(inbuf); inbuf = NULL; incap = 0; ilen = icur = 0;
 }
 
 static void card_line(MdBuf *m, int inner_w, const char *body) {
@@ -2079,11 +2303,16 @@ static void push_welcome_card(const Profile *prof) {
    Enter queues the message, Esc/^C abort the task, scrolling/expand all work. */
 static void handle_key(unsigned char ch, bool busy) {
     unsigned char escbuf[32];
+    if (pasting) { paste_feed(ch); return; }   /* nothing pasted acts as a key */
+    notice[0] = 0;
     if (ch == 27) {
         int escn = read_esc_seq(escbuf, sizeof escbuf);
         if (escn == 1) {
-            if (busy) { g_abort = 1; qn = 0; set_status("aborting…"); render_screen(); return; }
-            if (menu_count()) { menu_dismissed = true; render_screen(); }
+            int late = esc_late;
+            paste_suspect = false;
+            if (busy) { g_abort = 1; queue_clear(); set_status("aborting…"); render_screen(); }
+            else if (menu_count()) { menu_dismissed = true; render_screen(); }
+            if (late >= 0) handle_key((unsigned char)late, busy);
             return;
         }
         int clicked = -1;
@@ -2098,8 +2327,8 @@ static void handle_key(unsigned char ch, bool busy) {
                     const char *pick = m[idx];
                     ilen = icur = 0; inbuf[0] = 0; hpos = -1; menu_sel = 0; menu_dismissed = false;
 if (busy) {
-                        snprintf(inbuf, sizeof inbuf, "%s ", pick);
-                        ilen = icur = (int)strlen(inbuf);
+                        in_set(pick);
+                        ins(" ", 1);
                         render_screen();
                         return;
                     }
@@ -2111,9 +2340,12 @@ if (busy) {
             }
             return;
         }
-        if (escn >= 6 && !memcmp(escbuf, "\033[200~", 6)) { pasting = true; paste_start = icur; paste_bytes = 0; return; }
-        if (escn >= 6 && !memcmp(escbuf, "\033[201~", 6)) { pasting = false; collapse_paste_if_big(); render_screen(); return; }
-        if (escn == 2 && (escbuf[1] == '\r' || escbuf[1] == '\n')) {
+        if (escn >= 6 && !memcmp(escbuf, "\033[200~", 6)) { paste_begin(false); return; }
+        if (escn >= 6 && !memcmp(escbuf, PASTE_END, 6)) { paste_suspect = false; return; }
+        /* Alt+Enter, or Shift+Enter as CSI-u / modifyOtherKeys send it. Neither
+           protocol is switched on: it would change how Ctrl and Esc arrive. */
+        if ((escn == 2 && (escbuf[1] == '\r' || escbuf[1] == '\n')) ||
+            !strcmp((char *)escbuf, "\033[13;2u") || !strcmp((char *)escbuf, "\033[27;2;13~")) {
             ins("\n", 1); menu_sel = 0; render_screen(); return;
         }
         if (escbuf[1] == '[' || escbuf[1] == 'O') {
@@ -2123,27 +2355,20 @@ if (busy) {
                 if (mc) { menu_sel = (menu_sel > 0) ? menu_sel - 1 : mc - 1; }
                 else if (hpos < hist_n - 1) {
                     hpos++;
-                    snprintf(inbuf, sizeof inbuf, "%s", HIST[hist_n - 1 - hpos]);
-                    ilen = icur = (int)strlen(inbuf);
+                    in_set(HIST[hist_n - 1 - hpos]);
                 }
             } else if (k == 'B') {   /* down */
                 if (mc) { menu_sel = (menu_sel + 1) % mc; }
                 else if (hpos >= 0) {
                     hpos--;
-                    if (hpos < 0) inbuf[0] = ilen = icur = 0;
-                    else { snprintf(inbuf, sizeof inbuf, "%s", HIST[hist_n - 1 - hpos]); ilen = icur = (int)strlen(inbuf); }
+                    in_set(hpos < 0 ? "" : HIST[hist_n - 1 - hpos]);
                 }
-            } else if (k == 'D') { icur = utf8_prev(inbuf, icur); }
-            else if (k == 'C') { icur = utf8_next(inbuf, ilen, icur); }
+            } else if (k == 'D') { icur = in_prev(icur); }
+            else if (k == 'C') { icur = in_next(icur); }
             else if (k == 'H') icur = 0;
             else if (k == 'F') { icur = ilen; if (busy) scroll_off = 0; }
             else if (k == '~' && escn >= 3 && escbuf[2] == '3') {   /* delete */
-                if (icur < ilen) {
-                    int nxt = utf8_next(inbuf, ilen, icur);
-                    memmove(inbuf + icur, inbuf + nxt, (size_t)(ilen - nxt));
-                    ilen -= (nxt - icur);
-                    inbuf[ilen] = 0;
-                }
+                if (icur < ilen) in_delete(icur, in_next(icur));
             } else if (k == '~' && escn >= 3 && escbuf[2] == '5') { /* PageUp */
                 scroll_off += 8;
             } else if (k == '~' && escn >= 3 && escbuf[2] == '6') { /* PageDown */
@@ -2157,7 +2382,8 @@ if (busy) {
 
     if (ch == 4 && ilen == 0 && !busy) { want_exit = true; return; }     /* ^D quit */
     if (ch == 3) {
-        if (busy) { g_abort = 1; qn = 0; set_status("aborting…"); render_screen(); return; }
+        paste_suspect = false;
+        if (busy) { g_abort = 1; queue_clear(); set_status("aborting…"); render_screen(); return; }
         ilen = icur = 0; inbuf[0] = 0; hpos = -1; menu_sel = 0; menu_dismissed = false;
         render_screen(); return;
     }
@@ -2174,11 +2400,9 @@ if (busy) {
         int s = icur;
         while (s > 0 && inbuf[s - 1] == ' ') s--;
         while (s > 0 && inbuf[s - 1] != ' ') s--;
-        memmove(inbuf + s, inbuf + icur, (size_t)(ilen - icur));
-        ilen -= icur - s; icur = s; inbuf[ilen] = 0;
+        in_delete(token_start(s), icur);   /* a token has spaces in it */
         render_screen(); return;
     }
-    if (ch == '\t' && pasting) { ins("\t", 1); paste_bytes++; return; }
     if (ch == '\t') {   /* tab completes slash */
         const char *m[8];
         int nm = menu_matches(m, 8);
@@ -2187,7 +2411,7 @@ if (busy) {
             int plen = 0;
             while (plen < ilen && inbuf[plen] != ' ') plen++;
             int newlen = (int)strlen(pick);
-            if (ilen - plen + newlen + 2 < (int)sizeof inbuf) {
+            if (in_reserve((size_t)(ilen - plen + newlen) + 1)) {
                 memmove(inbuf + newlen, inbuf + plen, (size_t)(ilen - plen));
                 ilen += newlen - plen;
                 memcpy(inbuf, pick, (size_t)newlen);
@@ -2201,7 +2425,6 @@ if (busy) {
         return;
     }
     if (ch == '\r' || ch == '\n') {
-        if (pasting) { ins("\n", 1); paste_bytes++; return; }
         inbuf[ilen] = 0;
         if (!ilen) { render_screen(); return; }
         if (menu_count() && !strchr(inbuf, ' ')) {
@@ -2212,7 +2435,7 @@ if (busy) {
                 int plen = 0;
                 while (plen < ilen && inbuf[plen] != ' ') plen++;
                 int newlen = (int)strlen(pick);
-                if (ilen - plen + newlen + 1 < (int)sizeof inbuf) {
+                if (in_reserve((size_t)(ilen - plen + newlen))) {
                     memmove(inbuf + newlen, inbuf + plen, (size_t)(ilen - plen));
                     ilen += newlen - plen;
                     memcpy(inbuf, pick, (size_t)newlen);
@@ -2222,6 +2445,11 @@ if (busy) {
             }
         }
         bool isexit = !strcmp(inbuf, "/exit") || !strcmp(inbuf, "/quit");
+        /* refuse before anything is cleared, so the text stays in the box */
+        char *cmd = NULL;
+        if (busy && qn >= QMAX) set_notice("queue full (8): message kept in the input box");
+        else if (!(cmd = expand_pastes(inbuf))) set_notice("message over 1 MB refused");
+        if (!cmd) { render_screen(); return; }
         if (hist_n == 0 || strcmp(HIST[hist_n - 1], inbuf)) {
             if (hist_n < MAXHIST) HIST[hist_n++] = str_dup(inbuf);
             else {
@@ -2230,29 +2458,23 @@ if (busy) {
                 HIST[MAXHIST - 1] = str_dup(inbuf);
             }
         }
-        char cmd[16384];
-        snprintf(cmd, sizeof cmd, "%s", inbuf);
-        expand_pastes(cmd, sizeof cmd);
         ilen = icur = 0; inbuf[0] = 0; hpos = -1; menu_sel = 0; menu_dismissed = false;
         if (busy) {
-            if (qn < 8) { snprintf(qmsg[qn], sizeof qmsg[qn], "%s", cmd); qn++; }
+            qmsg[qn++] = cmd;
             render_screen();
             return;
         }
-        if (isexit) { want_exit = true; return; }
+        if (isexit) { want_exit = true; free(cmd); return; }
         render_screen();
-        if (cmd[0] == '/') run_slash(cmd);
+        if (is_slash(cmd)) run_slash(cmd);
         else tui_run_task(cmd);
+        free(cmd);
         render_screen();
         return;
     }
     if (ch == 127 || ch == 8) {
         if (icur > 0) {
-            int prev = utf8_prev(inbuf, icur);
-            memmove(inbuf + prev, inbuf + icur, (size_t)(ilen - icur));
-            ilen -= (icur - prev);
-            icur = prev;
-            inbuf[ilen] = 0;
+            in_delete(in_prev(icur), icur);
             menu_dismissed = false;
         }
         render_screen(); return;
@@ -2260,7 +2482,6 @@ if (busy) {
     if (ch >= 32) {
         char c1 = (char)ch;
         ins(&c1, 1);
-        if (pasting) { paste_bytes++; return; }
         render_screen(); return;
     }
 }
@@ -2268,14 +2489,14 @@ if (busy) {
 /* Drain queued messages after a task completes. */
 static void drain_queue(void) {
     while (qn > 0 && !g_abort) {
-        char next[16384];
-        snprintf(next, sizeof next, "%s", qmsg[0]);
-        for (int i = 1; i < qn; i++) memcpy(qmsg[i - 1], qmsg[i], sizeof qmsg[i]);
+        char *next = qmsg[0];
         qn--;
-        if (next[0] == '/') run_slash(next);
+        memmove(qmsg, qmsg + 1, (size_t)qn * sizeof *qmsg);
+        if (is_slash(next)) run_slash(next);
         else tui_run_task(next);
+        free(next);
     }
-    if (g_abort) qn = 0;
+    if (g_abort) queue_clear();
 }
 
 /* Input pump: process pending keystrokes while the agent is busy, throttle renders. */
@@ -2290,12 +2511,14 @@ static void tui_pump(void) {
         if (read(0, &ch, 1) != 1) break;
         handle_key(ch, true);
     }
+    paste_tick();
     static double lastr;
     double now = mono_now();
     if (now - lastr >= 0.08) { lastr = now; if (working) render_screen(); }
 }
 
 void tui_repl(void) {
+    if (!in_reserve(0)) return;
     signal(SIGWINCH, on_winch);
     detect_project_meta();
     term_raw(true);
@@ -2325,7 +2548,7 @@ void tui_repl(void) {
         FD_ZERO(&rf);
         FD_SET(0, &rf);
         struct timeval tv = {.tv_sec = 0, .tv_usec = 100000};
-        if (select(1, &rf, NULL, NULL, &tv) <= 0) continue;
+        if (select(1, &rf, NULL, NULL, &tv) <= 0) { paste_tick(); continue; }
 
         unsigned char ch;
         ssize_t n = read(0, &ch, 1);
