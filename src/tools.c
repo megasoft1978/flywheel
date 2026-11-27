@@ -1681,21 +1681,45 @@ static bool existed(const Items *before, const char *path, const struct stat *st
         || st->st_ino <= before->mark.ino;
 }
 
-/* what was already in dir would now be obeyed: take away one newly made entry
-   that git needs to see a repository there */
+static bool empty_dir(const char *path) {
+    DIR *d = opendir(path);
+    if (!d) return false;
+    struct dirent *e;
+    bool empty = true;
+    while (empty && (e = readdir(d)))
+        empty = !strcmp(e->d_name, ".") || !strcmp(e->d_name, "..");
+    closedir(d);
+    return empty;
+}
+
+static bool repo_like(const char *dir) {
+    return has_entry(dir, "HEAD")
+        && (has_entry(dir, "commondir") || (has_entry(dir, "objects") && has_entry(dir, "refs")));
+}
+
+/* what was already in dir would now be obeyed: take away newly made entries git
+   needs until it sees no repository there. A directory holding anything may
+   hold old files, so it stays. */
 static void disarm(const Items *before, const char *dir, const char *proj, Note *note) {
     static const char *const markers[] = {"HEAD", "commondir", "objects", "refs", NULL};
-    if (!has_entry(dir, "HEAD")
-        || !(has_entry(dir, "commondir") || (has_entry(dir, "objects") && has_entry(dir, "refs"))))
-        return;
-    for (int i = 0; markers[i]; i++) {
+    bool kept = false;
+    for (int i = 0; markers[i] && repo_like(dir); i++) {
         char p[PATH_MAX];
         struct stat st;
         if (snprintf(p, sizeof p, "%s/%s", dir, markers[i]) >= (int)sizeof p || lstat(p, &st)
             || existed(before, p, &st)) continue;
+        if (S_ISDIR(st.st_mode) && !empty_dir(p)) {
+            kept = true;
+            if (!strstr(note->s, p))
+                note_add(note, "[sandbox: %s is not empty, so it was not renamed]\n", p);
+            continue;
+        }
         move_aside(p, proj, note);
-        return;
     }
+    char say[PATH_MAX + 160];
+    snprintf(say, sizeof say, "[sandbox: %s is still a git repository with settings that run code;"
+             " nothing there could be renamed — tell the user]\n", dir);
+    if (kept && repo_like(dir) && !strstr(note->s, say)) note_add(note, "%s", say);
 }
 
 /* what could run code and was not there before is moved aside. Nothing that
@@ -2225,6 +2249,8 @@ static char *run_command(const char *cmd, const char *cwd, int timeout_s, int *c
                 mark_take(&before, proj);
                 tree_scan(proj, &before, fw_scan_cap);
             }
+            /* without a mark new cannot be told from old: close up front */
+            if (!before.mark.ok) before.partial = true;
             wild = sbx_wild(&before);
             /* an earlier command's TMPDIR may hold what this one must not move in */
             if (before.partial) {
@@ -2350,7 +2376,7 @@ static char *run_command(const char *cmd, const char *cwd, int timeout_s, int *c
             note_add(&note, "%s", "[sandbox: background processes end with their command; they were"
                      " stopped]\n");
         if (before.partial)
-            note_add(&note, "%s", "[sandbox: tree too large or unreadable to check: nothing was renamed;"
+            note_add(&note, "%s", "[sandbox: this tree cannot be fully checked: nothing was renamed;"
                      " nested .git, .envrc and new repositories were blocked up front]\n");
         else {
             if (wild && strstr(out, "Operation not permitted"))

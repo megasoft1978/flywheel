@@ -2543,6 +2543,18 @@ static void test_keeps_user_files(void) {
         T("shell: old file kept, its new repository disarmed", gone(proj, "n/.git/HEAD")
           && !gone(proj, "n/.git/config") && strstr(o, "existed before"));
         free(o);
+        /* a marker directory holding anything is not moved, and it is said */
+        host(proj, "for d in k l; do mkdir -p $d/refs $d/mine; echo old > $d/mine/f;"
+                   " echo 'ref: refs/heads/main' > $d/HEAD;"
+                   " printf '[core]\\n\\tfsmonitor = x\\n' > $d/config; done; rmdir l/refs");
+        o = run_bash("mkdir k/objects && mv k/mine/f k/objects/f", proj, 30);
+        T("disarm: filled directory not moved, reported", holds(under(proj, "k/objects/f"), "old\n")
+          && strstr(o, "still a git repository"));
+        free(o);
+        o = run_bash("mkdir l/objects l/refs && mv l/mine/f l/objects/f", proj, 30);
+        T("disarm: another new marker moves instead", holds(under(proj, "l/objects/f"), "old\n")
+          && gone(proj, "l/refs") && !strstr(o, "still a git repository"));
+        free(o);
     }
     setenv("HOME", old, 1);
     free(old);
@@ -2642,6 +2654,18 @@ static void test_partial_scan(void) {
       && gone(proj, "z/.git"));
     free(o);
     chmod(under(proj, "shut"), 0700);
+
+    /* a root that takes no mark: closed up front, not left unchecked */
+    snprintf(proj, sizeof proj, "%s/ro", base);
+    mkdir(proj, 0700);
+    host(proj, "mkdir sub");
+    free(run_bash("chmod 555 .", proj, 30));
+    o = run_bash("git init -q sub/z; mkdir -p sub/z/.git; " EVIL_CFG " >> sub/z/.git/config;"
+                 " echo evil > sub/.envrc", proj, 30);
+    T("read-only root: nested config and .envrc blocked", gone(proj, "sub/z/.git/config")
+      && gone(proj, "sub/.envrc") && strstr(o, "nothing was renamed"));
+    free(o);
+    chmod(proj, 0755);
     setenv("HOME", old, 1);
     free(old);
 }
