@@ -1549,7 +1549,8 @@ static void test_cli_values(void) {
     bad_reply = OK_HDR STOPPED "data: [DONE]\n\n";
     pid_t srv = serve(reply_fixed);
     char *q[] = {"flywheel", "-C", "/tmp", "-P", "generic", "-e", g_cfg.endpoint,
-                 "describe the codebase layout", NULL};
+                 "describe the codebase layout",
+                 sandbox_available() ? NULL : "--unsafe", NULL};
     char *o = run_flywheel(false, q);
     T("one-shot question finishes in one turn", strstr(o, "finish=done turns=1 ") != NULL);
     stop(srv);
@@ -1871,6 +1872,224 @@ static void test_review4(void) {
     perm_free();
 }
 
+/* ---------- sandbox ---------- */
+
+static bool out_has(const char *cmd, const char *frag) {
+    char *o = run_bash(cmd, g_cfg.cwd, 10);
+    bool hit = strstr(o, frag) != NULL;
+    free(o);
+    return hit;
+}
+
+static int sbx_asks;
+static bool sbx_answer;
+static char sbx_asked[600];
+static bool sbx_ask(const char *cmd, bool gate, void *ud) {
+    (void)gate; (void)ud;
+    sbx_asks++;
+    snprintf(sbx_asked, sizeof sbx_asked, "%s", cmd);
+    return sbx_answer;
+}
+
+/* one bash tool call through the agent loop; true if a message contains frag */
+static bool agent_bash(const char *args, Ui *ui, const char *frag) {
+    const char *calls[] = {"bash", args};
+    Msgs m;
+    new_task(&m);
+    sbx_asks = 0;
+    sbx_asked[0] = 0;
+    run_agent(&m, "tool_calls", 1, calls, 1, ui);
+    bool hit = any_msg(&m, frag);
+    msgs_free(&m);
+    return hit;
+}
+
+/* a listening socket on loopback: connecting succeeds iff network is allowed */
+static int listener(int *port) {
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = {.sin_family = AF_INET};
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t al = sizeof a;
+    if (bind(s, (struct sockaddr *)&a, sizeof a) || listen(s, 8) ||
+        getsockname(s, (struct sockaddr *)&a, &al)) return -1;
+    *port = ntohs(a.sin_port);
+    return s;
+}
+
+static void test_sandbox(void) {
+    char base[] = "/tmp/fwboxXXXXXX", proj[600], home[600], p[900], cmd[1500];
+    if (!mkdtemp(base)) { T("mkdtemp", false); return; }
+    /* the quote and backslash must survive into the profile */
+    snprintf(proj, sizeof proj, "%s/pro\"j\\", base);
+    snprintf(home, sizeof home, "%s/home", base);
+    mkdir(proj, 0700);
+    mkdir(home, 0700);
+    static const char *const dirs[] = {".ssh", ".aws", ".config", ".config/gh", ".config/flywheel"};
+    for (int i = 0; i < 5; i++) {
+        snprintf(p, sizeof p, "%s/%s", home, dirs[i]);
+        mkdir(p, 0700);
+        if (i == 2) continue;
+        snprintf(p, sizeof p, "%s/%s/key", home, dirs[i]);
+        put(p, "TOPSECRET");
+    }
+    snprintf(p, sizeof p, "%s/plain", home);
+    put(p, "readable");
+    char *oldhome = str_dup(getenv("HOME"));
+    setenv("HOME", home, 1);
+    setenv("FW_TEST_TOKEN", "tok-leak-123", 1);
+    free(g_cfg.cwd);
+    g_cfg.cwd = str_dup(proj);
+
+    snprintf(p, sizeof p, "%s/listed-file", proj);
+    put(p, "x");
+
+    /* ordinary work */
+    T("project write works", out_has("echo hi-in-project > f && cat f", "hi-in-project"));
+    T("private TMPDIR is writable",
+      out_has("echo tmp-ok > \"$TMPDIR/x\" && cat \"$TMPDIR/x\"; rm \"$TMPDIR/x\"", "tmp-ok"));
+    T("/dev/null and /dev/stderr", out_has("echo a >/dev/null && echo dev-ok >/dev/stderr", "dev-ok"));
+    T("heredoc and process substitution", out_has("cat <(cat <<E\nsub-ok\nE\n)", "sub-ok"));
+
+    /* writes outside */
+    snprintf(cmd, sizeof cmd, "echo x > '%s/escaped'", base);
+    int code = 0;
+    free(run_bash_status(cmd, g_cfg.cwd, 10, &code));
+    snprintf(p, sizeof p, "%s/escaped", base);
+    T("outside write blocked", code > 0 && access(p, F_OK));
+    T("outside write via interpreter blocked", out_has("python3 -c 'open(\"../escaped\",\"w\")'; true", "Error"));
+    T("outside write via interpreter left nothing", access(p, F_OK) != 0);
+    T("home write blocked", out_has("echo x > \"$HOME/escaped\"", "Operation not permitted"));
+
+    /* secret reads */
+    static const char *const reads[] = {"cat ../home/.ssh/key", "cat \"$HOME/.aws/key\"",
+        "cat ../home/.config/gh/key", "cat ../home/.config/flywheel/key", "cat ../HOME/.SSH/key",
+        "ln -s ../home/.ssh/key sl; cat sl", "ln ../home/.ssh/key hl; cat hl", "cp -R ../home/.ssh copy; cat copy/key"};
+    for (int i = 0; i < (int)(sizeof reads / sizeof *reads); i++) {
+        char *o = run_bash(reads[i], g_cfg.cwd, 10);
+        T(reads[i], !strstr(o, "TOPSECRET"));
+        free(o);
+    }
+    T("other home files stay readable", out_has("cat ../home/plain", "readable"));
+
+    /* a project that contains the home directory still cannot touch the stores */
+    free(g_cfg.cwd);
+    g_cfg.cwd = str_dup(base);
+    T("secret inside project unreadable", !out_has("cat home/.ssh/key", "TOPSECRET"));
+    free(run_bash("echo CHANGED > home/.ssh/key", g_cfg.cwd, 10));
+    snprintf(p, sizeof p, "%s/.ssh/key", home);
+    T("secret inside project unwritable", holds(p, "TOPSECRET"));
+    free(g_cfg.cwd);
+    g_cfg.cwd = str_dup(proj);
+
+    /* environment */
+    char *env = run_bash("env", g_cfg.cwd, 10);
+    T("token not inherited", !strstr(env, "tok-leak-123") && !strstr(env, "FW_TEST_TOKEN"));
+    T("PATH, HOME and private TMPDIR set",
+      strstr(env, "PATH=") && strstr(env, "HOME=") && strstr(env, "/fwsbx-"));
+    free(env);
+
+    /* network: external addresses and loopback alike */
+    int port = 0, ls = listener(&port);
+    T("listener", ls >= 0);
+    T("external network blocked", out_has("exec 3<>/dev/tcp/1.1.1.1/80", "Operation not permitted"));
+    snprintf(cmd, sizeof cmd, "exec 3<>/dev/tcp/127.0.0.1/%d && echo NET\"\"OK", port);
+    T("loopback blocked", out_has(cmd, "Operation not permitted"));
+    char *o = run_bash_net(cmd, g_cfg.cwd, 10, &code);
+    T("approved command reaches the network", !code && strstr(o, "NETOK"));
+    free(o);
+    o = run_bash_net("echo x > ../escaped", g_cfg.cwd, 10, &code);
+    snprintf(p, sizeof p, "%s/escaped", base);
+    T("network approval opens no writes", code > 0 && access(p, F_OK));
+    free(o);
+    T("the next command is offline again", out_has(cmd, "Operation not permitted"));
+
+    /* network approval through the agent loop */
+    char args[1500];
+    snprintf(args, sizeof args,
+             "{\"command\":\"exec 3<>/dev/tcp/127.0.0.1/%d && echo NET\\\"\\\"OK\",\"network\":true}", port);
+    Ui ask = {.interactive = true, .approve_cmd = sbx_ask};
+    Ui oneshot = {.interactive = false};
+    perm_free();
+    sbx_answer = true;
+    T("approved network call runs", agent_bash(args, &ask, "NETOK") && sbx_asks == 1);
+    T("prompt names the network", strstr(sbx_asked, "NETWORK") && strstr(sbx_asked, "/dev/tcp/"));
+    perm_add_rule(sbx_asked);
+    T("prompt cannot become a rule", !perm_allowed(sbx_asked));
+    T("asked again next time", agent_bash(args, &ask, "NETOK") && sbx_asks == 1);
+    sbx_answer = false;
+    T("refused network call does not run", agent_bash(args, &ask, "user denied") && sbx_asks == 1);
+    sbx_answer = true;
+    T("allow-listed command still asks for network",
+      agent_bash("{\"command\":\"ls\",\"network\":true}", &ask, "listed-file") && sbx_asks == 1);
+    T("allow-listed command alone does not ask",
+      agent_bash("{\"command\":\"ls\"}", &ask, "listed-file") && sbx_asks == 0);
+    T("one-shot cannot grant network", agent_bash(args, &oneshot, "network access needs"));
+    T("without the flag the agent stays offline",
+      agent_bash("{\"command\":\"exec 3<>/dev/tcp/1.1.1.1/80\"}", &oneshot, "[sandbox:"));
+
+    /* --unsafe is the old behaviour */
+    g_cfg.unsafe = true;
+    T("--unsafe keeps the environment", out_has("env", "tok-leak-123"));
+    free(run_bash("echo x > ../unsafe-wrote", g_cfg.cwd, 10));
+    snprintf(p, sizeof p, "%s/unsafe-wrote", base);
+    T("--unsafe writes outside", !access(p, F_OK));
+    g_cfg.unsafe = false;
+
+    /* the binary where sandbox-exec cannot be run: one-shot and bench refuse */
+    const char *bin = getenv("FW_BIN");
+    static const char *const modes[] = {"\"a question\"", "bench nosuite tag"};
+    for (int i = 0; i < 2; i++) {
+        snprintf(cmd, sizeof cmd,
+                 "/usr/bin/sandbox-exec -p '(version 1)(allow default)"
+                 "(deny process-exec (literal \"/usr/bin/sandbox-exec\"))' "
+                 "%s -e http://127.0.0.1:%d/v1 %s </dev/null 2>&1; echo \"rc=$?\"",
+                 bin ? bin : "./flywheel", port, modes[i]);
+        FILE *f = popen(cmd, "r");
+        char said[2000] = "";
+        size_t n = f ? fread(said, 1, sizeof said - 1, f) : 0;
+        said[n] = 0;
+        if (f) pclose(f);
+        T(modes[i], strstr(said, "Refusing to run") && strstr(said, "rc=2"));
+    }
+
+    close(ls);
+    unsetenv("FW_TEST_TOKEN");
+    setenv("HOME", oldhome, 1);
+    free(oldhome);
+}
+
+/* no sandbox: nothing may run unless someone approves or --unsafe says so */
+static void test_fail_closed(void) {
+    char dir[] = "/tmp/fwfcXXXXXX", p[256];
+    if (!mkdtemp(dir)) { T("mkdtemp", false); return; }
+    free(g_cfg.cwd);
+    g_cfg.cwd = str_dup(dir);
+    bool was = g_cfg.unsafe;
+    g_cfg.unsafe = false;
+    sandbox_disable_for_test(true);
+    snprintf(p, sizeof p, "%s/ran", dir);
+    const char *args = "{\"command\":\"touch ran\"}";
+    const char *calls[] = {"bash", args};
+    Ui ask = {.interactive = true, .approve_cmd = sbx_ask};
+    Ui oneshot = {.interactive = false};
+    Msgs m;
+    new_task(&m);
+    agent_finish_reason = "tool_calls";
+    const char *fin = run_agent(&m, "tool_calls", 1, calls, 1, &oneshot);
+    T("no sandbox: one-shot refuses", !strcmp(fin, "no-sandbox") && access(p, F_OK));
+    msgs_free(&m);
+    sbx_answer = false;
+    T("no sandbox: interactive still asks", agent_bash(args, &ask, "user denied") && sbx_asks == 1);
+    T("no sandbox: denied command did not run", access(p, F_OK) != 0);
+    g_cfg.unsafe = true;
+    new_task(&m);
+    run_agent(&m, "tool_calls", 1, calls, 1, &oneshot);
+    T("no sandbox: --unsafe runs", !access(p, F_OK));
+    msgs_free(&m);
+    g_cfg.unsafe = was;
+    sandbox_disable_for_test(false);
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     memset(&g_cfg, 0, sizeof g_cfg);
@@ -1878,6 +2097,7 @@ int main(void) {
     snprintf(projdir, sizeof projdir, "/tmp/fwprojXXXXXX");
     if (!mkdtemp(fakehome) || !mkdtemp(projdir)) return 1;
     setenv("HOME", fakehome, 1);   /* never touch the real rules */
+    g_cfg.unsafe = !sandbox_available();   /* else commands run sandboxed */
     g_cfg.cwd = str_dup("/tmp");
     setenv("HOME", "/home/fwdeny", 1);   /* HOME outside /tmp for the ~ and $HOME cases */
     test_deny();
@@ -1929,6 +2149,9 @@ int main(void) {
     test_truth();
     test_atomic();
     test_loopedit();
+    if (sandbox_available()) test_sandbox();
+    else printf("unit: SKIP sandbox tests (no sandbox here)\n");
+    test_fail_closed();
 #ifdef FW_MINI_HTTP
     test_connect_timeout();
 #endif

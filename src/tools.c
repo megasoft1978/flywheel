@@ -6,6 +6,7 @@
 #include <sys/wait.h>
 #include <ctype.h>
 #include <limits.h>
+#include <pwd.h>
 #include <sys/stat.h>
 #include <time.h>
 
@@ -1141,17 +1142,197 @@ static bool drain_pipe(int fd, char *buf, size_t *len, int max_reads) {
     return true;
 }
 
-char *run_bash(const char *cmd, const char *cwd, int timeout_s) {
-    return run_bash_status(cmd, cwd, timeout_s, NULL);
+/* ---------- sandbox for model-run commands ----------
+   macOS Seatbelt through sandbox-exec, deny by default: writes only inside the
+   working directory and a private TMPDIR, no reads of credential stores, no
+   network unless the user approved it for that one command. Elsewhere there is
+   no sandbox yet, which callers must treat as unavailable. */
+
+#define SBX_EXEC "/usr/bin/sandbox-exec"
+#define SBX_CAP 65536
+
+static int sbx_state = -1;   /* -1 = not probed, 0 = unavailable, 1 = works */
+
+/* readable by nobody in the sandbox, relative to the home directory */
+static const char *const SBX_SECRETS[] = {
+    ".ssh", ".aws", ".gnupg", ".kube", ".docker", ".azure", ".netrc", ".git-credentials",
+    ".config/gh", ".config/flywheel", ".config/gcloud", ".config/git/credentials",
+    "Library/Keychains", "Library/Cookies", "Library/Safari", "Library/Containers/com.apple.Safari",
+    "Library/Application Support/Google", "Library/Application Support/Chromium",
+    "Library/Application Support/BraveSoftware", "Library/Application Support/Firefox",
+    "Library/Application Support/Microsoft Edge", "Library/Application Support/Arc",
+    "Library/Application Support/Vivaldi", "Library/Application Support/com.operasoftware.Opera",
+    NULL
+};
+
+typedef struct { char *s; size_t n; bool full; } Sb;
+
+static void sb_add(Sb *b, const char *s) {
+    size_t n = strlen(s);
+    if (b->full || b->n + n + 1 > SBX_CAP) { b->full = true; return; }
+    memcpy(b->s + b->n, s, n + 1);
+    b->n += n;
 }
 
-char *run_bash_status(const char *cmd, const char *cwd, int timeout_s, int *code) {
-    if (code) *code = -1;
-    int fds[2];
-    if (pipe(fds)) return str_dup("error: pipe failed");
-    fcntl(fds[0], F_SETFL, O_NONBLOCK);
+/* ` (subpath "path")` */
+static void sb_path(Sb *b, const char *path) {
+    sb_add(b, " (subpath \"");
+    for (const char *p = path; *p; p++) {
+        char c[3] = {'\\', *p, 0};
+        sb_add(b, *p == '"' || *p == '\\' ? c : c + 1);
+    }
+    sb_add(b, "\")");
+}
 
+static void sb_secrets(Sb *b, const char *home) {
+    char real[PATH_MAX], p[PATH_MAX], target[PATH_MAX];
+    if (!home || !*home || !realpath(home, real)) return;
+    for (int i = 0; SBX_SECRETS[i]; i++) {
+        int n = snprintf(p, sizeof p, "%s/%s", real, SBX_SECRETS[i]);
+        if (n < 0 || (size_t)n >= sizeof p) { b->full = true; return; }
+        sb_path(b, p);
+        /* a symlinked store (dotfiles checkout) is judged by where it leads */
+        if (realpath(p, target) && strcmp(p, target)) sb_path(b, target);
+    }
+}
+
+/* malloc'd profile, NULL if the paths cannot be resolved. tmp may be NULL. */
+static char *sbx_profile(const char *cwd, const char *tmp, bool net) {
+    char proj[PATH_MAX], rtmp[PATH_MAX];
+    if (!cwd || !realpath(cwd, proj)) return NULL;
+    if (tmp && !realpath(tmp, rtmp)) return NULL;
+    Sb b = {.s = malloc(SBX_CAP)};
+    b.s[0] = 0;
+    sb_add(&b,
+        "(version 1)(deny default)"
+        "(allow process-exec process-fork)"
+        "(allow signal (target same-sandbox))"
+        "(allow process-info* (target same-sandbox))"
+        "(allow sysctl-read)"
+        "(allow file-read*)"
+        "(allow mach-lookup (global-name \"com.apple.system.opendirectoryd.libinfo\"))"
+        "(allow ipc-posix-shm ipc-posix-sem)"
+        "(allow file-write-data file-ioctl (literal \"/dev/null\") (literal \"/dev/zero\")"
+        " (literal \"/dev/dtracehelper\") (literal \"/dev/stdout\") (literal \"/dev/stderr\")"
+        " (subpath \"/dev/fd\"))");
+    sb_add(&b, "(allow file-write*");
+    sb_path(&b, proj);
+    if (tmp) sb_path(&b, rtmp);
+    sb_add(&b, ")");
+    /* the last matching rule wins: secrets stay closed even inside the project */
+    sb_add(&b, "(deny file-read* file-write* (subpath \"/Library/Keychains\")");
+    const char *home = getenv("HOME");
+    const struct passwd *pw = getpwuid(getuid());
+    sb_secrets(&b, home);
+    if (pw && (!home || strcmp(home, pw->pw_dir))) sb_secrets(&b, pw->pw_dir);
+    sb_add(&b, ")");
+    /* IP and name lookup only: other unix sockets (Docker, ssh-agent) stay shut */
+    if (net)
+        sb_add(&b,
+            "(allow system-socket)"
+            "(allow network-outbound (remote ip)"
+            " (remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))"
+            "(allow network-bind network-inbound (local ip))"
+            "(allow mach-lookup (global-name \"com.apple.trustd.agent\")"
+            " (global-name \"com.apple.TrustEvaluationAgent\")"
+            " (global-name \"com.apple.SystemConfiguration.configd\"))");
+    if (b.full) { free(b.s); return NULL; }
+    return b.s;
+}
+
+bool sandbox_available(void) {
+    if (sbx_state >= 0) return sbx_state;
+    sbx_state = 0;
+#ifdef __APPLE__
+    /* run something under a real profile: a nested sandbox or a policy that
+       blocks sandbox-exec must count as unavailable */
+    char *prof = sbx_profile("/usr/share", NULL, false);
+    if (!prof) return false;
     pid_t pid = fork();
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) { dup2(devnull, 0); dup2(devnull, 1); dup2(devnull, 2); }
+        execl(SBX_EXEC, "sandbox-exec", "-p", prof, "/usr/bin/true", (char *)NULL);
+        _exit(127);
+    }
+    free(prof);
+    int status = 0;
+    pid_t w;
+    do w = pid > 0 ? waitpid(pid, &status, 0) : -1; while (w < 0 && errno == EINTR);
+    sbx_state = w == pid && WIFEXITED(status) && !WEXITSTATUS(status);
+#endif
+    return sbx_state;
+}
+
+void sandbox_disable_for_test(bool off) { sbx_state = off ? 0 : -1; }
+
+bool sandbox_on(void) { return !g_cfg.unsafe && sandbox_available(); }
+
+static char sbx_tmp[PATH_MAX];
+static pid_t sbx_owner;
+
+static void sbx_tmp_remove(void) {
+    if (getpid() == sbx_owner) rmdir(sbx_tmp);   /* only if nothing was left in it */
+}
+
+/* this process's private TMPDIR, NULL if it cannot be made */
+static const char *sbx_tmpdir(void) {
+    struct stat st;
+    if (*sbx_tmp && !lstat(sbx_tmp, &st) && S_ISDIR(st.st_mode) && st.st_uid == getuid())
+        return sbx_tmp;
+    const char *base = getenv("TMPDIR");
+    if (!base || !*base) base = "/tmp";
+    snprintf(sbx_tmp, sizeof sbx_tmp, "%s%sfwsbx-XXXXXX", base,
+             base[strlen(base) - 1] == '/' ? "" : "/");
+    if (!mkdtemp(sbx_tmp)) { *sbx_tmp = 0; return NULL; }
+    if (!sbx_owner) { sbx_owner = getpid(); atexit(sbx_tmp_remove); }
+    return sbx_tmp;
+}
+
+#define SBX_NENV 10
+
+/* the whole environment of a command: nothing else is inherited (tokens, agent
+   sockets). The cache variables keep build tools out of the home directory. */
+static void sbx_env(char **env, const char *tmp) {
+    static const char *const keep[] = {"PATH", "HOME", "LANG", "TERM", NULL};
+    static const char *const redirect[][2] = {{"TMPDIR", ""}, {"XDG_CACHE_HOME", "/cache"},
+        {"GOCACHE", "/go-build"}, {"npm_config_cache", "/npm"}, {NULL, NULL}};
+    int n = 0;
+    for (int i = 0; keep[i]; i++) {
+        const char *v = getenv(keep[i]);
+        if (!v) continue;
+        size_t len = strlen(keep[i]) + strlen(v) + 2;
+        env[n] = malloc(len);
+        snprintf(env[n++], len, "%s=%s", keep[i], v);
+    }
+    for (int i = 0; redirect[i][0]; i++) {
+        size_t len = strlen(redirect[i][0]) + strlen(tmp) + strlen(redirect[i][1]) + 2;
+        env[n] = malloc(len);
+        snprintf(env[n++], len, "%s=%s%s", redirect[i][0], tmp, redirect[i][1]);
+    }
+    env[n] = NULL;
+}
+
+static char *run_command(const char *cmd, const char *cwd, int timeout_s, int *code, bool net) {
+    if (code) *code = -1;
+    /* --unsafe: as is. Otherwise a clean environment always, and the sandbox when
+       there is one (without it only an interactive session gets this far) */
+    bool clean = !g_cfg.unsafe, boxed = sandbox_on();
+    char *env[SBX_NENV] = {NULL}, *prof = NULL;
+    if (clean) {
+        const char *tmp = sbx_tmpdir();
+        if (!tmp) return str_dup("error: cannot create a private TMPDIR — not executed");
+        if (boxed && !(prof = sbx_profile(cwd, tmp, net)))
+            return str_dup("error: cannot set up the sandbox for this directory — not executed");
+        sbx_env(env, tmp);
+    }
+    int fds[2];
+    pid_t pid = -1;
+    if (!pipe(fds)) {
+        fcntl(fds[0], F_SETFL, O_NONBLOCK);
+        pid = fork();
+        if (pid < 0) { close(fds[0]); close(fds[1]); }
+    }
     if (pid == 0) {
         close(fds[0]);
         dup2(fds[1], 1); dup2(fds[1], 2);
@@ -1159,11 +1340,28 @@ char *run_bash_status(const char *cmd, const char *cwd, int timeout_s, int *code
         /* children must not steal keystrokes from the TUI */
         int devnull = open("/dev/null", O_RDONLY);
         if (devnull >= 0) { dup2(devnull, 0); close(devnull); }
-        chdir(cwd);
-        setpgid(0, 0);
-        execl("/bin/bash", "bash", "-c", cmd, (char *)NULL);
+        if (chdir(cwd)) {
+            perror("error: cannot enter the working directory");
+            _exit(126);
+        }
+        if (clean) {
+            /* no inherited sockets or files, and no controlling terminal */
+            long max = sysconf(_SC_OPEN_MAX);
+            for (int fd = 3; fd < (max > 0 && max < 65536 ? max : 65536); fd++) close(fd);
+            setsid();
+            if (boxed)
+                execle(SBX_EXEC, "sandbox-exec", "-p", prof, "/bin/bash", "-c", cmd,
+                       (char *)NULL, env);
+            else execle("/bin/bash", "bash", "-c", cmd, (char *)NULL, env);
+        } else {
+            setpgid(0, 0);
+            execl("/bin/bash", "bash", "-c", cmd, (char *)NULL);
+        }
         _exit(127);
     }
+    free(prof);
+    for (int i = 0; env[i]; i++) free(env[i]);
+    if (pid < 0) return str_dup("error: pipe failed");
     close(fds[1]);
     char *buf = malloc(OUT_CAP + 1);
     size_t len = 0;
@@ -1186,6 +1384,8 @@ char *run_bash_status(const char *cmd, const char *cwd, int timeout_s, int *code
             break;
         }
     }
+    /* nothing started with network access outlives its approval */
+    if (net && !timed) killpg(pid, SIGKILL);
     /* drain what is left; bounded so a surviving background writer can't pin us */
     drain_pipe(fds[0], buf, &len, 1024);
     close(fds[0]);
@@ -1212,6 +1412,18 @@ char *run_bash_status(const char *cmd, const char *cwd, int timeout_s, int *code
         free(out); out = t;
     }
     return out;
+}
+
+char *run_bash(const char *cmd, const char *cwd, int timeout_s) {
+    return run_command(cmd, cwd, timeout_s, NULL, false);
+}
+
+char *run_bash_status(const char *cmd, const char *cwd, int timeout_s, int *code) {
+    return run_command(cmd, cwd, timeout_s, code, false);
+}
+
+char *run_bash_net(const char *cmd, const char *cwd, int timeout_s, int *code) {
+    return run_command(cmd, cwd, timeout_s, code, true);
 }
 
 /* ---------- permission rules (claude-code style) ----------

@@ -61,7 +61,7 @@ The Linux build speaks plain HTTP only.
 
 ```bash
 flywheel                            # interactive REPL
-flywheel "fix the bug in x.ts"      # one-shot (approves commands automatically)
+flywheel "fix the bug in x.ts"      # one-shot (approves commands automatically, sandboxed)
 flywheel -f prompt.md -T 60 -W 900 --transcript run.jsonl
 flywheel bench <suite-dir> <tag>    # run a benchmark suite
 ```
@@ -76,6 +76,7 @@ flywheel bench <suite-dir> <tag>    # run a benchmark suite
 | `--gates N` | requirement-check passes before finishing | 1 |
 | `--transcript FILE` | JSONL log of the run | off |
 | `--allow-outside-writes` | throwaway containers only, see [Safety](#safety) | off |
+| `--unsafe` | no sandbox, full environment; see [Safety](#safety). Goes before `bench` | off |
 
 `flywheel --help` lists the rest. Settings can also live in `~/.config/flywheel/config`.
 Project instructions come from the first of `.flywheel.md`, `AGENTS.md` or `CLAUDE.md`
@@ -111,8 +112,47 @@ Project instructions come from the first of `.flywheel.md`, `AGENTS.md` or `CLAU
 
 ## Safety
 
-flywheel runs shell commands and project code on your machine. **It is not a sandbox.** Do not
-run it on an untrusted repository or task outside a container or VM.
+flywheel runs shell commands and project code on your machine. On macOS, the commands the model
+runs and the verification gate go through a Seatbelt sandbox (`sandbox-exec`): **they cannot write
+outside the project or reach the network unless you approve it.** That is the whole claim. Run an
+untrusted repository or task in a VM.
+
+**Sandbox (macOS)**
+
+- Writes: the working directory and a private `$TMPDIR` (plus `/dev/null` and similar). Not `/tmp`.
+- Reads: everything you can read, except `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.docker`,
+  `~/.azure`, `~/.netrc`, `~/.git-credentials`, `~/.config/{gh,flywheel,gcloud}`, keychains,
+  cookies and the common browser profiles. **Other files, including other tokens such as
+  `~/.npmrc`, stay readable** and their contents can reach the model.
+- Network: none, not even localhost. In an interactive session the model can ask for it for one
+  command; you are asked every time, whatever your "always allow" rules say. One-shot and `bench`
+  cannot grant it. Allowed network is any IP address, not one host.
+- Environment: only `PATH`, `HOME`, `LANG` and `TERM` are passed on; `TMPDIR`, `XDG_CACHE_HOME`,
+  `GOCACHE` and `npm_config_cache` point into the private temporary directory.
+
+What stops working inside it:
+
+- Tools that write under `$HOME`: package caches and global installs (`cargo`, `pip --user`,
+  Gradle and the like). Fetch dependencies yourself first.
+- `git fetch`/`push` (offline; over SSH it also fails with network approved, as keys and
+  `known_hosts` are unreadable), and Keychain or `gh` credentials.
+- A git worktree or submodule whose `.git` directory is outside the project: no commits.
+- Docker, `ssh-agent` and other Unix sockets, local servers and tests that open a port (unless
+  network is approved), `ps`, pseudo-terminals, `open` and AppleScript.
+
+Where it does not protect you:
+
+- Anything inside the project can be changed, including `.git` hooks and build scripts that you
+  or your editor may later run **outside** the sandbox.
+- Started in your home directory (or above it), the sandbox makes all of it writable, except the
+  stores listed above.
+- File tools do not go through the sandbox; they have their own project confinement. `bench` grade
+  scripts run unsandboxed.
+- A process that detaches itself from an approved network command may keep its network access.
+
+**No sandbox** (Linux, or `sandbox-exec` unavailable, for example inside another sandbox):
+one-shot and `bench` refuse to run unless you pass `--unsafe`. Interactive mode says so and keeps
+asking for approval. `--unsafe` turns the sandbox and the environment filtering off.
 
 **Interactive mode**
 
@@ -127,7 +167,8 @@ run it on an untrusted repository or task outside a container or VM.
   a repository are not trusted. A remembered `npm run`, `go test`, `cargo test` or gate check runs
   whatever the project files contain at that moment, including files the model wrote.
 
-**One-shot and `bench` modes approve everything automatically**, the verification gate included.
+**One-shot and `bench` modes approve everything automatically**, the verification gate included
+(network excepted).
 `tsc` (through `npx`, which uses a project-local binary), `cargo check` (which runs `build.rs`)
 and similar tools execute code from the project.
 
@@ -138,18 +179,20 @@ in every mode. They read the command text only:
   are not inspected.
 - Values of unknown `$VARS`, the output of `$(...)` and arguments fed through `xargs` are not seen.
 - Write checks do not follow symlinks.
-- `/tmp` and `/dev` (except disk devices) are writable.
+- They allow `/tmp` and `/dev` (except disk devices); the sandbox does not.
 - Keeping reads inside the project applies only to the auto-approved built-in commands.
 
 `--allow-outside-writes` is for throwaway containers: commands may write and delete outside the
 working directory, recursively too. `sudo`, the other basic deny rules and recursive `rm` of `/`
-or your home directory stay blocked.
+or your home directory stay blocked. It relaxes only these text rules: on macOS the sandbox still
+applies unless `--unsafe` is also given.
 
 ## Limits
 
 - Text only. The model has vision, but flywheel sends it text only.
 - No API key support. The Linux build has no HTTPS.
 - No context compaction.
+- No sandbox on Linux yet.
 - Go and Rust gates are experimental.
 - The harness was tuned on the private suite below.
 - Not yet measured against OpenCode with the same model, or against Claude Haiku 5.5 run as an

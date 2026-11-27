@@ -74,8 +74,9 @@ class FlywheelAgent(BaseAgent):
             env["FW_MODEL"] = self._model
         cmd = (
             "cd /app 2>/dev/null || cd /; "
-            # the task container is throwaway and tasks write outside /app
-            f"flywheel -q --allow-outside-writes "
+            # the task container is throwaway and tasks write outside /app;
+            # there is no sandbox on Linux, so --unsafe is required there
+            f"flywheel -q --allow-outside-writes --unsafe "
             f"-f /tmp/fw_instruction.txt -T {self._turn_timeout} "
             f"-W {self._wall_timeout} -t 180 --transcript /tmp/fw_transcript.jsonl "
             "> /tmp/fw_out.log 2>&1; echo FW_EXIT_$?"
