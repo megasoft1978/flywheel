@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>flywheel · a C coding agent for local models</title>
-<meta name="description" content="A small terminal coding agent written in C, built for a local 27B model on Apple Silicon.">
+<meta name="description" content="A small terminal coding agent written in C, built for a model running on your Mac.">
 <style>
 :root{--bg:#f7f5f0;--panel:#fff;--fg:#171612;--dim:#625e54;--line:#e3ded2;--acc:#9a6400;--bar:#b9b2a2;--ok:#1d7a3e;
  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
@@ -19,19 +19,13 @@ nav{display:flex;align-items:center;justify-content:space-between;gap:16px;paddi
 .brand svg{width:26px;height:26px;color:var(--acc)}
 nav ul{display:flex;gap:22px;list-style:none;font-size:14.5px}
 nav ul a{text-decoration:none;color:var(--dim)} nav ul a:hover{color:var(--fg)}
-header{padding:56px 0 64px;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.05fr);gap:44px;align-items:center}
+header{padding:56px 0 64px;display:grid;grid-template-columns:minmax(0,1fr);gap:44px}
 h1{font-size:clamp(34px,5.2vw,52px);line-height:1.08;letter-spacing:-.025em;text-wrap:balance}
 .lead{color:var(--dim);font-size:18px;margin:18px 0 28px}
 .cta{display:flex;gap:12px;flex-wrap:wrap}
 .btn{padding:11px 20px;border-radius:8px;font-weight:600;font-size:15px;text-decoration:none;border:1px solid var(--line)}
 .btn.p{background:var(--fg);color:var(--bg);border-color:var(--fg)}
 pre{font:13px/1.7 var(--mono);overflow-x:auto}
-.term{background:#121316;color:#d8d6cf;border:1px solid #2a2d33;border-radius:12px;overflow:hidden;box-shadow:0 24px 60px -30px rgba(0,0,0,.55)}
-.term .bar{display:flex;gap:7px;padding:12px 14px;border-bottom:1px solid #26292f}
-.term .bar i{width:10px;height:10px;border-radius:50%;background:#3b3f47}
-.term pre{padding:16px 18px;white-space:pre-wrap;word-break:break-word}
-.term .t{color:#6fc3df}.term .d{color:#8d8b84}.term .g{color:#5fd07f}.term .a{color:#f0b429}
-figcaption{color:var(--dim);font-size:12.5px;margin-top:10px}
 section{padding:60px 0;border-top:1px solid var(--line)}
 h2{font-size:28px;letter-spacing:-.015em;line-height:1.2;margin-bottom:12px}
 h3{font-size:19px;margin:34px 0 6px}
@@ -59,7 +53,7 @@ ul.tiles li.ok{border-color:var(--ok);color:var(--fg)} ul.tiles li.ok span{color
 .code{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 20px}
 .code .d{color:var(--dim)}
 footer{border-top:1px solid var(--line);padding:30px 0 56px;color:var(--dim);font-size:14px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
-@media (max-width:820px){header{grid-template-columns:minmax(0,1fr);padding-top:28px}nav ul{gap:14px}
+@media (max-width:820px){header{padding-top:28px}nav ul{gap:14px}
  .row{grid-template-columns:1fr 56px}.who{grid-column:1/-1}}
 @media (max-width:480px){nav ul li:not(:last-child){display:none}}
 </style>
@@ -68,67 +62,63 @@ footer{border-top:1px solid var(--line);padding:30px 0 56px;color:var(--dim);fon
 <div class="wrap">
 <nav>
   <a class="brand" href="#"><svg viewBox="0 0 64 64" aria-hidden="true" fill="none" stroke="currentColor" stroke-linecap="round"><circle cx="32" cy="32" r="27" stroke-width="5"/><g stroke-width="2.5"><line x1="32" y1="32" x2="56.0" y2="32.0"/><line x1="32" y1="32" x2="44.0" y2="52.8"/><line x1="32" y1="32" x2="20.0" y2="52.8"/><line x1="32" y1="32" x2="8.0" y2="32.0"/><line x1="32" y1="32" x2="20.0" y2="11.2"/><line x1="32" y1="32" x2="44.0" y2="11.2"/></g><circle cx="32" cy="32" r="7" fill="currentColor" stroke="none"/></svg>flywheel</a>
-  <ul><li><a href="#harness">Harness</a></li><li><a href="#safety">Safety</a></li><li><a href="#benchmarks">Benchmarks</a></li><li><a href="https://github.com/megasoft1978/flywheel">GitHub</a></li></ul>
+  <ul><li><a href="#benchmarks">Results</a></li><li><a href="#quickstart">Setup</a></li><li><a href="#safety">Safety</a></li><li><a href="https://github.com/megasoft1978/flywheel">GitHub</a></li></ul>
 </nav>
 
 <header>
   <div>
-    <h1>A coding agent for the model on your own machine.</h1>
-    <p class="lead">flywheel is a small terminal agent written in C, tuned for Qwen3.8-27B on Apple Silicon. It works with any OpenAI-compatible endpoint.</p>
+    <h1>A terminal coding agent in C for a model running on your Mac.</h1>
+    <p class="lead">Tested with Qwen3.8-27B served locally by Splash with a DFlash2 drafter. No cloud account, no API key.</p>
     <div class="cta"><a class="btn p" href="#quickstart">Get started</a><a class="btn" href="https://github.com/megasoft1978/flywheel">View source</a></div>
   </div>
-  <figure>
-    <div class="term"><div class="bar"><i></i><i></i><i></i></div><pre><span class="a">$</span> flywheel "test_calc.py fails. Fix the bug in
-  calc.py and run the test."
-
-<span class="t">⏺ Bash</span>(ls -la &amp;&amp; cat calc.py test_calc.py)
-<span class="t">⏺ Edit</span>(calc.py)
-<span class="d">  ⎿  ok: edited calc.py at line 2 (32 bytes)</span>
-<span class="t">⏺ Bash</span>(python3 test_calc.py)
-<span class="d">  ⎿  ok</span>
-
-<span class="g">●</span> flywheel: finish=done turns=4 calls=3
-  tokens=249 secs=2</pre></div>
-    <figcaption>Trimmed output of a real run on a deliberately trivial task, verification gate off.</figcaption>
-  </figure>
 </header>
 
-<section id="harness">
-  <h2>The harness does the work a small model can't</h2>
-  <p class="sub">Local models fail in repetitive, recoverable ways: malformed tool calls, doom loops, silent stalls. flywheel handles them around the model.</p>
-  <div class="grid"><div><h4>Loop breaker</h4><p>Spots repeated and near-repeated commands, prunes them, injects a correction and nudges temperature.</p></div><div><h4>Strict tool calls</h4><p>Repairs common JSON slips in shell commands. Truncated arguments are rejected, never run.</p></div><div><h4>Structured edits</h4><p><code>write_file</code> and <code>edit_file</code> with unique-match replacement, confined to the project.</p></div><div><h4>Verification gate</h4><p>Type checks and compiles per language, then one requirement-by-requirement pass before finishing.</p></div><div><h4>Live terminal UI</h4><p>Type while it works, Esc to interrupt, collapsible output, streaming markdown, tokens per second.</p></div><div><h4>Small and static</h4><p>About 6k lines of C. libcurl only on macOS; the Linux build is a static binary with no dependencies.</p></div></div>
-</section>
-
-<section id="safety">
-  <h2>Safety, stated plainly</h2>
-  <p class="sub">flywheel runs shell commands on your machine. Here is what it does and does not protect against.</p>
-  <ul class="safe"><li>Asks before anything outside a short read-only list; chaining, redirection, expansion and write flags always prompt. So does git, since repository config can make it run programs.</li><li>The approval dialog shows the whole command, with control and invisible characters made visible.</li><li>Keys typed before the dialog appears are ignored. Permission rules shipped inside a repository are not trusted.</li><li><b>One-shot and bench modes approve automatically.</b> Deny rules are best-effort. This is not a sandbox: run untrusted work in a container.</li></ul>
-</section>
-
 <section id="benchmarks">
-  <h2>Benchmarks</h2>
-  <p class="sub">Two early, small results, published with their limits.</p>
-
-  <h3>Terminal-Bench 2.0 pilot</h3>
-  <p><span class="big">4 / 10</span> tasks passed, with the model running locally.</p>
-  <ul class="tiles"><li class="ok"><span>pass</span>count-dataset-tokens</li><li class="ok"><span>pass</span>extract-elf</li><li class="ok"><span>pass</span>fix-git</li><li class="ok"><span>pass</span>git-multibranch</li><li><span>fail</span>chess-best-move</li><li><span>fail</span>circuit-fibsqrt</li><li><span>fail</span>make-mips-interpreter</li><li><span>fail</span>dna-insert</li><li><span>fail</span>filter-js-from-html</li><li><span>fail</span>gcode-to-text</li></ul>
-  <p class="note"><b>Not a leaderboard score.</b> The tasks were hand-picked, each ran once, seven were re-run after a Docker network outage stopped them from starting, and two builds were involved. <code>chess-best-move</code> needs vision, which this model lacks. The pilot predates a fix for missing file-tool parameter schemas. A full run is still to be done.</p>
+  <h2>Results</h2>
+  <p class="sub">8 of 13 private TypeScript/React tasks passed all hidden tests (score 10.15 of 13, median 5.7 minutes per task, one run). Terminal-Bench 2.0 pilot: 4 of 10.</p>
 
   <h3>13 TypeScript and React tasks</h3>
   <p class="sub">Private hidden-test suite. Score is the fraction of tests passing per task, zero if the type check fails; maximum 13.</p>
   <div class="row me"><div class="who"><b>flywheel + Qwen3.8-27B</b><small>local · agent loop · one run</small></div><div class="track"><i style="width:78.1%"></i></div><div class="val">10.15</div></div><div class="row"><div class="who"><b>Claude Sonnet 5.5</b><small>one-shot, no tools · first attempt</small></div><div class="track"><i style="width:92.3%"></i></div><div class="val">12.00</div></div><div class="row"><div class="who"><b>Claude Haiku 5.5</b><small>one-shot, no tools · first attempt</small></div><div class="track"><i style="width:92.3%"></i></div><div class="val">12.00</div></div>
-  <p class="note" style="margin-top:18px"><b>The frontier models are clearly ahead.</b> With one retry, Sonnet 5.5 and Haiku 5.5 both reached 13.00. Protocols differ, so treat this as a reference point, not a head-to-head: the Claude runs generated code without tools, while flywheel ran as an agent on a suite it had been tuned against. The flywheel run predates the current build.</p>
+  <p class="note" style="margin-top:18px"><b>The Claude models are clearly ahead.</b> With one retry that was shown the failing hidden test, Sonnet 5.5 and Haiku 5.5 both reached 13.00. Protocols differ, so treat this as a reference point, not a head-to-head: the Claude runs generated code without tools, while flywheel ran as an agent on a suite it had been tuned against. The Haiku row combines two runs. The flywheel run predates the current build. An earlier Python version of the harness scored 11.74 with 7 of 13 tasks fully passing.</p>
+  <h3>Terminal-Bench 2.0 pilot</h3>
+  <p><span class="big">4 / 10</span> tasks passed, with the model running locally.</p>
+  <ul class="tiles"><li class="ok"><span>pass</span>count-dataset-tokens</li><li class="ok"><span>pass</span>extract-elf</li><li class="ok"><span>pass</span>fix-git</li><li class="ok"><span>pass</span>git-multibranch</li><li><span>fail</span>chess-best-move</li><li><span>fail</span>circuit-fibsqrt</li><li><span>fail</span>make-mips-interpreter</li><li><span>fail</span>dna-insert</li><li><span>fail</span>filter-js-from-html</li><li><span>fail</span>gcode-to-text</li></ul>
+  <p class="note"><b>Not a leaderboard score.</b> The tasks were hand-picked, each ran once, seven were re-run after a Docker network outage stopped them from starting, and two builds were involved. <code>chess-best-move</code> needs reading an image, and flywheel sends the model text only. The pilot predates a fix for missing file-tool parameter schemas. A full run is still to be done.</p>
+
+</section>
+
+<section id="harness">
+  <h2>How the loop works</h2>
+  <p class="sub">Local models fail in repetitive ways: malformed tool calls, repeated commands, stalls. flywheel handles some of them around the model.</p>
+  <div class="grid"><div><h4>Loop breaker</h4><p>When similar commands keep returning similar results, prunes those turns, adds a correction and raises temperature.</p></div><div><h4>Strict tool calls</h4><p>Recovers shell commands from JSON with raw control characters. Truncated arguments are rejected, never run.</p></div><div><h4>Structured edits</h4><p><code>write_file</code> and <code>edit_file</code> with unique-match replacement, confined to the project.</p></div><div><h4>Verification gate</h4><p>A type check or compile per language, then one requirement-by-requirement pass. The interactive UI asks before running the check.</p></div><div><h4>Live terminal UI</h4><p>Type while it works, Esc to interrupt, collapsible output, streaming markdown, end-to-end tokens per second.</p></div><div><h4>Small and static</h4><p>About 7k lines of C. libcurl only on macOS; the Linux build is static and speaks plain HTTP.</p></div></div>
+</section>
+
+<section id="stack">
+  <h2>The stack as tested</h2>
+  <ul class="safe"><li>Model: <code>uub336/Qwen3.8-27B-pi-mlx-4bit</code> (about 15 GB, MLX)</li><li>Drafter: <code>z-lab/Qwen3.8-27B-DFlash2</code> (about 3.9 GB)</li><li>Engine: Splash 1.7.2, <code>brew install incoai/tap/splash</code></li><li>Machine: Apple M5 Max, 64 GB. Smaller Macs are untested.</li></ul>
 </section>
 
 <section id="quickstart">
   <h2>Get started</h2>
-  <p class="sub">macOS on Apple Silicon, with <code>clang</code> and <code>libcurl</code>.</p>
+  <p class="sub">macOS on Apple Silicon, with <code>clang</code> and <code>libcurl</code>. About 19 GB of downloads; <code>setup</code> needs Homebrew and <code>aria2c</code> (<code>brew install aria2</code>) installed first. Server already running? Set <code>FW_ENDPOINT</code>.</p>
   <pre class="code">git clone https://github.com/megasoft1978/flywheel
 cd flywheel &amp;&amp; make
 
 ./flywheel setup   <span class="d"># optional: engine + model, asks first</span>
 ./flywheel init    <span class="d"># per-project instructions</span>
 ./flywheel         <span class="d"># interactive session</span></pre>
+</section>
+
+<section id="safety">
+  <h2>Safety, stated plainly</h2>
+  <p class="sub">flywheel runs shell commands on your machine. Here is what it does and does not protect against.</p>
+  <ul class="safe"><li>The interactive UI asks before anything outside a short read-only list, including git, and before the verification gate. The dialog shows the whole command; keys typed before it appeared are ignored.</li><li><b>One-shot and bench modes approve everything automatically,</b> and checks such as <code>tsc</code> or <code>cargo check</code> execute code from the project.</li><li>Deny rules are best-effort. Scripts, interpreters, build tools and many commands are not inspected.</li><li><b>This is not a sandbox.</b> Do not run it on an untrusted repository outside a container or VM. Details are in the <a href="https://github.com/megasoft1978/flywheel#safety">README</a>.</li></ul>
+</section>
+
+<section id="limits">
+  <h2>Limits</h2>
+  <ul class="safe"><li>Text only: the model has vision, but flywheel does not send it images.</li><li>No API key support; the Linux build has no HTTPS.</li><li>No context compaction.</li><li>Go and Rust checks are experimental.</li><li>Tuned on the private suite above.</li><li>Not measured yet against OpenCode with the same model, or against Claude Haiku 5.5 as an agent (<a href="https://github.com/megasoft1978/flywheel/blob/main/bench/PROTOCOL.md">planned protocol</a>).</li></ul>
 </section>
 
 <footer><span>MIT licensed · C17</span><a href="https://github.com/megasoft1978/flywheel">github.com/megasoft1978/flywheel</a></footer>
