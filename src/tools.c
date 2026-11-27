@@ -1753,9 +1753,31 @@ static FILE *open_nofollow(const char *path, int flags, const char *mode) {
 
 #define FILETOOL_MAX_CONTENT (4 * 1024 * 1024)
 
+static int write_all(int fd, const char *data, size_t len) {
+    for (size_t off = 0; off < len; ) {
+        ssize_t w = write(fd, data + off, len - off);
+        if (w > 0) off += (size_t)w;
+        else if (w == 0 || errno != EINTR) return w ? errno : EIO;
+    }
+    return 0;
+}
+
+/* not atomic: *inplace says the file may be partly written on error */
+static int write_in_place(const char *path, const char *data, size_t len, bool *inplace) {
+    int fd = open(path, O_WRONLY | O_TRUNC | O_NOFOLLOW);
+    if (fd < 0) return errno;
+    *inplace = true;
+    int err = write_all(fd, data, len);
+    if (close(fd) && !err) err = errno;
+    return err;
+}
+
 /* Replace `path` through a temp file in the same directory and rename, so a
-   failed write leaves the old file. Returns 0, or the errno of the failure. */
-static int write_atomic(const char *path, const char *data, size_t len) {
+   failed write leaves the old file. Falls back to writing in place where a
+   rename cannot keep hard links or ownership, or the directory refuses a new
+   file. Returns 0, or the errno of the failure. */
+static int write_atomic(const char *path, const char *data, size_t len, bool *inplace) {
+    *inplace = false;
     struct stat st;
     bool had = !lstat(path, &st);
     if (had) {
@@ -1765,6 +1787,8 @@ static int write_atomic(const char *path, const char *data, size_t len) {
         if (S_ISDIR(st.st_mode)) return EISDIR;
         if (!S_ISREG(st.st_mode)) return EINVAL;
         if (access(path, W_OK)) return errno;
+        /* a rename would detach the other names */
+        if (st.st_nlink > 1) return write_in_place(path, data, len, inplace);
     }
     char tmp[PATH_MAX];
     const char *slash = strrchr(path, '/');
@@ -1774,15 +1798,21 @@ static int write_atomic(const char *path, const char *data, size_t len) {
         if (snprintf(tmp, sizeof tmp, "%.*s.fw-tmp-%ld-%d", dl, path, (long)getpid(), i) >= (int)sizeof tmp)
             return ENAMETOOLONG;
         fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, had ? 0600 : 0666);
-        if (fd < 0 && errno != EEXIST) return errno;
+        if (fd < 0 && errno != EEXIST) {
+            if (had && (errno == EACCES || errno == EPERM))
+                return write_in_place(path, data, len, inplace);
+            return errno;
+        }
     }
     if (fd < 0) return EEXIST;
-    int err = 0;
-    for (size_t off = 0; !err && off < len; ) {
-        ssize_t w = write(fd, data + off, len - off);
-        if (w > 0) off += (size_t)w;
-        else if (w == 0 || errno != EINTR) err = w ? errno : EIO;
+    struct stat ts;
+    if (had && (fstat(fd, &ts) || ((ts.st_uid != st.st_uid || ts.st_gid != st.st_gid)
+                                   && fchown(fd, st.st_uid, st.st_gid)))) {
+        close(fd);
+        unlink(tmp);
+        return write_in_place(path, data, len, inplace);
     }
+    int err = write_all(fd, data, len);
     if (!err && had && fchmod(fd, st.st_mode & 07777)) err = errno;
     if (close(fd) && !err) err = errno;
     if (!err && rename(tmp, path)) err = errno;
@@ -1798,10 +1828,12 @@ char *tool_write_file(const char *cwd, const char *path, const char *content) {
     size_t len = strlen(content);
     if (len > FILETOOL_MAX_CONTENT) return str_dup("error: content too large (4 MiB cap)");
 
-    int werr = write_atomic(abs, content, len);
+    bool inplace;
+    int werr = write_atomic(abs, content, len, &inplace);
     if (werr) {
         char buf[300];
-        snprintf(buf, sizeof buf, "error: cannot write %s: %s — nothing was changed", path, strerror(werr));
+        snprintf(buf, sizeof buf, "error: cannot write %s: %s — %s", path, strerror(werr),
+                 inplace ? "written in place, the file may be incomplete" : "nothing was changed");
         return str_dup(buf);
     }
 
@@ -1871,11 +1903,13 @@ char *tool_edit_file(const char *cwd, const char *path, const char *old_str, con
     free(data);
 
     size_t total = pre + nl + post;
-    int werr = write_atomic(abs, out, total);
+    bool inplace;
+    int werr = write_atomic(abs, out, total, &inplace);
     free(out);
     if (werr) {
         char buf[300];
-        snprintf(buf, sizeof buf, "error: cannot write %s: %s — nothing was changed", path, strerror(werr));
+        snprintf(buf, sizeof buf, "error: cannot write %s: %s — %s", path, strerror(werr),
+                 inplace ? "written in place, the file may be incomplete" : "nothing was changed");
         return str_dup(buf);
     }
 

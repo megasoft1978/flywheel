@@ -13,10 +13,16 @@ static void event(Ui *ui, const char *kind, const char *detail) {
     if (ui->emit_event) ui->emit_event(kind, detail, ui->ud);
 }
 
+static bool timed_out(const char *gate_output) {
+    return !strncmp(gate_output, "[timeout after", 14);
+}
+
 /* The gate runs project code, so an interactive user approves it first. A
    denial holds for the rest of the task (*denied). Never NULL; when not run,
-   *failed is false and the text says so. */
-static char *gate_out(const Profile *prof, Ui *ui, bool *denied, bool *failed) {
+   *failed is false and the text says so. *check is the outcome of the last
+   check that did run: NULL when it passed, untouched when it did not run. */
+static char *gate_out(const Profile *prof, Ui *ui, bool *denied, bool *failed,
+                      const char **check) {
     *failed = false;
     if (!prof->gate_cmd) return str_dup("");
     if (!*denied && ui->approve_cmd) {
@@ -30,21 +36,24 @@ static char *gate_out(const Profile *prof, Ui *ui, bool *denied, bool *failed) {
     }
     if (*denied) return str_dup(NOT_RUN);
     if (g_abort) return str_dup("(not run: aborted)");
-    return gate_run(prof, g_cfg.cwd, g_cfg.cmd_timeout * 2, failed);
+    char *out = gate_run(prof, g_cfg.cwd, g_cfg.cmd_timeout * 2, failed);
+    if (!g_abort)
+        *check = !*failed ? NULL : timed_out(out) ? "check-timeout" : "check-failed";
+    return out;
 }
 
-/* bash result for the model: output plus how the command ended, if not cleanly
-   (a timeout is already announced at the top of the output) */
 /* FNV-1a; the terminating NUL separates consecutive strings */
 static unsigned long long fnv1a(unsigned long long h, const char *s) {
     do h = (h ^ (unsigned char)*s) * 1099511628211ULL; while (*s++);
     return h;
 }
 
+/* bash result for the model: output plus how the command ended, if not cleanly
+   (a timeout is already announced at the top of the output) */
 static char *bash_out(const char *cmd) {
     int code;
     char *out = run_bash_status(cmd, g_cfg.cwd, g_cfg.cmd_timeout, &code);
-    if (!code || (code < 0 && (!strncmp(out, "[timeout after", 14) || !strncmp(out, "error:", 6))))
+    if (!code || (code < 0 && (!strncmp(out, "[timeout after", 14) || !strcmp(out, "error: pipe failed"))))
         return out;
     char st[48] = "[killed by a signal]";
     if (code > 0) snprintf(st, sizeof st, "[exit status %d]", code);
@@ -53,10 +62,6 @@ static char *bash_out(const char *cmd) {
     snprintf(r, cap, "%s%s%s", out, n && out[n - 1] == '\n' ? "" : "\n", st);
     free(out);
     return r;
-}
-
-static bool timed_out(const char *gate_output) {
-    return !strncmp(gate_output, "[timeout after", 14);
 }
 
 static bool wall_over(time_t wall0) {
@@ -68,6 +73,7 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
     Recent rec = {0};
     int prunes = 0, gates = 0, resets = 0, toks = 0, ptoks = 0, calls = 0, turns = 0;
     double secs = 0;
+    const char *check = NULL;   /* set while the last check that ran did not pass */
     bool wrote = false, gate_denied = false;
     int escape_turns = 0, slow_gates = 0;
     time_t wall0 = time(NULL);
@@ -168,7 +174,6 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
         if (ntcs == 0) {
             /* no tool call this turn */
             char gbuf[4096];
-            const char *check = NULL;   /* set when the final check did not pass */
             if (ui->deliverable && !wrote && turn < g_cfg.maxturns - 3) {
                 msgs_push(msgs, "user",
                     "You have not written any implementation files yet. Write the required files now, test them, and run the type check.");
@@ -177,10 +182,9 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
             }
             if (prof->gate_cmd && (ui->deliverable || wrote)) {
                 bool bad;
-                char *go = gate_out(prof, ui, &gate_denied, &bad);
+                char *go = gate_out(prof, ui, &gate_denied, &bad, &check);
                 if (g_abort) { finish = "aborted"; free(go); chat_resp_free(r); break; }
                 bool slow = bad && timed_out(go);
-                if (bad) check = slow ? "check-timeout" : "check-failed";
                 /* a check that hangs is reported once, not retried until the cap */
                 if (bad && !(slow && slow_gates++) && turn < g_cfg.maxturns - 2) {
                     snprintf(gbuf, sizeof gbuf,
@@ -254,9 +258,10 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
                 else out = iswrite ? tool_write_file(g_cfg.cwd, path, a)
                                    : tool_edit_file(g_cfg.cwd, path, a, jb->valuestring);
                 if (!strncmp(out, "ok:", 3)) wrote = true;
-                /* an edit is its text, not only its path; \001 makes the loop
-                   breaker compare these keys exactly */
-                if (args) {
+                /* an edit that took effect is its text, not only its path; \001
+                   makes the loop breaker compare these keys exactly. Failed
+                   ones stay comparable by similarity, so retries are a loop */
+                if (!strncmp(out, "ok:", 3)) {
                     unsigned long long h = fnv1a(fnv1a(fnv1a(14695981039346656037ULL, path), a),
                                                  cJSON_IsString(jb) ? jb->valuestring : "");
                     snprintf(reckey, sizeof reckey, "\001%016llx %.1100s", h, permstr);
@@ -313,7 +318,7 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
         if (g_cfg.gate_every && wrote && turn % g_cfg.gate_every == g_cfg.gate_every - 1
             && turn < g_cfg.maxturns - 5 && prof->gate_cmd) {
             bool bad, was = gate_denied;
-            char *go = gate_out(prof, ui, &gate_denied, &bad);
+            char *go = gate_out(prof, ui, &gate_denied, &bad, &check);
             if (gate_denied && !was)
                 msgs_push(msgs, "user", "The automatic check was not run: " NOT_RUN);
             if (bad) {
@@ -347,7 +352,7 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
             rec_clear(&rec);
             escape_turns = 2;
             bool bad;
-            char *go = gate_out(prof, ui, &gate_denied, &bad);
+            char *go = gate_out(prof, ui, &gate_denied, &bad, &check);
             char *files = run_bash(
                 "find . -maxdepth 3 \\( -name node_modules -o -name .git \\) -prune -o -type f -print | head -40",
                 g_cfg.cwd, 10);

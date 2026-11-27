@@ -1309,6 +1309,59 @@ static void test_atomic(void) {
     T("new file follows umask", !stat(l, &a) && a.st_size == 0 && (a.st_mode & 07777) == (0666 & ~um));
     free(r);
 
+    /* where replacing the file would lose something, it is written in place */
+    char h[256];
+    snprintf(p, sizeof p, "%s/one", dir);
+    snprintf(h, sizeof h, "%s/two", dir);
+    put(p, "shared");
+    T("hard link made", !link(p, h));
+    r = tool_write_file(dir, "one", "both see this");
+    stat(p, &a);
+    stat(h, &b);
+    T("hard-linked pair stays linked", !strncmp(r, "ok:", 3) && a.st_ino == b.st_ino && a.st_nlink == 2);
+    T("hard-linked pair shows the new content", holds(p, "both see this") && holds(h, "both see this"));
+    free(r);
+    fflush(stdout);
+    pid = fork();
+    if (pid == 0) {
+        signal(SIGXFSZ, SIG_IGN);
+        struct rlimit lim = {4, 4};
+        setrlimit(RLIMIT_FSIZE, &lim);
+        char *w = tool_write_file(dir, "one", "much longer than the limit\n");
+        _exit(strncmp(w, "error:", 6) || strstr(w, "nothing was changed") ? 1 : 0);
+    }
+    st = 0;
+    waitpid(pid, &st, 0);
+    T("failed in-place write does not claim nothing changed", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+
+    gid_t groups[64];
+    int ng = getgroups(64, groups);
+    snprintf(p, sizeof p, "%s/grp", dir);
+    put(p, "x");
+    stat(p, &a);
+    for (int i = 0; i < ng; i++) {
+        if (groups[i] == a.st_gid || chown(p, (uid_t)-1, groups[i])) continue;
+        r = tool_write_file(dir, "grp", "y");
+        stat(p, &b);
+        T("write keeps the group", b.st_gid == groups[i] && holds(p, "y"));
+        free(r);
+        break;
+    }
+
+    if (geteuid() != 0) {
+        char sub_[256];
+        snprintf(sub_, sizeof sub_, "%s/ro", dir);
+        mkdir(sub_, 0755);
+        snprintf(p, sizeof p, "%s/ro/f", dir);
+        put(p, "old");
+        chmod(sub_, 0555);
+        r = tool_write_file(dir, "ro/f", "new");
+        T("writable file in a read-only directory is written", !strncmp(r, "ok:", 3) && holds(p, "new"));
+        free(r);
+        chmod(sub_, 0755);
+    }
+    snprintf(p, sizeof p, "%s/run.sh", dir);
+
     free(g_cfg.cwd);
     g_cfg.cwd = str_dup(dir);
     Ui u = {.interactive = true};
@@ -1328,6 +1381,12 @@ static void test_atomic(void) {
 }
 
 /* ---------- exit status and check outcome reach the model and the user ---------- */
+
+static int once_asks;
+static bool gate_once(const char *cmd, bool gate, void *ud) {
+    (void)cmd; (void)ud;
+    return !gate || !once_asks++;
+}
 
 static void test_truth(void) {
     char dir[] = "/tmp/fwtruthXXXXXX";
@@ -1349,14 +1408,17 @@ static void test_truth(void) {
     static const char *const bad[] = {"bash", "{\"command\":\"echo hi; exit 3\"}",
                                       "bash", "{\"command\":\"echo fine\"}",
                                       "bash", "{\"command\":\"sleep 5\"}",
-                                      "bash", "{\"command\":\"kill -9 $$\"}"};
+                                      "bash", "{\"command\":\"kill -9 $$\"}",
+                                      "bash", "{\"command\":\"echo 'error: boom'; kill -9 $$\"}"};
     fake_tool(dir, "go", "exit 0");
     new_task(&m);
-    run_agent(&m, "tool_calls", 4, bad, 1, &u);
+    run_agent(&m, "tool_calls", 5, bad, 1, &u);
     T("bash: non-zero exit status reported", has_msg(&m, "tool", "hi\n[exit status 3]"));
     T("bash: success has no status line", has_msg(&m, "tool", "fine") && !has_msg(&m, "tool", "[exit status 0]"));
     T("bash: timeout reported", has_msg(&m, "tool", "[timeout after 1s"));
     T("bash: signal death reported", has_msg(&m, "tool", "[killed by a signal]"));
+    T("bash: output starting with error: keeps the signal",
+      has_msg(&m, "tool", "error: boom\n[killed by a signal]"));
     msgs_free(&m);
 
     static const char *const wr[] = {"write_file", "{\"path\":\"a.go\",\"content\":\"x\"}"};
@@ -1381,6 +1443,20 @@ static void test_truth(void) {
         free(c);
         msgs_free(&m);
     }
+    /* the gate fails once, then the user declines to run it again */
+    fake_tool(dir, "go", "echo broken; exit 1");
+    perm_free();
+    Ui once = {.interactive = true, .approve_cmd = gate_once};
+    once_asks = 0;
+    new_task(&m);
+    agent_finish_reason = "tool_calls"; agent_calls = wr; agent_ncalls = 1; agent_tool_turns = 1;
+    pid_t op = serve(reply_agent);
+    const char *ofin = agent_run(&m, &once, sum, sizeof sum);
+    stop(op);
+    T("check outcome: a declined re-run keeps the failure",
+      once_asks == 2 && !strcmp(ofin, "check-failed") && strstr(sum, "check=skipped"));
+    msgs_free(&m);
+
     bool failed_;
     char *o = gate_run(profile_detect(dir, "go"), dir, 1, &failed_);
     T("gate: timeout is not a pass", failed_);
@@ -1394,7 +1470,8 @@ static void test_truth(void) {
 
 /* ---------- loop breaker: an edit is its text, not only its path ---------- */
 
-static int loop_kind;   /* 0 new content, 1 new old/new strings, 2 identical write, 3 identical edit */
+static int loop_kind;   /* 0 new content, 1 new old/new strings, 2 identical write, 3 identical edit,
+                           4 varying old_string that never matches */
 
 static const char *reply_edits(int n) {
     if (n >= 4) return OK_HDR STOPPED "data: [DONE]\n\n";
@@ -1402,11 +1479,13 @@ static const char *reply_edits(int n) {
     memset(pad, 'x', 800);
     pad[800] = 0;
     int k = loop_kind < 2 ? n : 0;
-    if (loop_kind % 2 == 0)
+    if (loop_kind == 4)
+        snprintf(args, sizeof args, "{\"path\":\"f.txt\",\"old_string\":\"absent%d\",\"new_string\":\"y\"}", n);
+    else if (loop_kind % 2 == 0)
         snprintf(args, sizeof args, "{\"path\":\"f.txt\",\"content\":\"%sv%d\"}", pad, k);
     else
         snprintf(args, sizeof args, "{\"path\":\"f.txt\",\"old_string\":\"v%d\",\"new_string\":\"v%d\"}", k, k + 1);
-    const char *calls[] = {loop_kind % 2 == 0 ? "write_file" : "edit_file", args};
+    const char *calls[] = {loop_kind % 2 == 0 && loop_kind != 4 ? "write_file" : "edit_file", args};
     return tool_reply("tool_calls", 1, calls);
 }
 
@@ -1420,8 +1499,9 @@ static void test_loopedit(void) {
     g_cfg.profile = (char *)"generic";
     static const char *const names[] = {
         "successive rewrites of one file are kept", "successive edits of one file are kept",
-        "identical writes are still a loop", "identical edits are still a loop"};
-    for (loop_kind = 0; loop_kind < 4; loop_kind++) {
+        "identical writes are still a loop", "identical edits are still a loop",
+        "failing edits with a varying old_string are a loop"};
+    for (loop_kind = 0; loop_kind < 5; loop_kind++) {
         put(p, "v0\n");
         Ui u = {.interactive = true};
         Msgs m;
