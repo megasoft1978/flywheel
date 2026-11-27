@@ -17,15 +17,28 @@ static bool timed_out(const char *gate_output) {
     return !strncmp(gate_output, "[timeout after", 14);
 }
 
+static bool wall_over(time_t wall0) {
+    return g_cfg.wall && time(NULL) - wall0 >= g_cfg.wall;
+}
+
+/* no command may outlive the wall clock: timeout_s, cut to the time left */
+static int wall_clamp(int timeout_s, time_t wall0) {
+    if (!g_cfg.wall) return timeout_s;
+    long left = g_cfg.wall - (long)(time(NULL) - wall0);
+    if (left < 1) left = 1;
+    return timeout_s > 0 && timeout_s < left ? timeout_s : (int)left;
+}
+
 /* The gate runs project code, so an interactive user approves it first. A
    denial holds for the rest of the task (*denied). Never NULL; when not run,
    *failed is false and the text says so. *check is the outcome of the last
-   check that did run: NULL when it passed, untouched when it did not run. */
+   check that did run: NULL when it passed, untouched when it did not run.
+   *walled: the wall clock kept it from running or from completing. */
 static char *gate_out(const Profile *prof, Ui *ui, bool *denied, bool *failed,
-                      const char **check) {
-    *failed = false;
+                      const char **check, time_t wall0, bool *walled) {
+    *failed = *walled = false;
     if (!prof->gate_cmd) return str_dup("");
-    if (!*denied && ui->approve_cmd) {
+    if (!*denied && !wall_over(wall0) && ui->approve_cmd) {
         /* gate_cmd is exactly what gate_run executes */
         if (!perm_gate_allowed(prof->gate_cmd) && !ui->approve_cmd(prof->gate_cmd, true, ui->ud)) {
             *denied = true;
@@ -36,7 +49,13 @@ static char *gate_out(const Profile *prof, Ui *ui, bool *denied, bool *failed,
     }
     if (*denied) return str_dup(NOT_RUN);
     if (g_abort) return str_dup("(not run: aborted)");
-    char *out = gate_run(prof, g_cfg.cwd, g_cfg.cmd_timeout * 2, failed);
+    if (wall_over(wall0)) {   /* checked after the approval, which takes time */
+        *walled = true;
+        event(ui, "gate", "check not run: wall clock limit reached");
+        return str_dup("(not run: wall clock limit reached)");
+    }
+    char *out = gate_run(prof, g_cfg.cwd, wall_clamp(g_cfg.cmd_timeout * 2, wall0), failed);
+    *walled = timed_out(out) && wall_over(wall0);
     if (!g_abort)
         *check = !*failed ? NULL : timed_out(out) ? "check-timeout" : "check-failed";
     return out;
@@ -50,9 +69,20 @@ static unsigned long long fnv1a(unsigned long long h, const char *s) {
 
 /* bash result for the model: output plus how the command ended, if not cleanly
    (a timeout is already announced at the top of the output) */
-static char *bash_out(const char *cmd, bool net, bool interactive) {
+static char *bash_out(const char *cmd, bool net, bool interactive, time_t wall0) {
     int code;
-    char *out = (net ? run_bash_net : run_bash_status)(cmd, g_cfg.cwd, g_cfg.cmd_timeout, &code);
+    char *out = (net ? run_bash_net : run_bash_status)(cmd, g_cfg.cwd,
+                    wall_clamp(g_cfg.cmd_timeout, wall0), &code);
+    if (code < 0 && timed_out(out) && wall_over(wall0)) {   /* not a hang */
+        static const char why[] = "[stopped: wall clock limit reached]";
+        const char *rest = strchr(out, '\n');   /* replaces the "hung" line */
+        if (!rest) rest = "";
+        size_t cap = strlen(rest) + sizeof why;
+        char *w = malloc(cap);
+        snprintf(w, cap, "%s%s", why, rest);
+        free(out);
+        return w;
+    }
     /* say why, or the model retries the same thing */
     if (code > 0 && !net && sandbox_on() &&
         (strstr(out, "Operation not permitted") || strstr(out, "Could not resolve") ||
@@ -77,9 +107,7 @@ static char *bash_out(const char *cmd, bool net, bool interactive) {
     return r;
 }
 
-static bool wall_over(time_t wall0) {
-    return g_cfg.wall && time(NULL) - wall0 >= g_cfg.wall;
-}
+#define WALL_SKIP "error: wall clock limit reached — not executed"
 
 const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
     const Profile *prof = profile_detect(g_cfg.cwd, g_cfg.profile);
@@ -103,7 +131,7 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
     FILE *tr = g_cfg.transcript ? fopen(g_cfg.transcript, "a") : NULL;
 
     for (int turn = 0; turn < g_cfg.maxturns; turn++) {
-        if (g_cfg.wall && time(NULL) - wall0 > g_cfg.wall) { finish = "wall"; break; }
+        if (wall_over(wall0)) { finish = "wall"; break; }
         if (g_abort) { finish = "aborted"; break; }
         double base_t = g_cfg.temp, base_pp = g_cfg.pp;
         if (escape_turns > 0) { g_cfg.temp = base_t > g_cfg.loop_temp ? base_t : g_cfg.loop_temp;
@@ -136,7 +164,7 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
             }
             chat_resp_free(r);
             r = NULL;
-            struct timespec ts = {.tv_sec = 2 << attempt, .tv_nsec = 0};
+            struct timespec ts = {.tv_sec = wall_clamp(2 << attempt, wall0), .tv_nsec = 0};
             nanosleep(&ts, NULL);
             if (g_abort || wall_over(wall0)) break;
         }
@@ -199,9 +227,10 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
                 continue;
             }
             if (prof->gate_cmd && (ui->deliverable || wrote)) {
-                bool bad;
-                char *go = gate_out(prof, ui, &gate_denied, &bad, &check);
+                bool bad, walled;
+                char *go = gate_out(prof, ui, &gate_denied, &bad, &check, wall0, &walled);
                 if (g_abort) { finish = "aborted"; free(go); chat_resp_free(r); break; }
+                if (walled) { finish = "wall"; free(go); chat_resp_free(r); break; }
                 bool slow = bad && timed_out(go);
                 /* a check that hangs is reported once, not retried until the cap */
                 if (bad && !(slow && slow_gates++) && turn < g_cfg.maxturns - 2) {
@@ -244,8 +273,10 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
             char *out = NULL;
             char reckey[1200] = "";
 
-            /* Esc stops the rest of the batch; a cut-off response is never run */
+            /* Esc or the wall clock stops the rest of the batch; a cut-off
+               response is never run */
             const char *skip = g_abort ? "error: aborted by user — not executed"
+                : wall_over(wall0) ? WALL_SKIP
                 : !strcmp(r->finish, "length")
                 ? "error: response was cut off (finish=length) — tool call not executed; resend a shorter, complete call"
                 : NULL;
@@ -273,6 +304,7 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
                 else if (ui->approve_cmd && !perm_allowed(permstr) && !ui->approve_cmd(permstr, false, ui->ud))
                     out = str_dup("error: user denied this — adapt, explain why it is needed, or try another approach");
                 else if (g_abort) out = str_dup("error: aborted by user — not executed");
+                else if (wall_over(wall0)) out = str_dup(WALL_SKIP);
                 else out = iswrite ? tool_write_file(g_cfg.cwd, path, a)
                                    : tool_edit_file(g_cfg.cwd, path, a, jb->valuestring);
                 if (!strncmp(out, "ok:", 3)) wrote = true;
@@ -320,8 +352,9 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
                         out = str_dup("error: network access needs the user's approval, which this mode cannot ask for — not executed; run it without \"network\"");
                     else if (unapproved) out = str_dup("error: user denied this command — adapt, explain why it is needed, or try another approach");
                     else if (g_abort) out = str_dup("error: aborted by user — not executed");
+                    else if (wall_over(wall0)) out = str_dup(WALL_SKIP);
                     else {
-                        out = bash_out(fixed, net, ui->approve_cmd != NULL);
+                        out = bash_out(fixed, net, ui->approve_cmd != NULL, wall0);
                         if (cmd_is_write(fixed)) wrote = true;
                     }
                     snprintf(reckey, sizeof reckey, "%.1100s", fixed);
@@ -346,12 +379,14 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
         }
         chat_resp_free(r);
         if (g_abort) { finish = "aborted"; break; }
+        if (wall_over(wall0)) { finish = "wall"; break; }
 
         /* periodic gate */
         if (g_cfg.gate_every && wrote && turn % g_cfg.gate_every == g_cfg.gate_every - 1
             && turn < g_cfg.maxturns - 5 && prof->gate_cmd) {
-            bool bad, was = gate_denied;
-            char *go = gate_out(prof, ui, &gate_denied, &bad, &check);
+            bool bad, walled, was = gate_denied;
+            char *go = gate_out(prof, ui, &gate_denied, &bad, &check, wall0, &walled);
+            if (walled) { finish = "wall"; free(go); break; }
             if (gate_denied && !was)
                 msgs_push(msgs, "user", "The automatic check was not run: " NOT_RUN);
             if (bad) {
@@ -384,11 +419,12 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
             prunes++;
             rec_clear(&rec);
             escape_turns = 2;
-            bool bad;
-            char *go = gate_out(prof, ui, &gate_denied, &bad, &check);
-            char *files = run_bash(
+            bool bad, walled;
+            char *go = gate_out(prof, ui, &gate_denied, &bad, &check, wall0, &walled);
+            if (walled) { finish = "wall"; free(go); break; }
+            char *files = wall_over(wall0) ? str_dup("") : run_bash(
                 "find . -maxdepth 3 \\( -name node_modules -o -name .git \\) -prune -o -type f -print | head -40",
-                g_cfg.cwd, 10);
+                g_cfg.cwd, wall_clamp(10, wall0));
             char pb[8192];
             if (prunes % 2 == 0 && resets < MAXRESETS) {
                 resets++;

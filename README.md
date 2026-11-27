@@ -72,7 +72,7 @@ flywheel bench <suite-dir> <tag>    # run a benchmark suite
 | `-C DIR` | working directory | current |
 | `-P ts\|python\|go\|rust\|generic` | language profile | auto-detected |
 | `-T N` / `-t SEC` | max turns / command timeout | 60 / 30 |
-| `-W SEC` | wall clock, limits model requests only | off |
+| `-W SEC` | wall clock for the task: cuts model requests, commands and checks; ends as `wall` | off |
 | `--gates N` | requirement-check passes before finishing | 1 |
 | `--transcript FILE` | JSONL log of the run | off |
 | `--allow-outside-writes` | throwaway containers only, see [Safety](#safety) | off |
