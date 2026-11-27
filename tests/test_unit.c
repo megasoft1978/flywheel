@@ -453,14 +453,17 @@ static void test_symlinks(void) {
 }
 
 static void test_bounded_output(void) {
+    char dir[] = "/tmp/fwboundXXXXXX";   /* commands check their tree: keep it private */
+    if (!mkdtemp(dir)) { T("mkdtemp", false); return; }
     time_t t0 = time(NULL);
-    char *o = run_bash("(perl -e 'alarm 8; $|=1; print \"y\"x8192 while 1') & echo hi", "/tmp", 3);
+    char *o = run_bash("(perl -e 'alarm 8; $|=1; print \"y\"x8192 while 1') & echo hi", dir, 3);
     T("background writer does not hang the drain", time(NULL) - t0 < 6 && strlen(o) <= 4096);
     free(o);
-    o = run_bash("echo HEAD; head -c 4000000 /dev/zero | tr '\\0' a; echo TAIL", "/tmp", 10);
+    o = run_bash("echo HEAD; head -c 4000000 /dev/zero | tr '\\0' a; echo TAIL", dir, 10);
     T("large output keeps head and tail, no timeout",
       !strncmp(o, "HEAD", 4) && strstr(o, "TAIL") && !strstr(o, "[timeout") && strlen(o) <= 4096);
     free(o);
+    rmdir(dir);
 }
 
 static void test_copy_file(void) {
@@ -2262,6 +2265,222 @@ static void test_sandbox_escapes(void) {
     free(oldhome);
 }
 
+/* outside the sandbox: set up a fixture with a shell script */
+static void host(const char *dir, const char *script) {
+    char cmd[6000];
+    snprintf(cmd, sizeof cmd, "cd '%s' && { %s\n} >/dev/null 2>&1", dir, script);
+    T(script, !system(cmd));
+}
+
+static bool gone(const char *dir, const char *rel) {
+    char p[PATH_MAX];
+    snprintf(p, sizeof p, "%s/%s", dir, rel);
+    struct stat st;
+    return lstat(p, &st) != 0;
+}
+
+/* a fresh dummy HOME and an empty project below base */
+static char *review_dirs(char *base, char *home, char *proj) {
+    char tmpl[] = "/tmp/fwrevXXXXXX";
+    if (!mkdtemp(tmpl) || !realpath(tmpl, base)) return NULL;
+    snprintf(home, PATH_MAX, "%s/home", base);
+    snprintf(proj, PATH_MAX, "%s/proj", base);
+    mkdir(home, 0700);
+    mkdir(proj, 0700);
+    char *old = str_dup(getenv("HOME"));
+    setenv("HOME", home, 1);
+    return old;
+}
+
+/* 1: a directory swapped for a link between the check and the I/O */
+static char race_dir[PATH_MAX], race_to[PATH_MAX];
+static void swap_for_link(void) {
+    char bak[PATH_MAX + 8];
+    snprintf(bak, sizeof bak, "%s.bak", race_dir);
+    fw_file_hook = NULL;
+    if (rename(race_dir, bak) || symlink(race_to, race_dir)) T("swap", false);
+}
+
+static void test_file_race(void) {
+    char base[PATH_MAX], home[PATH_MAX], proj[PATH_MAX];
+    char *old = review_dirs(base, home, proj);
+    if (!old) { T("mkdtemp", false); return; }
+    put(under(home, ".ssh/key"), "TOPSECRET");
+    snprintf(race_to, sizeof race_to, "%s/.ssh", home);
+    static const char *const paths[] = {"a/authorized_keys", "b/sub/f", "c/key"};
+    for (int i = 0; i < 3; i++) {
+        snprintf(race_dir, sizeof race_dir, "%s/%c", proj, 'a' + i);
+        mkdir(race_dir, 0700);
+        if (i == 2) put(under(proj, "c/key"), "TOPSECRET");
+        fw_file_hook = swap_for_link;
+        refused(paths[i], i == 2 ? tool_edit_file(proj, paths[i], "TOP", "BOT")
+                                 : tool_write_file(proj, paths[i], "evil"));
+        fw_file_hook = NULL;
+    }
+    T("race: nothing written into the store", gone(home, ".ssh/authorized_keys"));
+    T("race: nothing made in the store", gone(home, ".ssh/sub"));
+    T("race: secret not edited", holds(under(home, ".ssh/key"), "TOPSECRET"));
+    setenv("HOME", old, 1);
+    free(old);
+}
+
+/* 4: APFS folds U+017F to "s"; the project is the home directory */
+static void test_unicode_stores(void) {
+    char base[PATH_MAX], home[PATH_MAX], proj[PATH_MAX];
+    char *old = review_dirs(base, home, proj);
+    if (!old) { T("mkdtemp", false); return; }
+    mkdir(under(home, ".config"), 0700);
+    refused("folded history file", tool_write_file(home, ".zsh_hi\xc5\xbftory", "x"));
+    T("no history file", gone(home, ".zsh_history"));
+    refused("folded store directory", tool_write_file(home, ".\xc5\xbfsh/authorized_keys", "k"));
+    T("no store directory left", gone(home, ".ssh"));
+    refused("folded store below .config", tool_write_file(home, ".config/g\xe2\x84\xaa/x/y", "k"));
+    refused("project above HOME", tool_write_file(base, "home/.\xc5\xbfsh/k", "k"));
+    T("still no store directory", gone(home, ".ssh"));
+    mkdir(under(home, "Dok\xc3\xbc"), 0700);
+    char *r = tool_write_file(home, "Dok\xc3\xbc/\xc3\xa9t\xc3\xa9.txt", "x");
+    T("non-ASCII names away from the stores work", !strncmp(r, "ok:", 3));
+    free(r);
+    setenv("HOME", old, 1);
+    free(old);
+}
+
+#define EVIL_CFG "printf '[core]\\n\\tfsmonitor = /usr/bin/false\\n'"
+
+/* 2: repositories below the root, which git outside the sandbox obeys */
+static void test_nested_git(void) {
+    char base[PATH_MAX], home[PATH_MAX], proj[PATH_MAX];
+    char *old = review_dirs(base, home, proj);
+    if (!old) { T("mkdtemp", false); return; }
+
+    /* a root that is no repository cannot become a bare one */
+    in_dir(proj);
+    quiet("mkdir objects refs; " EVIL_CFG " > config; echo 'ref: refs/heads/main' > HEAD");
+    quiet("echo 'ref: refs/heads/main' > h; mv h head; ln h HEAD");
+    T("no HEAD in a root without .git", gone(proj, "HEAD"));
+    refused("tool: root HEAD", tool_write_file(proj, "HEAD", "ref: refs/heads/main\n"));
+
+    /* what is there already is closed */
+    snprintf(proj, sizeof proj, "%s/repo", base);
+    mkdir(proj, 0700);
+    host(proj, "git init -q . && git -c user.name=t -c user.email=t@t commit -qm one --allow-empty"
+               " && git init -q sub && git init -q --bare .git/modules/m"
+               " && git worktree add -q wt -b wt"
+               " && mkdir link env && echo 'gitdir: ../.git/modules/m' > link/.git"
+               " && echo safe > env/.envrc");
+    static const char *const kept[] = {"sub/.git/config", ".git/modules/m/config", "link/.git",
+        ".git/worktrees/wt/commondir", "wt/.git", "env/.envrc"};
+    char *was[6];
+    for (int i = 0; i < 6; i++) was[i] = slurp(under(proj, kept[i]));
+    in_dir(proj);
+    for (int i = 0; i < 6; i++) {
+        char cmd[300];
+        snprintf(cmd, sizeof cmd, "echo evil >> %s; echo evil > e; mv e %s", kept[i], kept[i]);
+        quiet(cmd);
+        T(kept[i], was[i] && holds(under(proj, kept[i]), was[i]));
+        refused(kept[i], tool_write_file(proj, kept[i], "evil"));
+        free(was[i]);
+    }
+    quiet("echo evil > sub/.git/hooks/pre-commit; echo evil > .git/modules/m/hooks/pre-commit");
+    quiet("echo evil > sub/.git/config.worktree; echo /tmp > sub/.git/commondir");
+    quiet("mv sub sub2; mv .git/modules mods");
+    T("nested hooks not planted", gone(proj, "sub/.git/hooks/pre-commit")
+      && gone(proj, ".git/modules/m/hooks/pre-commit") && gone(proj, "sub/.git/config.worktree")
+      && gone(proj, "sub/.git/commondir"));
+    T("nested repository not renamed", gone(proj, "sub2") && gone(proj, "mods"));
+    static const char *const no[] = {"sub/.git/hooks/pre-commit", ".git/modules/m/hooks/x",
+        "new/.git/config", "new/.GIT/hooks/x", "deep/er/.envrc", "other/.git",
+        ".git/worktrees/wt/config.worktree"};
+    for (int i = 0; i < (int)(sizeof no / sizeof *no); i++)
+        refused(no[i], tool_write_file(proj, no[i], "evil"));
+
+    /* git still makes repositories below the root */
+    int code = -1;
+    char *o = run_bash_status("git init -q fresh && git clone -q . cl && git worktree add -q wt2 -b wt2"
+                              " && git -C cl status --short && git -C wt2 status --short", proj, 30, &code);
+    T("git init, clone and worktree add work", !code);
+    T("an ordinary new repository is left alone", !strstr(o, "quarantined")
+      && !gone(proj, "fresh/.git/config") && !gone(proj, "cl/.git/config")
+      && !gone(proj, ".git/worktrees/wt2/commondir") && !gone(proj, "wt2/.git"));
+    free(o);
+
+    /* the next command finds them there: closed like any other */
+    char *cfg = slurp(under(proj, "fresh/.git/config"));
+    quiet(EVIL_CFG " >> fresh/.git/config; echo evil > cl/.git/hooks/pre-commit;"
+          " echo /tmp > .git/worktrees/wt2/commondir");
+    T("repositories made earlier are closed", cfg && holds(under(proj, "fresh/.git/config"), cfg)
+      && gone(proj, "cl/.git/hooks/pre-commit")
+      && holds(under(proj, ".git/worktrees/wt2/commondir"), "../..\n"));
+    free(cfg);
+
+    /* what a command newly creates and could run is moved aside */
+    o = run_bash("git init -q f2 && " EVIL_CFG " >> f2/.git/config; git init -q f3 && echo evil > f3/.git/hooks/pre-commit;"
+                 " mkdir n && echo evil > n/.envrc; git init -q --bare b.git && " EVIL_CFG " >> b.git/config;"
+                 " mkdir l && echo \"gitdir: $TMPDIR\" > l/.git; mkdir .git/worktrees/zz && echo /tmp > .git/worktrees/zz/commondir;"
+                 " mkdir -p c/objects c/refs && " EVIL_CFG " > c/config;"
+                 " git init -q f4 && printf '[core]fsmonitor=/usr/bin/false\\n' > f4/.git/config;"
+                 " git init -q f5 && echo evil > f5/.git/config.worktree", proj, 30);
+    T("quarantine reported", strstr(o, "quarantined"));
+    free(o);
+    T("new config moved aside", gone(proj, "f2/.git/config") && gone(proj, "b.git/config")
+      && gone(proj, "c/config") && gone(proj, "f4/.git/config") && gone(proj, "f5/.git/config.worktree"));
+    T("new hook moved aside", gone(proj, "f3/.git/hooks/pre-commit"));
+    T("new .envrc moved aside", gone(proj, "n/.envrc"));
+    T("new gitlink out of the project moved aside", gone(proj, "l/.git"));
+    T("new commondir moved aside", gone(proj, ".git/worktrees/zz/commondir"));
+
+    /* a repository assembled by the file tools */
+    free(tool_write_file(proj, "t/config", "[core]\n\tfsmonitor = /usr/bin/false\n"));
+    free(tool_write_file(proj, "t/objects/x", "x"));
+    free(tool_write_file(proj, "t/refs/x", "x"));
+    free(tool_write_file(proj, "t/HEAD", "ref: refs/heads/main\n"));
+    T("tool-made repository cannot keep its config", gone(proj, "t/config"));
+    setenv("HOME", old, 1);
+    free(old);
+}
+
+/* 3: a linked worktree keeps its index and objects outside the project */
+static void test_linked_worktree(void) {
+    char base[PATH_MAX], home[PATH_MAX], proj[PATH_MAX];
+    char *old = review_dirs(base, home, proj);
+    if (!old) { T("mkdtemp", false); return; }
+    char wt[PATH_MAX + 8], fake[PATH_MAX + 8];
+    snprintf(wt, sizeof wt, "%s/wt", base);
+    snprintf(fake, sizeof fake, "%s/fake", base);
+    host(proj, "git init -q . && git config user.name t && git config user.email t@t"
+               " && git commit -qm one --allow-empty && git branch other && git worktree add -q ../wt -b wt");
+    char *config = slurp(under(proj, ".git/config"));
+    char *common = slurp(under(proj, ".git/worktrees/wt/commondir"));
+    in_dir(wt);
+    int code = -1;
+    char *o = run_bash_status("echo b > b && git add b && git commit -qm two", wt, 30, &code);
+    T("git add and commit in a linked worktree", !code);
+    free(o);
+    o = run_bash("git branch -u other", wt, 30);
+    T("config denial explained", strstr(o, "[sandbox:") && strstr(o, "NOT saved"));
+    free(o);
+    quiet("echo evil >> ../proj/.git/config; echo evil > ../proj/.git/hooks/pre-commit;"
+          " echo evil > ../proj/.git/worktrees/wt/commondir; echo evil > ../proj/.git/worktrees/wt/config.worktree;"
+          " echo evil > ../proj/outside; mv ../proj/.git ../proj/g2");
+    T("main config and hooks stay closed", config && holds(under(proj, ".git/config"), config)
+      && common && holds(under(proj, ".git/worktrees/wt/commondir"), common)
+      && gone(proj, ".git/hooks/pre-commit") && gone(proj, ".git/worktrees/wt/config.worktree")
+      && gone(proj, "outside") && gone(proj, "g2"));
+    /* a .git file the repository does not point back to opens nothing */
+    mkdir(fake, 0700);
+    char line[PATH_MAX + 64];
+    snprintf(line, sizeof line, "gitdir: %s/.git/worktrees/wt\n", proj);
+    put(under(fake, ".git"), line);
+    in_dir(fake);
+    quiet("echo evil > ../proj/.git/objects/planted; echo evil > ../proj/.git/worktrees/wt/planted");
+    T("forged .git file opens nothing", gone(proj, ".git/objects/planted")
+      && gone(proj, ".git/worktrees/wt/planted"));
+    free(config);
+    free(common);
+    setenv("HOME", old, 1);
+    free(old);
+}
+
 /* no sandbox: nothing may run unless someone approves or --unsafe says so */
 static void test_fail_closed(void) {
     char dir[] = "/tmp/fwfcXXXXXX", p[256];
@@ -2302,7 +2521,7 @@ int main(void) {
     if (!mkdtemp(fakehome) || !mkdtemp(projdir)) return 1;
     setenv("HOME", fakehome, 1);   /* never touch the real rules */
     g_cfg.unsafe = !sandbox_available();   /* else commands run sandboxed */
-    g_cfg.cwd = str_dup("/tmp");
+    g_cfg.cwd = str_dup(projdir);
     setenv("HOME", "/home/fwdeny", 1);   /* HOME outside /tmp for the ~ and $HOME cases */
     test_deny();
     test_deny_hardened();
@@ -2353,7 +2572,14 @@ int main(void) {
     test_truth();
     test_atomic();
     test_loopedit();
-    if (sandbox_available()) { test_sandbox(); test_sandbox_escapes(); }
+    test_file_race();
+    test_unicode_stores();
+    if (sandbox_available()) {
+        test_sandbox();
+        test_sandbox_escapes();
+        test_nested_git();
+        test_linked_worktree();
+    }
     else printf("unit: SKIP sandbox tests (no sandbox here)\n");
     test_fail_closed();
 #ifdef FW_MINI_HTTP

@@ -122,8 +122,15 @@ untrusted repository or task in a VM.
 - Writes: the working directory and a private `$TMPDIR` (plus `/dev/null` and similar). Not `/tmp`.
   Not the project's `.envrc`, `.git/hooks`, `.git/config`, `.git/config.worktree` or
   `.git/commondir`, which run or redirect code later, outside the sandbox. Without a real `.git`
-  directory, nothing can create `.git`. The project directory itself and the directories above
-  these files and the stores below cannot be renamed or removed.
+  directory, nothing can create `.git`, nor a `HEAD` in the root. The project directory itself and
+  the directories above these files and the stores below cannot be renamed or removed.
+- Nested repositories, `.git/modules`, `.git/worktrees` and nested `.envrc`: those that exist when
+  a command starts have config, hooks, `commondir`, `.git` link files and `.envrc` closed. New ones
+  are checked when the command ends; a config with anything beyond what `git init`, `clone`,
+  `worktree` and `submodule` write, a hook, an `.envrc` or a redirecting link is renamed to
+  `*.fw-quarantined-N`.
+- In a linked git worktree, also its own git directory and the main repository's `objects`, `refs`
+  and `logs`, so commits work. Config and hooks there stay closed.
 - Reads: everything you can read, except these credential stores in your home directory, which are
   neither readable nor writable, also through the file tools and where they are symlinks:
   `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.docker`, `~/.azure`, `~/.netrc`,
@@ -144,20 +151,29 @@ What stops working inside it:
   Gradle and the like). Fetch dependencies yourself first.
 - `git init` in the project root, and anything that writes `.git/config` or hooks: `git config`,
   `git remote add`, `git push -u`, `git branch -u`, `git submodule add`, hook installers such as
-  husky or `pre-commit install`. `add`, `commit`, branches and stash work.
+  husky or `pre-commit install`. `add`, `commit`, branches and stash work. Git may report success
+  although the setting was not saved; the tool output says so.
+- Changing the config or hooks of, or renaming or removing, a nested repository or worktree that
+  already existed.
 - Tools that need a denied file: private registry logins in `~/.npmrc`, `~/.m2/settings.xml`,
   `~/.gradle/gradle.properties` and the like.
 - `git fetch`/`push` (offline; over SSH it also fails with network approved, as keys and
   `known_hosts` are unreadable), and Keychain or `gh` credentials.
-- A git worktree or submodule whose `.git` directory is outside the project: no commits.
+- A submodule opened as the project, or a worktree whose link back from the main repository does
+  not match: no commits.
+- New file names with non-ASCII characters in a directory that holds a credential store.
 - Docker, `ssh-agent` and other Unix sockets, local servers and tests that open a port (unless
   network is approved), `ps`, pseudo-terminals, `open` and AppleScript.
 
 Where it does not protect you:
 
 - Other files inside the project can be changed, including build scripts, `Makefile`,
-  `package.json`, hook directories named by `core.hooksPath` (such as `.husky`), nested
-  repositories and `.git/modules`. You or your editor may later run them **outside** the sandbox.
+  `package.json` and hook directories named by `core.hooksPath` (such as `.husky`). You or your
+  editor may later run them **outside** the sandbox.
+- The check on new nested git files runs when a command ends. A detached process can write them
+  afterwards. It is also incomplete in unreadable directories and, in trees over 200,000 entries,
+  skipped (the output says so). Whatever else creates such files in the project during a command
+  is treated the same way.
 - Started in your home directory (or above it), the sandbox makes all of it writable, except the
   stores listed above.
 - A store reached through a chain of several symlinks is protected at both ends, but a link in the
