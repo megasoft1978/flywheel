@@ -78,11 +78,17 @@ static bool in_ranges(const Range *r, int n, const char *p) {
 
 /* Read one shell word at *s, removing quotes and backslashes. Stops at an
    unquoted blank or operator. out needs strlen(*s)+1 bytes. *sub is set to
-   the first command substitution found inside double quotes (or NULL). */
-static void read_word(const char **s, char *out, const char **sub) {
+   the first command substitution found inside double quotes (or NULL),
+   *expands whether the shell would substitute something into the word. */
+static bool starts_expansion(const char *p) {
+    return *p == '`' || (*p == '$' && p[1] && (isalnum((unsigned char)p[1]) || strchr("_{(@*#?!$-", p[1])));
+}
+
+static void read_word(const char **s, char *out, const char **sub, bool *expands) {
     const char *p = *s;
     char *w = out;
     if (sub) *sub = NULL;
+    if (expands) *expands = false;
     while (*p && !strchr(" \t\r\n;&|<>()`", *p)) {
         if (*p == '\\') {
             p++;
@@ -104,6 +110,7 @@ static void read_word(const char **s, char *out, const char **sub) {
             if (*p) p++;
         } else if (*p == '"') {
             for (p++; *p && *p != '"'; ) {
+                if (expands && *p != '\\' && starts_expansion(p)) *expands = true;
                 if (*p == '\\' && p[1] && strchr("\"\\$`\n", p[1])) {
                     p++;
                     if (*p == '\n') { p++; continue; }
@@ -113,7 +120,11 @@ static void read_word(const char **s, char *out, const char **sub) {
                 *w++ = *p++;
             }
             if (*p) p++;
-        } else *w++ = *p++;
+        } else {
+            /* `$` before `(` ends the word here, so look at the input */
+            if (expands && starts_expansion(p)) *expands = true;
+            *w++ = *p++;
+        }
     }
     *w = 0;
     *s = p;
@@ -232,12 +243,14 @@ static const char *check_simple(char **v, int n, const char *cwd, int depth);
 static char *fill_braces(const char *w, const char *by) {
     size_t n = 0, bl = strlen(by);
     for (const char *p = w; (p = strstr(p, "{}")); p += 2) n++;
-    char *out = malloc(strlen(w) + n * bl + 1), *q = out;
+    bool expands = w[strlen(w) + 1];
+    char *out = malloc(strlen(w) + n * bl + 2), *q = out;
     while (*w) {
         if (w[0] == '{' && w[1] == '}') { memcpy(q, by, bl); q += bl; w += 2; }
         else *q++ = *w++;
     }
     *q = 0;
+    q[1] = expands;
     return out;
 }
 
@@ -261,11 +274,11 @@ static const char *check_find(char **a, int na, const char *cwd, int depth) {
     }
     for (; k < na && a[k][0] != '-' && strcmp(a[k], "!") && strcmp(a[k], "("); k++) pts[np++] = a[k];
     if (!np) pts[np++] = (char *)".";
-    bool mutates = false, listed = false;
+    bool mutates = false, listed = false, acts = false;
     const char *err = NULL;
     for (; !err && k < na; k++) {
         if (!strncmp(a[k], "-files0-from", 12)) listed = true;
-        else if (!strcmp(a[k], "-delete")) mutates = true;
+        else if (!strcmp(a[k], "-delete")) mutates = acts = true;
         else if ((!strncmp(a[k], "-fprint", 7) || !strcmp(a[k], "-fls")) && k + 1 < na) {
             if (!target_ok(a[++k], cwd)) err = E_OUTSIDE;
         } else if (!strncmp(a[k], "-exec", 5) || !strncmp(a[k], "-ok", 3)) {
@@ -277,6 +290,7 @@ static const char *check_find(char **a, int na, const char *cwd, int depth) {
             const char *c = strrchr(a[s], '/') ? strrchr(a[s], '/') + 1 : a[s];
             err = check_simple(a + s, k - s, cwd, depth + 1);
             if (one_of(c, readers)) continue;
+            acts = true;
             if (indir || !one_of(c, known)) { mutates = true; continue; }
             /* judge the command as if {} were a file below each start point */
             char **x = malloc((size_t)(k - s) * sizeof *x);
@@ -292,7 +306,8 @@ static const char *check_find(char **a, int na, const char *cwd, int depth) {
             free(x);
         }
     }
-    if (!err && mutates && listed && !g_cfg.outside_writes) err = E_OUTSIDE;
+    /* start points read from a file cannot be judged */
+    if (!err && acts && listed && !g_cfg.outside_writes) err = E_OUTSIDE;
     for (int i = 0; !err && mutates && i < np; i++)
         if (!target_ok(pts[i], cwd)) err = E_OUTSIDE;
     free(pts);
@@ -330,13 +345,15 @@ static const char *sed_file(const char **p, const char *cwd) {
 
 /* w/W and s///w write files without -i, e runs a shell command */
 static const char *check_sed_script(const char *p, const char *cwd) {
-    if (g_cfg.outside_writes) return NULL;
+    if (g_cfg.outside_writes || !*p) return NULL;
     if (strchr(p, OPAQUE)) return E_OUTSIDE;
-    /* a whole script held in a shell variable cannot be seen */
-    if (p[0] == '$' && (p[1] == '{' || (isalpha((unsigned char)p[1]) && isalnum((unsigned char)p[2]))))
-        return NULL;
+    /* p ends where its word does; scan_script stores the flag after the NUL */
+    bool expands = p[strlen(p) + 1];
     const char *err = NULL;
     while (!err && *p) {
+        /* a command held in a shell variable cannot be seen; otherwise `$`
+           is the last-line address */
+        if (expands && *p == '$' && (!p[1] || starts_expansion(p))) return E_OUTSIDE;
         if (strchr(" \t\r\n;{}!,+~$", *p) || isdigit((unsigned char)*p)) { p++; continue; }
         if (*p == '/') { p = sed_part(p + 1, '/', true); p += strspn(p, "IM"); continue; }
         if (*p == '\\' && p[1]) { p = sed_part(p + 2, p[1], true); p += strspn(p, "IM"); continue; }
@@ -383,6 +400,7 @@ static const char *check_sed(char **a, int na, const char *cwd) {
             } else if (len == 4 && !strncmp(o + 2, "file", len)) {
                 script = true;
                 if (!eq) k++;
+                if (!g_cfg.outside_writes) err = E_OUTSIDE;   /* script not visible */
             } else if (len == 11 && !strncmp(o + 2, "line-length", len)) {
                 if (!eq) k++;
             } else if (len == 8 && !strncmp(o + 2, "in-place", len)) inplace = true;
@@ -399,7 +417,12 @@ static const char *check_sed(char **a, int na, const char *cwd) {
                     code = c[1] ? c + 1 : k + 1 < na ? a[++k] : "";
                     break;
                 }
-                if (*c == 'f') { script = true; if (!c[1]) k++; break; }
+                if (*c == 'f') {
+                    script = true;
+                    if (!c[1]) k++;
+                    if (!g_cfg.outside_writes) err = E_OUTSIDE;   /* script not visible */
+                    break;
+                }
                 if (*c == 'l' && !c[1] && k + 1 < na && *a[k + 1] &&
                     strspn(a[k + 1], "0123456789") == strlen(a[k + 1])) k++;
             }
@@ -624,6 +647,7 @@ static const char *check_simple(char **v, int n, const char *cwd, int depth) {
     static const char *const wrap[] = {"env", "nohup", "command", "exec", "nice", "xargs", "timeout", "setsid", NULL};
     static const char *const shells[] = {"sh", "bash", "zsh", "dash", NULL};
     int i = 0;
+    const char *valued = NULL;   /* short options of the wrapper that take a word */
     bool wrapped = false;
     const char *base = NULL;
     for (; i < n; i++) {
@@ -631,10 +655,20 @@ static const char *check_simple(char **v, int n, const char *cwd, int depth) {
         const char *eq = strchr(w, '=');
         if (eq && eq > w && !memchr(w, '/', (size_t)(eq - w)) && w[0] != '-') continue;
         if (one_of(w, kw)) continue;
-        if (wrapped && (w[0] == '-' || isdigit((unsigned char)w[0]))) continue;
+        if (wrapped && w[0] == '-') {
+            if (w[1] && w[1] != '-') {
+                const char *c = w + 1;
+                while (*c && !strchr(valued, *c)) c++;
+                if (*c && !c[1]) i++;   /* separate value, not the command */
+            }
+            continue;
+        }
+        if (wrapped && isdigit((unsigned char)w[0])) continue;
         base = strrchr(w, '/') ? strrchr(w, '/') + 1 : w;
         if (!one_of(base, wrap)) break;
         wrapped = true;
+        valued = !strcmp(base, "env") ? "uC" : !strcmp(base, "xargs") ? "InPLd" :
+                 !strcmp(base, "timeout") ? "sk" : "";
     }
     if (i >= n) return NULL;
     if (strchr(v[i], OPAQUE)) return E_RULE;
@@ -686,7 +720,7 @@ static const char *check_simple(char **v, int n, const char *cwd, int depth) {
    heredoc payloads and comments (they're data, not shell syntax). */
 static const char *scan_script(const char *s, const char *cwd, int depth) {
     if (depth > 4) return E_RULE;   /* too deep to check: fail closed */
-    char *arena = malloc(2 * strlen(s) + 2), *top = arena;
+    char *arena = malloc(3 * strlen(s) + 3), *top = arena;
     char *v[MAXWORDS];
     char delim[MAXHEREDOC][64];
     bool dash[MAXHEREDOC];
@@ -725,7 +759,7 @@ static const char *scan_script(const char *s, const char *cwd, int depth) {
                 if (d) p++;
                 while (*p == ' ' || *p == '\t') p++;
                 char *w = top;
-                read_word(&p, w, NULL);
+                read_word(&p, w, NULL, NULL);
                 if (*w && nd < MAXHEREDOC && strlen(w) < sizeof delim[0]) {
                     strcpy(delim[nd], w);
                     dash[nd++] = d;
@@ -762,9 +796,11 @@ static const char *scan_script(const char *s, const char *cwd, int depth) {
             continue;
         }
         const char *sub;
+        bool expands;
         char *w = top;
-        read_word(&p, w, &sub);
-        top += strlen(w) + 1;
+        read_word(&p, w, &sub, &expands);
+        top += strlen(w) + 2;
+        top[-1] = expands;
         if (sub) err = scan_script(sub, cwd, depth + 1);
         if (!err && redir_out) {
             if (!path_ok(w, cwd)) err = E_OUTSIDE;
@@ -1146,7 +1182,7 @@ static bool has_mutating_args(const char *cmd) {
     for (const char *p = cmd; *p; ) {
         if (strchr(" \t()", *p)) { p++; continue; }
         if (n == MAXWORDS) { bad = true; break; }
-        read_word(&p, top, NULL);
+        read_word(&p, top, NULL, NULL);
         v[n++] = top;
         top += strlen(top) + 1;
     }
@@ -1158,6 +1194,7 @@ static bool has_mutating_args(const char *cmd) {
     bool file = !strcmp(c, "file"), pf = !strcmp(c, "printf");
     bool tst = !strcmp(c, "test") || !strcmp(c, "[");
     bool tsc = !strcmp(c, "npx") && n > 1 && !strcmp(v[1], "tsc"), noemit = false;
+    bool go = !strcmp(c, "go");
     bool grep = !strcmp(c, "grep"), ls = !strcmp(c, "ls"), perl = !strncmp(c, "perl", 4);
     bool opts = true;
     int plain = 0;
@@ -1183,6 +1220,14 @@ static bool has_mutating_args(const char *cmd) {
         if (git && (!strncmp(a, "--output", 8) || abbrev(a, "--output", 3) || abbrev(a, "--ext-diff", 4) ||
                     (abbrev(a, "--textconv", 5) && strcmp(a, "--text")) ||
                     abbrev(a, "--show-signature", 8) || strstr(a, "signature") || has_sig_format(a))) bad = true;
+        if (git && abbrev(a, "--upload-pack", 5)) bad = true;
+        if (go && a[0] == '-') {   /* run another program or write any file */
+            const char *name = a + (a[1] == '-' ? 2 : 1);
+            size_t len = strcspn(name, "=");
+            static const char *const unsafe[] = {"exec", "toolexec", "vettool", "o", NULL};
+            for (int k = 0; unsafe[k]; k++)
+                if (len == strlen(unsafe[k]) && !strncmp(name, unsafe[k], len)) bad = true;
+        }
         if (uniq) {   /* a second operand is the output file; "-" is an operand */
             if (opts && !strcmp(a, "--")) opts = false;
             else if (!opts || a[0] != '-' || !a[1]) {
@@ -1246,7 +1291,7 @@ static bool grep_reads_outside(const char *p, bool rg, char *buf) {
     char *first = NULL;
     while (!out && *p) {
         if (strchr(" \t()", *p)) { p++; continue; }
-        read_word(&p, buf, NULL);
+        read_word(&p, buf, NULL, NULL);
         if (next) {
             if (next == 'f') out = !read_inside(buf);
             next = 0;
@@ -1280,14 +1325,14 @@ static bool reads_outside(const char *cmd) {
         "wc", "file", "stat", "cd", "test", "sort", "uniq", "cut", NULL};
     char *buf = malloc(strlen(cmd) + 1);
     const char *p = cmd;
-    read_word(&p, buf, NULL);
+    read_word(&p, buf, NULL, NULL);
     bool out = false, cut = !strcmp(buf, "cut"), sort = !strcmp(buf, "sort"), skip = false;
     if (!strcmp(buf, "grep") || !strcmp(buf, "rg"))
         out = grep_reads_outside(p, buf[0] == 'r', buf);
     else if (one_of(buf, readers))
         while (!out && *p) {
             if (strchr(" \t()", *p)) { p++; continue; }
-            read_word(&p, buf, NULL);
+            read_word(&p, buf, NULL, NULL);
             if (skip) { skip = false; continue; }
             const char *path = buf;
             if (buf[0] == '-' && buf[1]) {

@@ -1223,6 +1223,72 @@ static void test_review2_perm(void) {
     perm_free();
 }
 
+/* ---------- scan-last findings ---------- */
+
+static void test_scan_deny(void) {
+    const char *cwd = "/tmp/sb";
+    static const char *no[] = {
+        "sed '$w /etc/x' f", "sed -n '$!{w /etc/x\n}' f", "sed '$s/a/b/w /etc/x' f",
+        "sed -n '${w /etc/x\n}' f", "sed -e '$W /etc/x' f",
+        "sed '$wab/../../../etc/x' f",
+        "sed \"$SCRIPT\" f", "sed $SCRIPT f", "sed -n \"${SCRIPT}\" f", "sed -e\"$SCRIPT\" f",
+        "sed --expression=\"$SCRIPT\" f", "sed -e p -e \"p;$more\" f", "sed \"$(cat s)\" f", "sed $(cat s) f",
+        "find . -exec sed \"$S\" {} \\;",
+        "sed -f s.sed f", "sed -fs.sed f", "sed -nf s.sed f", "sed --file s.sed f", "sed --file=s.sed f",
+        "env -u FOO rm /etc/x", "env -C sub rm /etc/x", "env -iu FOO rm /etc/x",
+        "xargs -I {} rm /etc/x", "xargs -n one rm /etc/x", "xargs -P max rm /etc/x", "xargs -L x rm /etc/x",
+        "xargs -d , rm /etc/x", "timeout -s KILL 5 rm /etc/x", "timeout -k soon 5 rm /etc/x", NULL};
+    for (int i = 0; no[i]; i++) T(no[i], deny_check(no[i], cwd) != NULL);
+    static const char *yes[] = {
+        "sed -n '$p' f", "sed '$d' f", "sed -n '${p;q}' f", "sed -n '$!{p}' f", "sed -n \"\\$p\" f",
+        "sed -n \"1,$ p\" f", "sed '$a tail' f", "env -u FOO rm build/x", "xargs -I {} rm build/{}",
+        "xargs -n1 rm build/x", "timeout -s KILL 5 rm build/x", "timeout -sKILL 5 rm build/x", NULL};
+    for (int i = 0; yes[i]; i++) T(yes[i], deny_check(yes[i], cwd) == NULL);
+    g_cfg.outside_writes = true;
+    T("sed -f with outside writes", !deny_check("sed -f s.sed f", cwd));
+    T("sed $VAR with outside writes", !deny_check("sed \"$SCRIPT\" f", cwd));
+    g_cfg.outside_writes = false;
+}
+
+static void test_scan_find_list(void) {
+    const char *cwd = "/tmp/sb";
+    static const char *no[] = {
+        "find -files0-from list -delete", "find -files0-from list -exec cp {} /tmp/sb/ \\;",
+        "find -files0-from list -exec rm {} \\;", "find -files0-from list -execdir rm {} +",
+        "find -files0-from list -exec ./script.sh {} \\;", "find -files0-from list -ok mv {} out \\;",
+        "find -files0-from=list -okdir touch {} \\;", "find -exec chmod 600 {} + -files0-from list", NULL};
+    for (int i = 0; no[i]; i++) T(no[i], deny_check(no[i], cwd) != NULL);
+    static const char *yes[] = {"find -files0-from list", "find -files0-from list -print",
+        "find -files0-from list -exec grep -l x {} +", "find -files0-from list -execdir cat {} \\;", NULL};
+    for (int i = 0; yes[i]; i++) T(yes[i], deny_check(yes[i], cwd) == NULL);
+    g_cfg.outside_writes = true;
+    for (int i = 0; no[i]; i++) T(no[i], deny_check(no[i], cwd) == NULL);
+    g_cfg.outside_writes = false;
+}
+
+static void test_scan_perm(void) {
+    free(g_cfg.cwd);
+    g_cfg.cwd = str_dup(projdir);
+    perm_free();
+    perm_add_rule("git fetch");
+    perm_add_rule("go test");
+    perm_add_rule("go build");
+    perm_add_rule("go vet");
+    static const char *no[] = {
+        "git fetch --upload-pack=./evil .", "git fetch --upload-pack ./evil .", "git fetch --upl=./evil .",
+        "git fetch --upload-pa ./evil .",
+        "go test -exec ./evil.sh ./...", "go test --exec=./evil.sh ./...",
+        "go build -toolexec ./evil.sh", "go build --toolexec=./evil.sh",
+        "go build -o /etc/x .", "go build --o=/etc/x .",
+        "go vet -vettool=x", "go vet --vettool x", NULL};
+    for (int i = 0; no[i]; i++) T(no[i], !perm_allowed(no[i]));
+    static const char *yes[] = {"git fetch origin", "go test -run X ./...", "go build ./...", "go vet ./...", NULL};
+    for (int i = 0; yes[i]; i++) T(yes[i], perm_allowed(yes[i]));
+    char pf[1200];
+    if (perm_project_file(pf, sizeof pf)) unlink(pf);
+    perm_free();
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     memset(&g_cfg, 0, sizeof g_cfg);
@@ -1268,6 +1334,11 @@ int main(void) {
     test_review2_optout();
     setenv("HOME", fakehome, 1);
     test_review2_perm();
+    test_scan_perm();
+    setenv("HOME", "/home/fwdeny", 1);
+    test_scan_deny();
+    test_scan_find_list();
+    setenv("HOME", fakehome, 1);
 #ifdef FW_MINI_HTTP
     test_connect_timeout();
 #endif
