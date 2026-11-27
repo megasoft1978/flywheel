@@ -1,0 +1,6 @@
+# SYNTHETIC FIXTURE - not benchmark data
+terminal-bench/alpha-task
+terminal-bench/beta-task
+terminal-bench/gamma-task
+terminal-bench/delta-task
+terminal-bench/epsilon-task

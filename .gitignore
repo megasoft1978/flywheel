@@ -16,3 +16,5 @@ bench-tb/__pycache__/
 bench-tb/*.log
 dist/
 .flywheel.md
+tests/test_image
+tests/test_image_mini

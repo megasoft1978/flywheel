@@ -1,0 +1,11 @@
+# Development tasks: the 10 pilot tasks in the README table. Never part of the held-out score.
+terminal-bench/count-dataset-tokens
+terminal-bench/chess-best-move
+terminal-bench/extract-elf
+terminal-bench/circuit-fibsqrt
+terminal-bench/fix-git
+terminal-bench/make-mips-interpreter
+terminal-bench/git-multibranch
+terminal-bench/dna-insert
+terminal-bench/filter-js-from-html
+terminal-bench/gcode-to-text
