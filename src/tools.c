@@ -1209,6 +1209,7 @@ static const char *const SBX_TOOLS[] = {
    `middle` (regex), `file`, `rest` (regex) */
 static const char *const SBX_TOOL_SECRETS[][4] = {
     {".nvm/versions", "[^/]+(/[^/]+)?/", "etc/npmrc", ""},
+    {".nvm/versions", "[^/]+(/[^/]+)?/", "lib/node_modules/npm/npmrc", ""},
     {".sdkman/candidates/maven", "[^/]+/", "conf/settings.xml", ""},
     {".local/share/uv/tools", "[^/]+/", "uv-receipt.toml", ""},
     {".local/share/pipx/venvs", "[^/]+/", "pipx_metadata.json", ""},
@@ -2606,6 +2607,54 @@ static const char *sbx_tmpdir(void) {
 
 #define SBX_NENV 10
 
+static bool through_link(const char *path) {
+    char p[PATH_MAX];
+    if (snprintf(p, sizeof p, "%s", path) >= (int)sizeof p) return false;
+    for (char *s = p + 1;; s++) {
+        if (*s && *s != '/') continue;
+        char c = *s;
+        *s = 0;
+        struct stat st;
+        if (!lstat(p, &st) && S_ISLNK(st.st_mode)) return true;
+        if (!(*s = c)) return false;
+    }
+}
+
+/* "PATH=..." with each entry under a home that passes through a link replaced by
+   where it leads: the link may not be readable in the sandbox, and a PATH search
+   that cannot read it can stop there. Closed entries stay: programs in them run. */
+static char *sbx_path(const char *v) {
+    char home[4][PATH_MAX], one[PATH_MAX], to[PATH_MAX];
+    int n = homes(home);
+    size_t entries = 1;
+    for (const char *p = v; *p; p++) entries += *p == ':';
+    size_t cap = strlen(v) + entries * PATH_MAX + 6, len = 5;
+    char *out = malloc(cap);
+    memcpy(out, "PATH=", 6);
+    for (;;) {
+        size_t k = strcspn(v, ":");
+        const char *use = v;
+        size_t used = k;
+        if (*v == '/' && k < sizeof one) {
+            memcpy(one, v, k);
+            one[k] = 0;
+            bool under = false;
+            for (int i = 0; i < n; i++) under = under || path_under(home[i], one);
+            if (under && through_link(one) && realpath(one, to) && !strchr(to, ':')) {
+                use = to;
+                used = strlen(to);
+            }
+        }
+        memcpy(out + len, use, used);
+        len += used;
+        if (!v[k]) break;
+        out[len++] = ':';
+        v += k + 1;
+    }
+    out[len] = 0;
+    return out;
+}
+
 /* the whole environment of a command: nothing else is inherited (tokens, agent
    sockets). The cache variables keep build tools out of the home directory. */
 static void sbx_env(char **env, const char *tmp) {
@@ -2616,6 +2665,7 @@ static void sbx_env(char **env, const char *tmp) {
     for (int i = 0; keep[i]; i++) {
         const char *v = getenv(keep[i]);
         if (!v) continue;
+        if (!strcmp(keep[i], "PATH")) { env[n++] = sbx_path(v); continue; }
         size_t len = strlen(keep[i]) + strlen(v) + 2;
         env[n] = malloc(len);
         snprintf(env[n++], len, "%s=%s", keep[i], v);

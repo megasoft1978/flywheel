@@ -2635,17 +2635,17 @@ static void test_home_links(void) {
     static const char *const creds[] = {".nvm/versions/node/v1/etc/npmrc",
         ".sdkman/candidates/maven/3.9/conf/settings.xml", ".local/share/uv/tools/t/uv-receipt.toml",
         ".local/share/pipx/venvs/t/pipx_metadata.json", ".cargo/registry/credentials",
-        ".cargo/registry/credentials.toml"};
+        ".cargo/registry/credentials.toml", ".nvm/versions/node/v1/lib/node_modules/npm/npmrc"};
     static const char *const beside[] = {".nvm/versions/node/v1/etc/other",
         ".sdkman/candidates/maven/3.9/conf/logging.xml", ".local/share/uv/tools/t/pyvenv.cfg",
         ".local/share/pipx/venvs/t/pyvenv.cfg", ".cargo/registry/src/c/credentials.rs",
-        ".cargo/git/db/d"};
-    for (int i = 0; i < 6; i++) {
+        ".cargo/git/db/d", ".nvm/versions/node/v1/lib/node_modules/npm/package.json"};
+    for (int i = 0; i < 7; i++) {
         put(under(home, creds[i]), "TOPSECRET");
         put(under(home, beside[i]), "TOOLOK");
     }
     in_dir(later);
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 7; i++) {
         char cmd[256];
         snprintf(cmd, sizeof cmd, "cat \"$HOME/%s\"", creds[i]);
         hidden(cmd);
@@ -2654,6 +2654,49 @@ static void test_home_links(void) {
     }
     hidden("cat \"$HOME/.NVM/versions/node/v1/etc/NPMRC\"");
 
+    setenv("HOME", old, 1);
+    free(old);
+}
+
+/* a link on PATH under a home is given to commands as where it leads: the link
+   itself cannot be read, and a PATH search by Node stops there */
+static void test_home_path(void) {
+    char base[PATH_MAX], home[PATH_MAX], unused[PATH_MAX], real[PATH_MAX], proj[PATH_MAX + 16];
+    char *old = review_dirs(base, home, unused);
+    if (!old) { T("mkdtemp", false); return; }
+    const char *had = getenv("PATH");
+    char *path = str_dup(had ? had : "/usr/bin:/bin");
+    snprintf(proj, sizeof proj, "%s/work/proj", home);
+    put(under(home, "work/proj/f"), "x");
+    put(under(home, ".closed/bin/secret"), "TOPSECRET");
+    put(under(home, "co:lon/f"), "x");
+    host(home, "mkdir .slot plaindir && ln -s ../.closed/bin .slot/bin && ln -s co:lon colon"
+               " && ln -s nowhere dangling");
+    T("home resolves", realpath(home, real) != NULL);
+
+    /* entries kept as they are: not under a home, relative, empty, unresolvable,
+       or leading to a name PATH cannot hold */
+    char set[8 * PATH_MAX], want[8 * PATH_MAX];
+    snprintf(set, sizeof set, "%s/.slot/bin::rel:%s/plaindir:%s/colon:%s/dangling:/tmp:/usr/bin:/bin:",
+             real, real, real, real);
+    snprintf(want, sizeof want, "[%s/.closed/bin::rel:%s/plaindir:%s/colon:%s/dangling:/tmp:/usr/bin:/bin:]",
+             real, real, real, real);
+    setenv("PATH", set, 1);
+    in_dir(proj);
+    shown("printf '[%s]' \"$PATH\"", want);
+    setenv("PATH", path, 1);
+
+    if (!system("node -e 0 >/dev/null 2>&1")) {
+        snprintf(set, sizeof set, "%s/.slot/bin:%s", real, path);
+        setenv("PATH", set, 1);
+        shown("node -e 'const r = require(\"child_process\").spawnSync(\"sh\", [\"-c\", \"echo SPAWNED\"]);"
+              " console.log(String(r.stdout || r.error))'", "SPAWNED");
+    } else printf("unit: SKIP node PATH search under the sandbox (not installed)\n");
+    hidden("cat \"$HOME/.slot/bin/secret\"");
+    hidden("cat \"$HOME/.closed/bin/secret\"");
+
+    setenv("PATH", path, 1);
+    free(path);
     setenv("HOME", old, 1);
     free(old);
 }
@@ -3697,6 +3740,7 @@ int main(void) {
         test_linked_worktree();
         test_home_reads();
         test_home_links();
+        test_home_path();
         test_repo_above();
     }
     else printf("unit: SKIP sandbox tests (no sandbox here)\n");

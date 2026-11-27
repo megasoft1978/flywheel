@@ -199,6 +199,7 @@ untrusted repository or task in a VM.
   `~/.m2/settings.xml`, `~/.gradle/gradle.properties`, shell and REPL history files, keychains,
   cookies and the common browser profiles.
 - Also unreadable in the toolchain folders: `~/.nvm/versions/**/etc/npmrc`,
+  `~/.nvm/versions/**/lib/node_modules/npm/npmrc`,
   `~/.sdkman/candidates/maven/*/conf/settings.xml`, `uv-receipt.toml` of uv tools,
   `pipx_metadata.json` of pipx environments and `~/.cargo/registry/credentials*` (they can hold
   index or registry logins). `~/.cargo/git/db` **stays readable**, and a git dependency's URL there
@@ -210,7 +211,8 @@ untrusted repository or task in a VM.
   command; you are asked every time, whatever your "always allow" rules say. One-shot and `bench`
   cannot grant it. Allowed network is any IP address, not one host.
 - Environment: only `PATH`, `HOME`, `LANG` and `TERM` are passed on; `TMPDIR`, `XDG_CACHE_HOME`,
-  `GOCACHE` and `npm_config_cache` point into the private temporary directory.
+  `GOCACHE` and `npm_config_cache` point into the private temporary directory. A `PATH` entry under
+  your home that passes through a link is passed on as where it leads.
 
 What stops working inside it:
 
@@ -240,9 +242,10 @@ What stops working inside it:
 - Removing a directory that holds a nested `.git` or `.envrc` (`rm -rf` removes the
   rest and leaves the protected files), and
   `git worktree remove` or `prune`. Renaming the directory around them works.
-- Programs started by Node (`npm run`, `npm exec`) can fail with exit 255 when a directory on
-  `PATH` is a closed one under `$HOME`: the lookup stops there with `EPERM`. Take it off `PATH`
-  (or, for scripts, use `npm run --script-shell=/bin/bash`).
+- Programs started by Node (`npm run`, `npm exec`) can fail with exit 255 when the lookup on
+  `PATH` meets `EPERM`: a link under `$HOME` that could not be resolved, or a closed directory that
+  holds the name looked up. Take that entry off `PATH` (or, for scripts, use
+  `npm run --script-shell=/bin/bash`).
 - `pipx` fails when `~/Library/Application Support/pipx` exists: it checks that
   folder and is refused.
 - Tools that need a denied file: private registry logins in `~/.npmrc`, `~/.m2/settings.xml`,
