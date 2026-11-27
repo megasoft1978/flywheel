@@ -16,7 +16,8 @@ Status: Terminal-Bench 2.1 preparation only. No scored run has started. Nothing 
   - With `-W`, command and gate timeouts are cut to the time left, and no further tool call or
     gate starts once it has expired; the run ends as `finish=wall` with its summary and
     transcript written. The limit counts whole seconds from the start of the task. Not covered:
-    background processes a command leaves behind. Harbor's kill is still the hard cap.
+    background processes a command leaves behind, and any process that leaves the command's process
+    group (setsid, GNU timeout). Harbor's kill is still the hard cap.
   - Before a scored run: one smoke task must show flywheel exiting before Harbor's kill
     (`FW_EXIT`, `finish=wall`), and whether the kill stops the flywheel process in the container
     before the verifier runs (not checked in the Docker exec path).
@@ -74,7 +75,7 @@ Cannot match, and to be disclosed with the results:
 - OpenCode's title agent keeps its own temperature (0.5).
 - Time limits: all three harnesses are cut by the same Harbor per-task agent timeout. flywheel
   also stops itself at `-W`, 60 s earlier: it cuts the running model request, command or gate and
-  ends the run, so it has up to 60 s less working time than the budget. Terminus 2
+  ends the run, so it has 60 s less working time than the budget. Terminus 2
   sends commands non-blocking and waits min(duration, 60) s without killing them
   (`harbor/agents/terminus_2/terminus_2.py:1400`, `:1434`); its 180 s blocking cap
   (`tmux_session.py:792`) is not on that path. It has no turn limit by default. flywheel's

@@ -74,10 +74,12 @@ static char *bash_out(const char *cmd, bool net, bool interactive, time_t wall0)
     char *out = (net ? run_bash_net : run_bash_status)(cmd, g_cfg.cwd,
                     wall_clamp(g_cfg.cmd_timeout, wall0), &code);
     if (code < 0 && timed_out(out) && wall_over(wall0)) {   /* not a hang */
-        static const char why[] = "\n[stopped: wall clock limit reached]";
-        size_t cap = strlen(out) + sizeof why;
+        static const char why[] = "[stopped: wall clock limit reached]";
+        const char *rest = strchr(out, '\n');   /* replaces the "hung" line */
+        if (!rest) rest = "";
+        size_t cap = strlen(rest) + sizeof why;
         char *w = malloc(cap);
-        snprintf(w, cap, "%s%s", out, why);
+        snprintf(w, cap, "%s%s", why, rest);
         free(out);
         return w;
     }
@@ -384,6 +386,7 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
             && turn < g_cfg.maxturns - 5 && prof->gate_cmd) {
             bool bad, walled, was = gate_denied;
             char *go = gate_out(prof, ui, &gate_denied, &bad, &check, wall0, &walled);
+            if (walled) { finish = "wall"; free(go); break; }
             if (gate_denied && !was)
                 msgs_push(msgs, "user", "The automatic check was not run: " NOT_RUN);
             if (bad) {

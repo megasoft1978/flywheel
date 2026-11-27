@@ -1586,6 +1586,7 @@ static void test_wall_limit(void) {
     const char *fin = wall_run(&m, &u, 3, batch, sum, sizeof sum, &secs);
     T("-W cuts a running command", secs <= 5);
     T("-W: the cut command says why", has_msg(&m, "tool", "wall clock limit"));
+    T("-W: the cut command is not called hung", !has_msg(&m, "tool", "command hung"));
     T("-W: later command not started", access(second, F_OK) != 0);
     T("-W: later file write not started", access(third, F_OK) != 0);
     T("-W: finish and summary say wall", !strcmp(fin, "wall") && strstr(sum, "finish=wall "));
@@ -1613,6 +1614,14 @@ static void test_wall_limit(void) {
     fin = wall_run(&m, &slow, 1, wr, sum, sizeof sum, &secs);
     T("-W: gate not started after the limit", access(ran, F_OK) != 0);
     T("-W: a skipped gate is not done", !strcmp(fin, "wall") && strstr(sum, "finish=wall "));
+    msgs_free(&m);
+
+    unlink(ran);
+
+    g_cfg.gate_every = 1;
+    fin = wall_run(&m, &u, 1, wr, sum, sizeof sum, &secs);
+    T("-W cuts a running periodic gate", access(ran, F_OK) == 0 && secs <= 5 && !strcmp(fin, "wall"));
+    T("-W: a cut periodic gate leaves no fix-this message", !has_msg(&m, "user", "Automatic type check"));
     msgs_free(&m);
 
     g_cfg.wall = 0;
