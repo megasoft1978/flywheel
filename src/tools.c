@@ -1,5 +1,6 @@
 #define _DARWIN_C_SOURCE 1   /* O_NOFOLLOW */
 #include "flywheel.h"
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -1437,9 +1438,18 @@ static bool cannot(const char *path) {
 
 static bool absent(void) { return errno == ENOENT || errno == ENOTDIR; }
 
+/* /System/Volumes/Data spells every path a second time, which the rules would
+   not match: nothing may lead through it */
+static bool data_volume(const char *path, const struct stat *st) {
+    static const char data[] = "/System/Volumes/Data";
+    struct stat d;
+    return !strcasecmp(path, data)
+        || (st && !stat(data, &d) && d.st_dev == st->st_dev && d.st_ino == st->st_ino);
+}
+
 /* Follow the absolute path one component at a time, reporting every step. A
    final directory is only pinned unless `closed`. False, naming the place, for
-   a loop and for anything that cannot be looked at. out: where it leads,
+   a loop, the data volume and anything that cannot be looked at. out: where it leads,
    PATH_MAX bytes. */
 static bool walk(const char *path, bool closed, char *out, NodeFn fn, void *arg) {
     char rest[PATH_MAX], next[PATH_MAX], link[PATH_MAX];
@@ -1466,6 +1476,7 @@ static bool walk(const char *path, bool closed, char *out, NodeFn fn, void *arg)
             if (!absent()) return cannot(out);
             there = false;
         }
+        if (data_volume(out, there ? &st : NULL)) return cannot(path);
         if (there && S_ISLNK(st.st_mode)) {
             ssize_t n = readlink(out, link, sizeof link - 1);
             if (n < 0 || ++hops > 32) return cannot(out);
@@ -1531,12 +1542,37 @@ static const char *const GIT_CLOSED[] = {
     "sequencer", NULL
 };
 
-static bool walk_files(const char *dir, const char *const *names, NodeFn fn, void *arg) {
+/* git runs what a linked hook leads to: close that as well */
+static bool walk_hooks(const char *dir, NodeFn fn, void *arg) {
+    DIR *d = opendir(dir);
+    if (!d) return absent() || cannot(dir);
     char p[PATH_MAX], out[PATH_MAX];
-    for (int i = 0; names[i]; i++) {
-        if (snprintf(p, sizeof p, "%s/%s", dir, names[i]) >= (int)sizeof p) return cannot(dir);
-        if (!walk(p, true, out, fn, arg)) return false;
+    bool ok = true;
+    struct dirent *e;
+    while (ok && (errno = 0, e = readdir(d))) {
+        struct stat st;
+        if (snprintf(p, sizeof p, "%s/%s", dir, e->d_name) >= (int)sizeof p || lstat(p, &st))
+            ok = cannot(dir);
+        else if (S_ISLNK(st.st_mode))
+            ok = walk(p, true, out, fn, arg);
     }
+    if (ok && errno) ok = cannot(dir);
+    closedir(d);
+    return ok;
+}
+
+/* one protected file, and for a hooks directory the links in it */
+static bool walk_closed(const char *dir, const char *name, NodeFn fn, void *arg) {
+    char p[PATH_MAX], out[PATH_MAX];
+    if (snprintf(p, sizeof p, "%s/%s", dir, name) >= (int)sizeof p) return cannot(dir);
+    if (!walk(p, true, out, fn, arg)) return false;
+    const char *base = strrchr(name, '/');
+    return strcmp(base ? base + 1 : name, "hooks") || walk_hooks(out, fn, arg);
+}
+
+static bool walk_files(const char *dir, const char *const *names, NodeFn fn, void *arg) {
+    for (int i = 0; names[i]; i++)
+        if (!walk_closed(dir, names[i], fn, arg)) return false;
     return true;
 }
 
@@ -1561,6 +1597,7 @@ static bool each_protected(const char *proj, NodeFn fn, void *arg) {
     char p[PATH_MAX], other[PATH_MAX];
     struct stat st;
     if (!walk_files(proj, SBX_PROJ, fn, arg)) return false;
+    if (root_bare(proj) && !walk_files(proj, GIT_CLOSED, fn, arg)) return false;
     int moved = gitdir_elsewhere(proj, other, fn, arg);
     if (moved < 0) return false;
     if (moved && !walk_files(other, GIT_CLOSED, fn, arg)) return false;
@@ -1612,13 +1649,11 @@ static const char *const LINKED_CLOSED[] = {
 };
 
 static bool walk_linked(const Linked *w, NodeFn fn, void *arg) {
-    char p[PATH_MAX], out[PATH_MAX];
     for (int h = 0; h < 2; h++)
         for (int i = 0; LINKED_CLOSED[i]; i++) {
             const char *dir = h ? w->common : w->dir;
             if (h && !strcmp(LINKED_CLOSED[i], "modules")) continue;
-            if (snprintf(p, sizeof p, "%s/%s", dir, LINKED_CLOSED[i]) >= (int)sizeof p) return cannot(dir);
-            if (!walk(p, true, out, fn, arg)) return false;
+            if (!walk_closed(dir, LINKED_CLOSED[i], fn, arg)) return false;
         }
     return true;
 }
@@ -1641,14 +1676,12 @@ static void sb_project(Sb *b, const char *proj, bool repo, const Linked *linked)
     char p[PATH_MAX];
     Rules r = {b, false};
     /* a root that is already a bare repository */
-    static const char *const bare[] = {"config", "config.worktree", "commondir", "hooks",
-                                       "rebase-merge", "rebase-apply", "sequencer", NULL};
     bool is_bare = root_bare(proj);
     sb_add(b, "(deny file-write*");
     if (snprintf(p, sizeof p, "%s/.git", proj) >= (int)sizeof p) b->full = true;
     if (!repo) sb_path(b, p);
-    for (int i = 0; is_bare && bare[i]; i++) {
-        if (snprintf(p, sizeof p, "%s/%s", proj, bare[i]) >= (int)sizeof p) b->full = true;
+    for (int i = 0; is_bare && GIT_CLOSED[i]; i++) {
+        if (snprintf(p, sizeof p, "%s/%s", proj, GIT_CLOSED[i]) >= (int)sizeof p) b->full = true;
         sb_path(b, p);
     }
     for (int i = 0; SBX_PROJ[i]; i++) {

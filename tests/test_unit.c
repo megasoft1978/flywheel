@@ -2902,6 +2902,110 @@ static void test_unreadable_git(void) {
     free(old);
 }
 
+static bool mentions(const char *path, const char *want) {
+    char *c = slurp(path);
+    bool found = c && strstr(c, want);
+    free(c);
+    return found;
+}
+
+/* a hook that is a link runs what it leads to: that is closed too */
+static void test_hook_links(void) {
+    char base[PATH_MAX], home[PATH_MAX], proj[PATH_MAX];
+    char *old = review_dirs(base, home, proj);
+    if (!old) { T("mkdtemp", false); return; }
+    static const char *const repo = "git init -q . && git config user.name t && git config user.email t@t"
+                                    " && git commit -qm one --allow-empty && mkdir scripts"
+                                    " && printf '#!/bin/sh\\n:\\n' > scripts/pc && chmod +x scripts/pc";
+    static const struct { const char *name, *setup, *cwd; } how[] = {
+        {"hook link: project", "ln -s ../../scripts/pc .git/hooks/pre-commit", "."},
+        {"hook link: relocated", "mv .git real && echo 'gitdir: real' > .git"
+         " && ln -s ../../scripts/pc real/hooks/pre-commit", "."},
+        {"hook link: common", "mv .git real && mkdir g && cp real/HEAD g/ && echo ../real > g/commondir"
+         " && echo 'gitdir: g' > .git && ln -s ../../scripts/pc real/hooks/pre-commit", "."},
+        {"hook link: linked", "git worktree add -q wt && mkdir wt/scripts && cp scripts/pc wt/scripts/"
+         " && ln -s ../../wt/scripts/pc .git/hooks/pre-commit", "wt"},
+        {"hook link: bare root", "mkdir hooks && ln -s ../scripts/pc hooks/pre-commit && echo x > HEAD", "."},
+    };
+    for (int i = 0; i < (int)(sizeof how / sizeof *how); i++) {
+        char dir[PATH_MAX], at[PATH_MAX];
+        snprintf(dir, sizeof dir, "%s/hook%d", base, i);
+        mkdir(dir, 0700);
+        host(dir, repo);
+        host(dir, how[i].setup);
+        snprintf(at, sizeof at, "%s", under(dir, how[i].cwd));
+        in_dir(at);
+        char *o = run_bash("echo 'touch PWNED' >> scripts/pc; echo ran > ran", at, 30);
+        T(how[i].name, !gone(at, "ran") && !mentions(under(at, "scripts/pc"), "PWNED"));
+        free(o);
+        refused(how[i].name, tool_write_file(at, "scripts/pc", "touch PWNED\n"));
+        T(how[i].name, !mentions(under(at, "scripts/pc"), "PWNED"));
+        free(tool_write_file(at, "scripts/other", "x"));
+        T(how[i].name, holds(under(at, "scripts/other"), "x"));
+        if (strcmp(how[i].name, "hook link: bare root")) {
+            int code = -1;
+            o = run_bash_status("echo a > a && git add a && git commit -qm a", at, 30, &code);
+            T(how[i].name, !code);
+            free(o);
+        }
+    }
+
+    /* a hooks directory that cannot be listed: its links cannot be closed */
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof dir, "%s/unlisted", base);
+    mkdir(dir, 0700);
+    host(dir, repo);
+    host(dir, "ln -s ../../scripts/pc .git/hooks/pre-commit && chmod 100 .git/hooks");
+    char *o = run_bash("echo ran > ran", dir, 30);
+    T("hooks not listable", !strncmp(o, "error:", 6) && strstr(o, "hooks") && gone(dir, "ran"));
+    free(o);
+    o = tool_write_file(dir, "ran", "x");
+    T("hooks not listable", !strncmp(o, "error:", 6) && gone(dir, "ran"));
+    free(o);
+    host(dir, "chmod 755 .git/hooks");
+    setenv("HOME", old, 1);
+    free(old);
+}
+
+/* the data volume spells every path a second way, which the rules would miss */
+static void test_data_volume(void) {
+    char base[PATH_MAX], home[PATH_MAX], proj[PATH_MAX];
+    char *old = review_dirs(base, home, proj);
+    if (!old) { T("mkdtemp", false); return; }
+    static const char *const repo = "git init -q . && git config user.name t && git config user.email t@t"
+                                    " && git commit -qm one --allow-empty";
+    static const struct { const char *name, *setup, *config; } how[] = {
+        {"data volume: gitdir", "mv .git gd && echo \"gitdir: /System/Volumes/Data$(pwd -P)/gd\" > .git",
+         "gd/config"},
+        {"data volume: link", "mv .git gd && ln -s \"/System/Volumes/Data$(pwd -P)/gd\" .git", "gd/config"},
+        {"data volume: case", "mv .git gd && echo \"gitdir: /system/volumes/DATA$(pwd -P)/gd\" > .git",
+         "gd/config"},
+        {"data volume: commondir", "mv .git real && mkdir g && cp real/HEAD g/"
+         " && echo \"/System/Volumes/Data$(pwd -P)/real\" > g/commondir && echo 'gitdir: g' > .git",
+         "real/config"},
+    };
+    struct stat st;
+    if (stat("/System/Volumes/Data", &st)) { setenv("HOME", old, 1); free(old); return; }
+    for (int i = 0; i < (int)(sizeof how / sizeof *how); i++) {
+        char dir[PATH_MAX], cmd[200];
+        snprintf(dir, sizeof dir, "%s/data%d", base, i);
+        mkdir(dir, 0700);
+        host(dir, repo);
+        host(dir, how[i].setup);
+        in_dir(dir);
+        snprintf(cmd, sizeof cmd, "echo '# evil' >> %s; echo ran > ran", how[i].config);
+        char *o = run_bash(cmd, dir, 30);
+        T(how[i].name, !strncmp(o, "error:", 6) && gone(dir, "ran")
+          && !mentions(under(dir, how[i].config), "evil"));
+        free(o);
+        o = tool_write_file(dir, how[i].config, "# evil\n");
+        T(how[i].name, !strncmp(o, "error:", 6) && !mentions(under(dir, how[i].config), "evil"));
+        free(o);
+    }
+    setenv("HOME", old, 1);
+    free(old);
+}
+
 /* a rebase a command planted: what `git rebase --continue` outside would run */
 #define PLANT(d) "mkdir " d "; echo 'exec touch \"$OLDPWD/PWNED\"; touch PWNED' > " d "/git-rebase-todo;" \
     " : > " d "/done; : > " d "/interactive; git rev-parse HEAD > " d "/onto;" \
@@ -3134,6 +3238,8 @@ int main(void) {
         test_rebase_state();
         test_git_chains();
         test_unreadable_git();
+        test_hook_links();
+        test_data_volume();
         test_sandbox();
         test_sandbox_escapes();
         test_nested_git();

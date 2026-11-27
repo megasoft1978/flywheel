@@ -137,9 +137,11 @@ untrusted repository or task in a VM.
   or repaired, and detached processes are bound by them too. In a root that is already a bare
   repository (or has a `HEAD` file), the same names are closed there. Every link and `gitdir:` or
   `commondir` file on the way to the project's protected files is closed too, so none can be pointed
-  elsewhere. If the rules cannot be built, a store is a link that cannot be followed (a loop), or
-  a protected file or git directory cannot be followed or read (a loop, or no permission), the
-  command is not run and the file tools do not write; the message names the path.
+  elsewhere, and so is whatever a linked hook in a protected hooks directory leads to. A path
+  through `/System/Volumes/Data` (a second spelling the rules would miss) is refused. If the rules
+  cannot be built, a store is a link that cannot be followed (a loop), or a protected file or git
+  directory cannot be followed or read (a loop, or no permission), the command is not run and the
+  file tools do not write; the message names the path.
 - A command that was given the network has all its processes killed when it ends, detached ones
   included, so that none keeps that access. Other background processes (a dev server) keep
   running, still inside the sandbox.
