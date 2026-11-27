@@ -171,14 +171,22 @@ untrusted repository or task in a VM.
 - Reads: **nothing under your home directory** (`$HOME` and the account's home), except:
   - the project (the working directory) and `$TMPDIR`;
   - for a linked git worktree, its git directory and the main repository's git directory;
+  - for a submodule, its git directory under `.git/modules/` of the nearest repository above, if
+    its `core.worktree` points back to the project and that repository is not at or above a home;
   - git's global configs, every file they include, and `core.excludesfile` and
-    `core.attributesfile` when they name a file; `~/.config/git/{ignore,attributes}`;
+    `core.attributesfile` when they name an existing file by an absolute or `~` path (a relative
+    value opens nothing); `~/.config/git/{ignore,attributes}`;
   - toolchains and downloaded dependencies: `~/.cargo/{bin,registry,git}`, `~/.rustup`,
     `~/go/{bin,pkg/mod}`, `~/.nvm/versions`, `~/.bun/bin`, `~/.pyenv`, `~/.rbenv`,
     `~/Library/Python`, `~/.local/{bin,lib}`, `~/.local/share/uv/{python,tools}`,
     `~/.local/share/pipx/venvs`, `~/.sdkman/candidates`, `~/.m2/repository`,
     `~/.gradle/{caches,wrapper/dists,jdks}`. One that is a symlink opens its target, unless the
     target is or holds a home directory. The list is fixed.
+
+  A git file or toolchain folder reached through a link that a command could change (one inside the
+  project, `$TMPDIR` or a linked worktree's writable directories) is not opened at all. Where those
+  files and folders, or the way to them, lie in such a place, they cannot be written, created,
+  replaced or moved, so no command can plant a link there for itself or a later one.
 
   Names and contents of everything else there are closed, also through other spellings and
   symlinks. Of the directories and links on the way to the readable places, only metadata can be
@@ -190,6 +198,11 @@ untrusted repository or task in a VM.
   `~/.cargo/credentials*`, `~/.gem/credentials`, `~/.pgpass`, `~/.vault-token`,
   `~/.m2/settings.xml`, `~/.gradle/gradle.properties`, shell and REPL history files, keychains,
   cookies and the common browser profiles.
+- Also unreadable in the toolchain folders: `~/.nvm/versions/**/etc/npmrc`,
+  `~/.sdkman/candidates/maven/*/conf/settings.xml`, `uv-receipt.toml` of uv tools,
+  `pipx_metadata.json` of pipx environments and `~/.cargo/registry/credentials*` (they can hold
+  index or registry logins). `~/.cargo/git/db` **stays readable**, and a git dependency's URL there
+  may carry a token.
 - **Outside your home directory everything you can read stays readable**, and so does every file in
   the places above that is not on the store list (`.env` files in the project, tokens written into
   a git config or a dependency's clone URL). Its contents can reach the model.
@@ -207,10 +220,11 @@ What stops working inside it:
   there (also when on your `PATH`), configs such as `~/.cargo/config.toml`, sibling projects and
   path dependencies, shell startup files. Toolchains moved with `CARGO_HOME`, `RUSTUP_HOME` and
   the like are not found.
-- git when the project is a subdirectory of a repository under `$HOME`, a submodule or a
-  `--separate-git-dir` checkout: its git directory is outside the project and unreadable. Start
-  flywheel at the repository root. Hooks, `core.hooksPath` directories and object alternates under
-  `$HOME` outside the project cannot be read either.
+- git when the project is a subdirectory of a repository under `$HOME` or a `--separate-git-dir`
+  checkout: its git directory is outside the project and unreadable (from a subdirectory git would
+  also have to list the repository root). Start flywheel at the repository root. In a submodule
+  `status` and `log` work. Hooks, `core.hooksPath` directories and object alternates under `$HOME`
+  outside the project cannot be read.
 - `git init`, and anything that writes `.git/config` or hooks: `git config`, `git remote add`,
   `git push -u`, `git branch -u`, hook installers such as husky or `pre-commit install`.
   Neither can anything that changes a `core.hooksPath` directory, such as editing `.husky/` or a
@@ -226,6 +240,11 @@ What stops working inside it:
 - Removing a directory that holds a nested `.git` or `.envrc` (`rm -rf` removes the
   rest and leaves the protected files), and
   `git worktree remove` or `prune`. Renaming the directory around them works.
+- Programs started by Node (`npm run`, `npm exec`) can fail with exit 255 when a directory on
+  `PATH` is a closed one under `$HOME`: the lookup stops there with `EPERM`. Take it off `PATH`
+  (or, for scripts, use `npm run --script-shell=/bin/bash`).
+- `pipx` fails when `~/Library/Application Support/pipx` exists: it checks that
+  folder and is refused.
 - Tools that need a denied file: private registry logins in `~/.npmrc`, `~/.m2/settings.xml`,
   `~/.gradle/gradle.properties` and the like.
 - `git fetch`/`push` (offline; over SSH it also fails with network approved, as keys and
@@ -257,7 +276,9 @@ Where it does not protect you:
   resolved by name and the missing directory itself is not closed: a command may be able to create
   it as a link and redirect that worktree's hooks. `git worktree prune` removes the stale entry.
 - Started in your home directory (or above it), the sandbox makes all of it readable and
-  writable, except the stores listed above. Start it in a project directory.
+  writable, except the stores listed above; the toolchain folders and the git files named above are
+  read-only there, and missing ones cannot be created (the same for those a project holds, as in a
+  dotfiles repository). Start it in a project directory.
 - Metadata (existence, size, dates) of the directories above the project and the other readable
   places can be read, and a missing path is reported as missing rather than denied.
 - A store reached through a chain of several symlinks is protected at both ends, but a link in the
