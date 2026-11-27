@@ -228,6 +228,9 @@ Where it does not protect you:
   any directory that looks bare on the way), its submodules and its linked worktrees. Not in
   repositories above that one, in other repositories below the project, in the system config
   of a git installed somewhere unusual, or in `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG_COUNT`.
+- For a linked worktree whose directory is missing, a relative `core.hooksPath` containing `..` is
+  resolved by name and the missing directory itself is not closed: a command may be able to create
+  it as a link and redirect that worktree's hooks. `git worktree prune` removes the stale entry.
 - Started in your home directory (or above it), the sandbox makes all of it writable, except the
   stores listed above.
 - A store reached through a chain of several symlinks is protected at both ends, but a link in the
