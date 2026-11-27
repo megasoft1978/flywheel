@@ -3016,6 +3016,12 @@ static void test_data_volume(void) {
 }
 
 #define HOOKS(v) "git config core.hooksPath " v
+/* a submodule at grp/sub whose own config names th */
+#define GRP_SUB "mkdir -p .git/modules/grp grp && git init -q --separate-git-dir=.git/modules/grp/sub grp/sub" \
+    " && git --git-dir=.git/modules/grp/sub config core.worktree ../../../../grp/sub && mkdir grp/sub/th" \
+    " && git --git-dir=.git/modules/grp/sub config core.hooksPath th"
+#define WT_CONFIG(v) "git config extensions.worktreeConfig true && git worktree add -q ../w2" \
+    " && git -C ../w2 config --worktree core.hooksPath " v
 
 /* what core.hooksPath names is run by git outside: closed like .git/hooks */
 static void test_hooks_path(void) {
@@ -3060,6 +3066,24 @@ static void test_hooks_path(void) {
          HOOKS("th"), ".", "scripts/pc"},
         {"husky script", "mkdir -p .husky/_ && " HOOKS(".husky/_/"), ".", ".husky/pre-commit"},
         {"husky stub", "mkdir -p .husky/_ && " HOOKS(".husky/_"), ".", ".husky/_/pre-commit"},
+        {"looks bare, below", "mkdir -p sub/githooks sub/objects sub/refs && " HOOKS("sub/githooks"),
+         "sub", "githooks/pre-commit"},
+        {"looks bare, husky", "mkdir -p sub/.husky/_ sub/objects sub/refs && " HOOKS("sub/.husky/_"),
+         "sub", ".husky/pre-commit"},
+        {"module group HEAD", GRP_SUB " && echo x > .git/modules/grp/HEAD", ".", "grp/sub/th/pre-commit"},
+        {"module group config", GRP_SUB " && : > .git/modules/grp/config", ".",
+         "grp/sub/th/pre-commit"},
+        {"leading CR", "mkdir th && printf '[core]\\n\\thooksPath =\\rth\\n' >> .git/config", ".",
+         "th/pre-commit"},
+        {"form feed", "mkdir \"$(printf 'th\\f')\" && printf '[core]\\n\\thooksPath = th\\f\\n' >> .git/config",
+         ".", "'th\f'/pre-commit"},
+        {"outside worktree", "mkdir th && " WT_CONFIG("../p/th"), ".", "th/pre-commit"},
+        {"stale worktree", "mkdir th && " WT_CONFIG("../p/th") " && mv ../w2 ../moved", ".",
+         "th/pre-commit"},
+        {"in the git dir", HOOKS("rh"), ".", ".git/rh/pre-commit"},
+        {"in the common dir", "git worktree add -q wt && " HOOKS("refs/rh"), "wt",
+         "../.git/refs/rh/pre-commit"},
+        {"in a module git dir", GRP_SUB, ".", ".git/modules/grp/sub/th/pre-commit"},
     };
     for (int i = 0; i < (int)(sizeof how / sizeof *how); i++) {
         char h[PATH_MAX], dir[PATH_MAX], at[PATH_MAX], cmd[600], rel[100];
@@ -3074,7 +3098,11 @@ static void test_hooks_path(void) {
                  strcmp(how[i].cwd, ".") ? how[i].cwd : "");
         in_dir(at);
         snprintf(rel, sizeof rel, "%s", how[i].target);
-        if (rel[0] == '\'') snprintf(rel, sizeof rel, "t h/pre-commit");
+        if (rel[0] == '\'') {     /* the file tools take the name unquoted */
+            char *end = strchr(rel + 1, '\'');
+            memmove(end, end + 1, strlen(end));
+            memmove(rel, rel + 1, strlen(rel));
+        }
         snprintf(cmd, sizeof cmd, "mkdir -p \"$(dirname %s)\"; echo 'touch PWNED' >> %s; echo ran > ran",
                  how[i].target, how[i].target);
         char *o = run_bash(cmd, at, 30);
@@ -3086,13 +3114,14 @@ static void test_hooks_path(void) {
         T(how[i].name, !mentions(file, "PWNED"));
         free(tool_write_file(at, "other", "x"));
         T(how[i].name, holds(under(at, "other"), "x"));
-        if (!strcmp(how[i].name, "worktree below")) {
+        if (!strcmp(how[i].name, "worktree below") || !strcmp(how[i].name, "outside worktree")) {
             /* nor may a command make the next one lose sight of it */
-            free(run_bash("rm -f .git/worktrees/wt/gitdir", at, 30));
-            T(how[i].name, !gone(at, ".git/worktrees/wt/gitdir"));
+            free(run_bash("rm -f .git/worktrees/w*/gitdir", at, 30));
+            T(how[i].name, !gone(at, strcmp(how[i].name, "outside worktree")
+                                     ? ".git/worktrees/wt/gitdir" : ".git/worktrees/w2/gitdir"));
         }
         /* not from a submodule, nor below the repository: .git is out of reach there */
-        if (strcmp(how[i].name, "submodule") && strcmp(how[i].name, "project below")) {
+        if (strcmp(how[i].name, "submodule") && strcmp(how[i].cwd, "sub")) {
             int code = -1;
             o = run_bash_status("echo a > a && git add a && git commit -qm a", at, 30, &code);
             T(how[i].name, !code);
@@ -3113,6 +3142,9 @@ static void test_hooks_path(void) {
         {"hooks: prefix", HOOKS("'%(prefix)/h'")},
         {"hooks: broken config", "printf '[core\\n' >> \"$HOME/.gitconfig\""},
         {"hooks: include loop", "git config include.path config"},
+        {"hooks: inner tab", "printf '[core]\\nhooksPath = a\\tb\\n' >> .git/config"},
+        {"hooks: worktree gitdir empty", "git worktree add -q ../w3 && : > .git/worktrees/w3/gitdir"},
+        {"hooks: worktree gitdir gone", "git worktree add -q ../w4 && rm .git/worktrees/w4/gitdir"},
     };
     for (int i = 0; i < (int)(sizeof stop / sizeof *stop); i++) {
         char h[PATH_MAX], dir[PATH_MAX];

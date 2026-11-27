@@ -145,11 +145,14 @@ untrusted repository or task in a VM.
 - What `core.hooksPath` names is closed like `.git/hooks`, also to the file tools and before it
   exists; for husky's `.husky/_`, all of `.husky`. Every value in the system, global, repository,
   worktree and submodule configs counts, also one that another overrides, and every `include` and
-  `includeIf` file is followed whatever its condition; those config files are closed too. Linked
+  `includeIf` file is followed whatever its condition; those config files are closed too. A
+  relative value is closed in each work tree, also linked worktrees outside the project, and in
+  the git directories, where hooks run on receive. Linked
   hooks directly in such a directory are followed. If a value covers the whole project (`.`, the
   project root or a directory above it), cannot be resolved (`%(prefix)`, an unknown `~user`) or a
-  config cannot be read or parsed, no command runs, the file tools do not write, and the message
-  says why. `/dev/null` turns hooks off and is fine.
+  config cannot be read or parsed (also a tab inside an unquoted value, or a
+  `.git/worktrees/<name>` without a readable `gitdir`: `git worktree prune`), no command runs, the
+  file tools do not write, and the message says why. `/dev/null` turns hooks off and is fine.
 - A command that was given the network has all its processes killed when it ends, detached ones
   included, so that none keeps that access. Other background processes (a dev server) keep
   running, still inside the sandbox.
@@ -208,10 +211,12 @@ Where it does not protect you:
   by commands (and assembled with the file tools), and git run later inside it obeys it; the same holds for the target of a `.git`
   link file that points outside any `.git`, for what a nested config or `.envrc` symlink, or nested
   or submodule hook links, point to, for hard links that already exist, and for new directories
-  under a `.git/modules/<group>/` of submodules with a `/` in their name.
+  under a `.git/modules/<group>/` of submodules with a `/` in their name. In a project that is
+  itself a bare repository, `modules/` is not closed.
 - Links in subdirectories of a hooks directory are not followed: what they point to can be changed.
-- `core.hooksPath` is looked for in the repository the project is in, its submodules and its
-  worktrees inside the project. Not in other repositories below the project, in the system config
+- `core.hooksPath` is looked for in the repository the project is in (the first `.git` upward, and
+  any directory that looks bare on the way), its submodules and its linked worktrees. Not in
+  repositories above that one, in other repositories below the project, in the system config
   of a git installed somewhere unusual, or in `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG_COUNT`.
 - Started in your home directory (or above it), the sandbox makes all of it writable, except the
   stores listed above.

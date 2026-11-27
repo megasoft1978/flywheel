@@ -1685,20 +1685,22 @@ static bool cfg_key(Hooks *h, const char *path, const char *sec, bool sub, const
     return cfg_file(h, full, depth + 1);
 }
 
-/* the value after '=', up to the end of its line; NULL for bad syntax */
+/* the value after '=', up to the end of its line; NULL for bad syntax.
+   Blank is space, tab and CR, as git has it: form feed and the like are kept. */
 static const char *cfg_value(const char *s, char *out, bool *fits) {
-    size_t n = 0, keep = 0;
+    size_t n = 0, keep = 0, odd = 0;
     bool quote = false;
     *fits = true;
-    s += strspn(s, " \t");
     for (;; s++) {
         char c = *s;
-        bool literal = false;
         if (c == '\r' && s[1] == '\n') c = *++s;
         if (!c || c == '\n') break;
         if (!quote && (c == '#' || c == ';')) { s += strcspn(s, "\n"); break; }
+        bool blank = !quote && (c == ' ' || c == '\t' || c == '\r');
+        if (blank && !n) continue;
         if (c == '"') { quote = !quote; keep = n; continue; }
         if (c == '\\') {
+            keep = n;           /* blanks before an escape stay */
             c = *++s;
             if (c == '\r' && s[1] == '\n') c = *++s;
             if (c == '\n') continue;
@@ -1706,13 +1708,15 @@ static const char *cfg_value(const char *s, char *out, bool *fits) {
             else if (c == 't') c = '\t';
             else if (c == 'b') c = '\b';
             else if (c != '"' && c != '\\') return NULL;
-            literal = true;
         }
         if (n + 1 >= PATH_MAX) { *fits = false; continue; }
+        if (blank && c != ' ' && !odd) odd = n + 1;
         out[n++] = c;
-        if (quote || literal || !isspace((unsigned char)c)) keep = n;
+        if (!blank) keep = n;
     }
     out[keep] = 0;
+    /* some gits keep an unquoted tab or CR inside a value, some make it a space */
+    if (odd && odd <= keep) *fits = false;
     return quote ? NULL : s;
 }
 
@@ -1733,8 +1737,8 @@ static bool cfg_parse(Hooks *h, const char *path, const char *s, int depth) {
                 else if (!sub && n + 1 < sizeof sec) sec[n++] = (char)tolower((unsigned char)*s);
             }
             sec[n] = 0;
-            if (*s == ' ' || *s == '\t') {
-                s += strspn(s, " \t");
+            if (*s == ' ' || *s == '\t' || *s == '\r') {
+                s += strspn(s, " \t\r");
                 if (*s++ != '"') return cannot(path);
                 for (sub = true; *s && *s != '"' && *s != '\n'; s++)
                     if (*s == '\\' && s[1]) s++;
@@ -1826,7 +1830,15 @@ static bool hooks_apply(Hooks *h, const char *tree) {
         char dir[PATH_MAX], full[PATH_MAX], at[PATH_MAX], up[PATH_MAX];
         if (!cfg_expand(v, dir)) return refuse("cannot resolve core.hooksPath", v);
         if (*dir != '/' && !tree) continue;
-        if (!join(full, tree ? tree : "", dir)) return refuse("cannot resolve core.hooksPath", v);
+        /* a work tree that is gone: leading ".." steps are taken by name */
+        const char *base = tree ? tree : "", *rel = dir;
+        struct stat st;
+        if (*dir != '/' && stat(tree, &st))
+            for (snprintf(up, sizeof up, "%s", tree); !strncmp(rel, "../", 3); rel += 3, base = up) {
+                char *s = strrchr(up, '/');
+                if (s) s[s == up] = 0;
+            }
+        if (!join(full, base, rel)) return refuse("cannot resolve core.hooksPath", v);
         for (size_t n = strlen(full); n > 1 && full[n - 1] == '/'; ) full[--n] = 0;
         if (!hooks_dir(h, full, tree)) return false;
         if (husky_stubs(full)) {
@@ -1851,37 +1863,49 @@ static bool hooks_trees(Hooks *h, const char *gitdir) {
     return true;
 }
 
-/* every submodule git directory below `dir`, with its own config */
+static bool hooks_worktrees(Hooks *h, const char *common);
+
+/* what git keeps in a git directory and never holds another one */
+static bool git_data(const char *name) {
+    return !strcmp(name, "objects") || !strcmp(name, "refs") || !strcmp(name, "logs")
+        || !strcmp(name, "lfs") || !strcmp(name, "svn");
+}
+
+/* every submodule git directory below `dir`, with its own config. Only a
+   `config` file marks one: a submodule's path may itself have "config" or
+   "HEAD" in it, so what is below is searched either way. */
 static bool hooks_modules(Hooks *h, const char *dir, int depth) {
     DIR *d = opendir(dir);
     if (!d) return absent() || cannot(dir);
-    bool ok = depth <= 8 || cannot(dir);
-    struct dirent *e;
-    while (ok && (errno = 0, e = readdir(d))) {
-        char p[PATH_MAX], sub[PATH_MAX];
-        struct stat st;
-        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
-        if (!join(p, dir, e->d_name)) { ok = cannot(dir); break; }
-        if (stat(p, &st)) { ok = absent() || cannot(p); continue; }
-        if (!S_ISDIR(st.st_mode)) continue;
-        if (!has_entry(p, "config") && !has_entry(p, "HEAD")) {
-            ok = hooks_modules(h, p, depth + 1);
-            continue;
-        }
+    bool ok = depth <= 16 || cannot(dir);
+    struct stat st;
+    char mark[PATH_MAX];
+    bool gitdir = join(mark, dir, "config") && !lstat(mark, &st) && !S_ISDIR(st.st_mode);
+    if (ok && gitdir && depth) {
         int hooks = h->hooks.n, tree = h->tree.n;
         h->files = 0;
-        ok = cfg_in(h, p, "config") && cfg_in(h, p, "config.worktree")
-             && (h->tree.n > tree ? hooks_trees(h, p) : hooks_apply(h, NULL));
+        ok = cfg_in(h, dir, "config") && cfg_in(h, dir, "config.worktree")
+             && hooks_apply(h, dir)   /* hooks run there on receive */
+             && hooks_trees(h, dir) && hooks_worktrees(h, dir);
         values_cut(&h->hooks, hooks);
         values_cut(&h->tree, tree);
-        if (ok) ok = join(sub, p, "modules") ? hooks_modules(h, sub, depth + 1) : cannot(p);
+    }
+    struct dirent *e;
+    while (ok && (errno = 0, e = readdir(d))) {
+        char p[PATH_MAX];
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        if (gitdir && depth && git_data(e->d_name)) continue;
+        if (!join(p, dir, e->d_name)) { ok = cannot(dir); break; }
+        if (stat(p, &st)) { ok = absent() || cannot(p); continue; }
+        if (S_ISDIR(st.st_mode)) ok = hooks_modules(h, p, depth + 1);
     }
     if (ok && errno) ok = cannot(dir);
     closedir(d);
     return ok;
 }
 
-/* the linked worktrees that lie inside the project */
+/* every linked worktree, wherever it lies: git runs hooks from there, and what
+   its values name may be in the project */
 static bool hooks_worktrees(Hooks *h, const char *common) {
     char dir[PATH_MAX];
     if (!join(dir, common, "worktrees")) return cannot(common);
@@ -1891,18 +1915,22 @@ static bool hooks_worktrees(Hooks *h, const char *common) {
     struct dirent *e;
     while (ok && (errno = 0, e = readdir(d))) {
         char wt[PATH_MAX], file[PATH_MAX], line[PATH_MAX], git[PATH_MAX], tree[PATH_MAX];
+        char at[PATH_MAX], kept[PATH_MAX];
+        struct stat st;
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
         if (!join(wt, dir, e->d_name) || !join(file, wt, "gitdir")) { ok = cannot(dir); break; }
-        if (!first_line(file, line, sizeof line)) continue;
-        if (!join(git, wt, line)) { ok = cannot(file); break; }
-        parent_of(git, tree);
-        char at[PATH_MAX];
-        if (!realpath(tree, at) || !is_within(h->proj, at)) continue;
+        if (stat(wt, &st)) { ok = absent() || cannot(wt); continue; }
+        if (!S_ISDIR(st.st_mode)) continue;
         /* without this file the next command would not find the work tree */
-        char kept[PATH_MAX];
         if (!walk(file, true, kept, h->fn, h->arg)) { ok = false; break; }
+        if (!first_line(file, line, sizeof line) || !*line || !join(git, wt, line)) {
+            ok = cannot(file);
+            break;
+        }
+        parent_of(git, tree);   /* a removed work tree is still named */
         int hooks = h->hooks.n;
-        ok = cfg_in(h, wt, "config.worktree") && hooks_apply(h, at);
+        h->files = 0;
+        ok = cfg_in(h, wt, "config.worktree") && hooks_apply(h, realpath(tree, at) ? at : tree);
         values_cut(&h->hooks, hooks);
     }
     if (ok && errno) ok = cannot(dir);
@@ -1910,25 +1938,9 @@ static bool hooks_worktrees(Hooks *h, const char *common) {
     return ok;
 }
 
-/* the configs of the repository the project is in, then of what is inside it */
-static bool hooks_repo(Hooks *h) {
-    char top[PATH_MAX], gitdir[PATH_MAX], common[PATH_MAX], p[PATH_MAX], line[PATH_MAX];
-    snprintf(top, sizeof top, "%s", h->proj);
-    bool bare = false, found = false;
-    for (bool first = true; ; first = false) {
-        if (has_entry(top, ".git")) found = true;
-        else if (first ? root_bare(top) : bare_like(top)) found = bare = true;
-        char *s = strrchr(top, '/');
-        if (found || !s || !s[1]) break;
-        s[s == top] = 0;
-    }
-    if (!found) return hooks_apply(h, NULL);
-    if (bare) snprintf(gitdir, sizeof gitdir, "%s", top);
-    else {
-        int moved = gitdir_elsewhere(top, gitdir, no_node, NULL);
-        if (moved < 0) return false;
-        if (!moved && !join(gitdir, top, ".git")) return cannot(top);
-    }
+/* one repository: its configs, its work trees and what it holds */
+static bool hooks_one(Hooks *h, const char *top, const char *gitdir) {
+    char common[PATH_MAX], p[PATH_MAX], line[PATH_MAX];
     snprintf(common, sizeof common, "%s", gitdir);
     struct stat st;
     if (!join(p, gitdir, "commondir")) return cannot(gitdir);
@@ -1940,14 +1952,39 @@ static bool hooks_repo(Hooks *h) {
 
     int hooks = h->hooks.n, tree = h->tree.n;
     h->files = 0;
+    /* a relative value also counts from the git directories: hooks run there
+       on receive */
     if (!cfg_in(h, common, "config") || !cfg_in(h, common, "config.worktree")
         || !cfg_in(h, gitdir, "config") || !cfg_in(h, gitdir, "config.worktree")
-        || !hooks_apply(h, top) || !hooks_trees(h, gitdir) || !hooks_worktrees(h, common))
+        || !hooks_apply(h, top) || !hooks_apply(h, gitdir) || !hooks_apply(h, common)
+        || !hooks_trees(h, gitdir) || !hooks_worktrees(h, common))
         return false;
     values_cut(&h->hooks, hooks);
     values_cut(&h->tree, tree);
     if (!join(p, gitdir, "modules") || !hooks_modules(h, p, 0)) return false;
     return !strcmp(common, gitdir) || (join(p, common, "modules") && hooks_modules(h, p, 0));
+}
+
+/* the configs of the repository the project is in, then of what is inside it.
+   Only .git ends the search upward: a directory that merely looks bare (a
+   command can make one) is read as one on the way. */
+static bool hooks_repo(Hooks *h) {
+    char top[PATH_MAX], gitdir[PATH_MAX];
+    snprintf(top, sizeof top, "%s", h->proj);
+    bool bare = false;
+    for (bool first = true; !has_entry(top, ".git"); first = false) {
+        if (first ? root_bare(top) : bare_like(top)) {
+            bare = true;
+            if (!hooks_one(h, top, top)) return false;
+        }
+        char *s = strrchr(top, '/');
+        if (!s || !s[1]) return bare || hooks_apply(h, NULL);
+        s[s == top] = 0;
+    }
+    int moved = gitdir_elsewhere(top, gitdir, no_node, NULL);
+    if (moved < 0) return false;
+    if (!moved && !join(gitdir, top, ".git")) return cannot(top);
+    return hooks_one(h, top, gitdir);
 }
 
 static bool hooks_paths(const char *proj, NodeFn fn, void *arg) {
