@@ -393,9 +393,11 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
             if (prunes % 2 == 0 && resets < MAXRESETS) {
                 resets++;
                 /* context reset: keep system + current task, then a reset msg */
+                Images held = images_copy(&msgs->v[task].images);   /* freed by trunc */
                 msgs_trunc(msgs, task > 0 ? 1 : 0);
                 msgs_push(msgs, "user", taskmsg);
                 task = msgs->n - 1;
+                msgs->v[task].images = held;
                 snprintf(pb, sizeof pb,
                     "Context reset after repeated %s loop. Your saved files:\n%s\nCurrent type check:\n%.1000s\nRe-read the task prompt carefully. Inspect the existing files, find what is still missing or wrong versus the requirements, fix it with a different approach, verify the type check is clean, and reply DONE.",
                     kind, files, go);
