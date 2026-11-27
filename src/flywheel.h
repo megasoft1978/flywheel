@@ -187,6 +187,7 @@ char *str_ndup(const char *, size_t);
 char *read_file(const char *path);                  /* NULL on fail */
 void  ftrim_mid(char *s, int head, int tail);       /* keep head+tail chars, mark middle */
 void  utf8_sanitize(char *s);                       /* tools.c — JSON-safe bytes */
+bool  is_hidden_cp(unsigned cp, bool strict);       /* reorders or hides text */
 char *clean_text(const char *s, bool crlf, bool strict); /* terminal-safe copy, malloc'd */
 char *tty_text(const char *s, bool crlf);           /* clean_text only if stdout is a tty */
 

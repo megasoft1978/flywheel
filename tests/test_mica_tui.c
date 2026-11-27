@@ -237,6 +237,11 @@ static bool handle_security(int cfd, const char *last_msg) {
     return true;
 }
 
+/* the flag of Scotland: U+1F3F4, tags "gbsct", U+E007F */
+#define FLAG_SCT "\xf0\x9f\x8f\xb4\xf3\xa0\x81\xa7\xf3\xa0\x81\xa2\xf3\xa0\x81\xb3" \
+                 "\xf3\xa0\x81\xa3\xf3\xa0\x81\xb4\xf3\xa0\x81\xbf"
+#define SEG_PLAIN "FIRSTPART\necho safe  x#; id\nflag " FLAG_SCT " not \xf0\x9f\x8f\xb4 ok!"
+
 static void handle_client(int cfd) {
     static char req[2 << 20];
     size_t got = 0;
@@ -288,6 +293,25 @@ static void handle_client(int cfd) {
 
     if (handle_probe(cfd, last_msg)) return;
     if (handle_security(cfd, last_msg)) return;
+
+    if (strstr(last_msg, "SEG_REPLY")) {   /* answer split by reasoning, with hidden text */
+        static const char *const part[][2] = {
+            {"content", "FIRSTPART\\n"},
+            {"reasoning_content", "hmm"},
+            {"content", "echo safe \xe2\x80\xae\xe2\x81\xa6 x\xf3\xa0\x81\x81\\u001b#; id\\n"},
+            {"reasoning_content", "hmm"},
+            {"content", "flag " FLAG_SCT " not \xf0\x9f\x8f\xb4\xf3\xa0\x81\xa1\xf3\xa0\x81\xbf "
+                        "ok\xe0\x80\xaf\xed\xa0\x80\xf0\x80\x80\xaf!"},
+        };
+        for (size_t i = 0; i < sizeof part / sizeof *part; i++) {
+            char j[512];
+            snprintf(j, sizeof j, "{\"choices\":[{\"delta\":{\"%s\":\"%s\"}}]}", part[i][0], part[i][1]);
+            send_sse_chunk(cfd, j);
+        }
+        send_all(cfd, "data: [DONE]\n\n", 14);
+        close(cfd);
+        return;
+    }
 
     if (strstr(last_msg, "BIG_REPLY")) {       /* 100 lines of 1000 bytes */
         char j[1200], fill[1000];
@@ -837,7 +861,9 @@ static void ask(MicaSession *s, const char *msg) {
 /* every session here finds a fake pbcopy first on PATH: the real clipboard is never touched */
 static void copy_tests(const char *dir, const char *cmd) {
     char bin[1100], script[1200], clip[1200], failflag[1200];
-    snprintf(bin, sizeof bin, "%s/fakebin", dir);
+    char outside[] = "/tmp/fwcopy-XXXXXX";
+    assert(mkdtemp(outside) != NULL);
+    snprintf(bin, sizeof bin, "%s/fakebin", outside);
     snprintf(script, sizeof script, "%s/pbcopy", bin);
     snprintf(clip, sizeof clip, "%s/clip.txt", dir);
     snprintf(failflag, sizeof failflag, "%s/pbfail", dir);
@@ -955,6 +981,95 @@ static void copy_tests(const char *dir, const char *cmd) {
     pump(s, 100);
     CHECK(s, "mouse on: terminal restored", !mica_session_reports_mouse(s));
     mica_session_destroy(s);
+
+    /* a project-supplied pbcopy never runs: relative, empty, absolute or symlinked
+       PATH entries. PATH holds no system pbcopy, so the clipboard stays untouched */
+    char evil[1200], inproj[1200], evil2[1300], linkdir[1200], linkfile[1300], hijack[1200];
+    snprintf(evil, sizeof evil, "%s/pbcopy", dir);
+    snprintf(inproj, sizeof inproj, "%s/inproj", dir);
+    snprintf(evil2, sizeof evil2, "%s/pbcopy", inproj);
+    snprintf(linkdir, sizeof linkdir, "%s/linkbin", outside);
+    snprintf(linkfile, sizeof linkfile, "%s/pbcopy", linkdir);
+    snprintf(hijack, sizeof hijack, "%s/HIJACKED", dir);
+    assert(mkdir(inproj, 0700) == 0 && mkdir(linkdir, 0700) == 0);
+    const char *const evils[] = {evil, evil2};
+    for (int i = 0; i < 2; i++) {
+        f = fopen(evils[i], "w");
+        assert(f != NULL);
+        fprintf(f, "#!/bin/sh\nexec /bin/cat > '%s'\n", hijack);
+        fclose(f);
+        assert(chmod(evils[i], 0700) == 0);
+    }
+    assert(symlink(evil, linkfile) == 0);
+
+    unlink(clip);
+    snprintf(full, sizeof full, "unset SSH_CONNECTION SSH_TTY SSH_CLIENT TMUX; "
+             "export PATH='.::inproj:%s:%s:/bin'; %s", inproj, linkdir, cmd);
+    s = mica_session_create(dir, full, 24, 80);
+    assert(s != NULL);
+    CHECK(s, "hijack: ready", wait_for_text(s, "ready", 3000));
+    pump(s, 150);
+    ask(s, "SEC_ZWTEXT");
+    keys(s, "/copy\r");
+    CHECK(s, "hijack: falls back to OSC 52", wait_for_text(s, "pbcopy failed. Sent", 3000));
+    pump(s, 200);
+    CHECK(s, "hijack: project pbcopy not run", access(hijack, F_OK) != 0);
+    osc = mica_session_take_clipboard_write(s);
+    CHECK(s, "copy: bidi and zero-width characters removed", osc && !strcmp(osc, "zw"));
+    free(osc);
+    mica_session_destroy(s);
+
+    /* with a safe entry after the unsafe ones, that one is used */
+    snprintf(full, sizeof full, "unset SSH_CONNECTION SSH_TTY SSH_CLIENT TMUX; "
+             "export PATH='.::inproj:%s:%s:%s:/bin'; %s", inproj, linkdir, bin, cmd);
+    s = mica_session_create(dir, full, 14, 80);
+    assert(s != NULL);
+    CHECK(s, "segments: ready", wait_for_text(s, "ready", 3000));
+    pump(s, 150);
+    ask(s, "SEG_REPLY");
+    keys(s, "/copy\r");
+    CHECK(s, "segments: says it has several lines", wait_for_text(s, "several lines (3)", 3000));
+    CHECK(s, "segments: safe pbcopy used", access(hijack, F_OK) != 0);
+    slurp(clip, got, sizeof got);
+    CHECK(s, "segments: whole reply, hidden text removed", !strcmp(got, SEG_PLAIN));
+
+    /* 14 rows: the menu scrolls to the last command */
+    keys(s, "/clear\r");
+    keys(s, "/");
+    CHECK(s, "short menu: last command off screen", find_row(s, "/quit") < 0);
+    for (int i = 0; i < 9; i++) keys(s, "\033[B");
+    int quit = find_row(s, "/quit");
+    CHECK(s, "short menu: arrows reach /quit", quit >= 0 && find_row(s, "\xe2\x96\xb8 /quit") == quit);
+    CHECK(s, "short menu: first command scrolled away", find_row(s, "write .flywheel.md") < 0);
+    keys(s, "\033[B");
+    CHECK(s, "short menu: wraps to the top", find_row(s, "\xe2\x96\xb8 /init") >= 0);
+    keys(s, "\033[A");
+    keys(s, "\x03" "/mouse\r");
+    keys(s, "/clear\r");
+    keys(s, "/help\r");
+    CHECK(s, "help: no wheel while the mouse is off",
+          find_row(s, "PgUp/PgDn scroll") >= 0 && find_row(s, "or wheel") < 0);
+    keys(s, "/mouse\r");
+    keys(s, "/clear\r");
+    keys(s, "/");
+    for (int i = 0; i < 9; i++) keys(s, "\033[B");
+    int row = find_row(s, "/exit");
+    CHECK(s, "short menu: /exit visible", row >= 0);
+    char click[32];
+    snprintf(click, sizeof click, "\033[<0;5;%dM", row + 1);
+    keys(s, click);
+    CHECK(s, "short menu: click uses the scroll offset", wait_for_exit(s, 3000));
+    mica_session_destroy(s);
+
+    unlink(evil);
+    unlink(evil2);
+    unlink(linkfile);
+    unlink(script);
+    unlink(clip);
+    rmdir(inproj);
+    rmdir(linkdir);
+    rmdir(bin);
+    rmdir(outside);
 }
 
 int main(int argc, char **argv) {

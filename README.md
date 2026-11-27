@@ -107,8 +107,10 @@ Project instructions come from the first of `.flywheel.md`, `AGENTS.md` or `CLAU
 - Tool output and thinking collapse; click or `^O` to expand.
 - Slash menu (`/init /clear /model /allow /status /copy /mouse /help /exit`), input history,
   large-paste collapse.
-- `/copy` copies the last assistant reply as plain text (escape sequences and control characters
-  removed). It uses `pbcopy` on a local macOS session, otherwise, over SSH or if `pbcopy` fails,
+- `/copy` copies the last assistant reply as plain text (escape sequences, control characters and
+  bidi, zero-width and tag characters removed; the England, Scotland and Wales flags stay). It uses
+  `pbcopy` on a local macOS session (never one found through a relative `PATH` entry or inside the
+  project), otherwise, over SSH or if `pbcopy` fails,
   OSC 52 (replies up to 74994 bytes). A terminal never confirms OSC 52, so paste to check; tmux
   needs `set-clipboard on`.
 - Mouse reporting is on by default and takes over drag-to-select. Hold the terminal's bypass key
