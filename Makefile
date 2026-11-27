@@ -51,7 +51,7 @@ test-unit: $(BIN) $(TESTDIR)/test_unit $(TESTDIR)/test_unit_mini
 test-mica: $(MICA_DEPS)
 	$(MICA_RUN)
 
-test: $(BIN) test-unit test-mica
+test: $(BIN) test-unit test-mica test-http
 
 # built twice: libcurl transport and the FW_MINI_HTTP one
 UNIT_SRC = tests/test_unit.c src/tools.c src/args.c src/sim.c src/util.c src/msgs.c \

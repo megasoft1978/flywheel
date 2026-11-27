@@ -158,7 +158,9 @@ static int feed(size_t (*cb)(char *, size_t, size_t, void *), void *ud,
 
 /* Core request: method POST/GET. Streams body through cb as it arrives.
    Returns 0 when the whole body arrived (regardless of status code), -1 on
-   transport error, truncated/malformed framing or abort.
+   transport error, truncated framing or abort, -2 when the response was
+   rejected for a limit or bad framing (header line/count, Content-Length):
+   response rejected, do not retry.
    status_out receives the HTTP status code. */
 static int mini_request(const char *method, const char *url, const char *payload,
                         int streaming, size_t (*cb)(char *, size_t, size_t, void *),
@@ -229,9 +231,9 @@ static int mini_request(const char *method, const char *url, const char *payload
     int header_lines = 0;
     for (;;) {
         int r = read_line(fd, &line, idle);
-        if (r == -3) { rc = -1; snprintf(errbuf, errcap, "response header line too long"); goto done; }
+        if (r == -3) { rc = -2; snprintf(errbuf, errcap, "response header line too long"); goto done; }
         if (r != 1) { rc = -1; snprintf(errbuf, errcap, "header read failed"); goto done; }
-        if (header_lines > MAX_HEADERS) { rc = -1; snprintf(errbuf, errcap, "too many response headers"); goto done; }
+        if (header_lines > MAX_HEADERS) { rc = -2; snprintf(errbuf, errcap, "too many response headers"); goto done; }
         if (header_lines == 0) {
             unsigned u = 0;
             if (sscanf(line.buf, "HTTP/%*s %u", &u) == 1) status = (int)u;
@@ -242,7 +244,7 @@ static int mini_request(const char *method, const char *url, const char *payload
             errno = 0;
             content_length = strtol(line.buf + 15, &end, 10);
             if (errno || end == line.buf + 15 || content_length < 0 || end[strspn(end, " \t\r\n")]) {
-                rc = -1; snprintf(errbuf, errcap, "bad Content-Length"); goto done;
+                rc = -2; snprintf(errbuf, errcap, "bad Content-Length"); goto done;
             }
         }
         header_lines++;

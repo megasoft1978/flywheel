@@ -273,20 +273,20 @@ static void test_mini(void) {
         put(&b, "HTTP/1.1 200 OK\r\nContent-Length: ");
         put(&b, bad_length[i]);
         put(&b, "\r\n\r\n" STOPPED END);
-        expect_error("bad Content-Length", ask(b.p, b.len, 4096, true), "bad Content-Length");
+        expect_final_error("bad Content-Length", ask(b.p, b.len, 4096, true), "bad Content-Length");
     }
 
     b.len = 0;
     put(&b, "HTTP/1.1 200 OK\r\n");
     for (int i = 0; i < 1000; i++) put(&b, "X-Pad: 1\r\n");
     put(&b, "\r\n" STOPPED END);
-    expect_error("header count is bounded", ask(b.p, b.len, 4096, true), "too many response headers");
+    expect_final_error("header count is bounded", ask(b.p, b.len, 4096, true), "too many response headers");
 
     b.len = 0;
     put(&b, "HTTP/1.1 200 OK\r\nX-Pad: ");
     while (b.len < 20000) put(&b, "pppppppppppppppp");
     put(&b, "\r\n\r\n" STOPPED END);
-    expect_error("header line is bounded", ask(b.p, b.len, 4096, true), "header line too long");
+    expect_final_error("header line is bounded", ask(b.p, b.len, 4096, true), "header line too long");
 
     static const char small[] = OK_HDR "ok";
     pid_t p = serve(small, sizeof small - 1, 4096);

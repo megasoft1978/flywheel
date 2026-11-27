@@ -463,7 +463,9 @@ ChatResp *chat(Msgs *msgs, StreamCb *cb) {
         why = a.fatal;            /* we stopped the transfer ourselves */
     } else if (broken) {
 #ifdef FW_MINI_HTTP
-        snprintf(a.err, sizeof a.err, "http: %s", merr[0] ? merr : "transport error");
+        /* -2: the minihttp reader rejected the response; retrying cannot help */
+        snprintf(a.err, sizeof a.err, "%s%s", mrc == -2 ? "bad response: " : "http: ",
+                 merr[0] ? merr : "transport error");
 #else
         snprintf(a.err, sizeof a.err, "curl: %s", curl_easy_strerror(rc));
 #endif
