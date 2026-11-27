@@ -2383,59 +2383,30 @@ static void test_nested_git(void) {
     }
     quiet("echo evil > sub/.git/hooks/pre-commit; echo evil > .git/modules/m/hooks/pre-commit");
     quiet("echo evil > sub/.git/config.worktree; echo /tmp > sub/.git/commondir");
-    quiet("mv sub sub2; mv .git/modules mods");
+    char *cfg = slurp(under(proj, "sub/.git/config"));
+    quiet("mv .git/modules mods; mv sub sub2; echo evil >> sub2/.git/config;"
+          " echo evil > sub2/.git/hooks/pre-commit");
+    T("nested config stays closed under a renamed parent", cfg && gone(proj, "mods")
+      && holds(under(proj, "sub2/.git/config"), cfg)
+      && gone(proj, "sub2/.git/hooks/pre-commit"));
+    free(cfg);
+    quiet("mv sub2 sub");
     T("nested hooks not planted", gone(proj, "sub/.git/hooks/pre-commit")
       && gone(proj, ".git/modules/m/hooks/pre-commit") && gone(proj, "sub/.git/config.worktree")
       && gone(proj, "sub/.git/commondir"));
-    T("nested repository not renamed", gone(proj, "sub2") && gone(proj, "mods"));
     static const char *const no[] = {"sub/.git/hooks/pre-commit", ".git/modules/m/hooks/x",
         "new/.git/config", "new/.GIT/hooks/x", "deep/er/.envrc", "other/.git",
         ".git/worktrees/wt/config.worktree"};
     for (int i = 0; i < (int)(sizeof no / sizeof *no); i++)
         refused(no[i], tool_write_file(proj, no[i], "evil"));
 
-    /* git still makes repositories below the root */
-    int code = -1;
-    char *o = run_bash_status("git init -q fresh && git clone -q . cl && git worktree add -q wt2 -b wt2"
-                              " && git -C cl status --short && git -C wt2 status --short", proj, 30, &code);
-    T("git init, clone and worktree add work", !code);
-    T("an ordinary new repository is left alone", !strstr(o, "quarantined")
-      && !gone(proj, "fresh/.git/config") && !gone(proj, "cl/.git/config")
-      && !gone(proj, ".git/worktrees/wt2/commondir") && !gone(proj, "wt2/.git"));
-    free(o);
-
-    /* the next command finds them there: closed like any other */
-    char *cfg = slurp(under(proj, "fresh/.git/config"));
-    quiet(EVIL_CFG " >> fresh/.git/config; echo evil > cl/.git/hooks/pre-commit;"
-          " echo /tmp > .git/worktrees/wt2/commondir");
-    T("repositories made earlier are closed", cfg && holds(under(proj, "fresh/.git/config"), cfg)
-      && gone(proj, "cl/.git/hooks/pre-commit")
-      && holds(under(proj, ".git/worktrees/wt2/commondir"), "../..\n"));
-    free(cfg);
-
-    /* what a command newly creates and could run is moved aside */
-    o = run_bash("git init -q f2 && " EVIL_CFG " >> f2/.git/config; git init -q f3 && echo evil > f3/.git/hooks/pre-commit;"
-                 " mkdir n && echo evil > n/.envrc; git init -q --bare b.git && " EVIL_CFG " >> b.git/config;"
-                 " mkdir l && echo \"gitdir: $TMPDIR\" > l/.git; mkdir .git/worktrees/zz && echo /tmp > .git/worktrees/zz/commondir;"
-                 " mkdir -p c/objects c/refs && " EVIL_CFG " > c/config;"
-                 " git init -q f4 && printf '[core]fsmonitor=/usr/bin/false\\n' > f4/.git/config;"
-                 " git init -q f5 && echo evil > f5/.git/config.worktree", proj, 30);
-    T("quarantine reported", strstr(o, "quarantined"));
-    free(o);
-    T("new config moved aside", gone(proj, "f2/.git/config") && gone(proj, "b.git/config")
-      && gone(proj, "c/config") && gone(proj, "f4/.git/config") && gone(proj, "f5/.git/config.worktree"));
-    T("new hook moved aside", gone(proj, "f3/.git/hooks/pre-commit"));
-    T("new .envrc moved aside", gone(proj, "n/.envrc"));
-    T("new gitlink out of the project moved aside", gone(proj, "l/.git"));
-    T("new commondir moved aside", gone(proj, ".git/worktrees/zz/commondir"));
-
-    /* a repository assembled by the file tools */
-    free(tool_write_file(proj, "t/config", "[core]\n\tfsmonitor = /usr/bin/false\n"));
-    free(tool_write_file(proj, "t/objects/x", "x"));
-    free(tool_write_file(proj, "t/refs/x", "x"));
-    free(tool_write_file(proj, "t/HEAD", "ref: refs/heads/main\n"));
-    /* the config was there before the last call: it stays, the repository does not */
-    T("tool-made repository is not usable", gone(proj, "t/HEAD") && !gone(proj, "t/config"));
+    /* nothing makes a repository below the root */
+    int code = 0;
+    quiet("git init -q fresh; git clone -q . cl; git worktree add -q wt2 -b wt2");
+    free(run_bash_status("git init -q f2", proj, 30, &code));
+    T("nested git init fails", code);
+    T("no nested repository made", gone(proj, "fresh/.git") && gone(proj, "cl/.git")
+      && gone(proj, "f2/.git") && gone(proj, "wt2/.git") && gone(proj, ".git/worktrees/wt2"));
     setenv("HOME", old, 1);
     free(old);
 }
@@ -2529,47 +2500,38 @@ static void test_keeps_user_files(void) {
             T("shell: nothing renamed", !strstr(o, "quarantined") && user_files_there(proj, subs[i]));
             free(o);
         }
-        /* an old config completed into a repository: only the new HEAD moves */
+        /* nothing is renamed even when a command completes a repository */
         snprintf(proj, sizeof proj, "%s/done", base);
         mkdir(proj, 0700);
         host(proj, "mkdir -p s/objects s/refs && printf '[core]\\n\\tfsmonitor = x\\n' > s/config");
-        char *o = run_bash("echo 'ref: refs/heads/main' > s/HEAD", proj, 30);
-        T("shell: only the new marker moves", strstr(o, "quarantined") && gone(proj, "s/HEAD")
-          && !gone(proj, "s/config"));
-        free(o);
-        /* an old file moved to where git obeys it is not renamed either */
-        host(proj, "printf '[core]\\n\\tfsmonitor = x\\n' > old.txt");
-        o = run_bash("git init -q n && mv old.txt n/.git/config", proj, 30);
-        T("shell: old file kept, its new repository disarmed", gone(proj, "n/.git/HEAD")
-          && !gone(proj, "n/.git/config") && strstr(o, "existed before"));
-        free(o);
-        /* a marker directory holding anything is not moved, and it is said */
-        host(proj, "for d in k l; do mkdir -p $d/refs $d/mine; echo old > $d/mine/f;"
-                   " echo 'ref: refs/heads/main' > $d/HEAD;"
-                   " printf '[core]\\n\\tfsmonitor = x\\n' > $d/config; done; rmdir l/refs");
-        o = run_bash("mkdir k/objects && mv k/mine/f k/objects/f", proj, 30);
-        T("disarm: filled directory not moved, reported", holds(under(proj, "k/objects/f"), "old\n")
-          && strstr(o, "still a git repository"));
-        free(o);
-        o = run_bash("mkdir l/objects l/refs && mv l/mine/f l/objects/f", proj, 30);
-        T("disarm: another new marker moves instead", holds(under(proj, "l/objects/f"), "old\n")
-          && gone(proj, "l/refs") && !strstr(o, "still a git repository"));
-        free(o);
+        free(run_bash("echo 'ref: refs/heads/main' > s/HEAD", proj, 30));
+        T("shell: nothing moved", !gone(proj, "s/HEAD") && !gone(proj, "s/config"));
     }
     setenv("HOME", old, 1);
     free(old);
 }
 
-/* a process that left the command's group cannot write after the check */
+#define DETACH(then) "perl -MPOSIX -e 'exit if fork; setsid; close STDIN; close STDOUT;" \
+                     " close STDERR; sleep 1; " then "'"
+
+/* a process that left the command's group stays bound by the rules; it is
+   stopped only when the command had network access */
 static void test_detached(void) {
     char base[PATH_MAX], home[PATH_MAX], proj[PATH_MAX];
     char *old = review_dirs(base, home, proj);
     if (!old) { T("mkdtemp", false); return; }
-    char *o = run_bash("mkdir n; perl -MPOSIX -e 'exit if fork; setsid; close STDIN; close STDOUT;"
-                       " close STDERR; sleep 1; open F, q(>), q(n/.envrc); print F q(evil)'", proj, 30);
+    char *o = run_bash("mkdir n; " DETACH("open F, q(>), q(n/.envrc); print F q(evil); open G, q(>), q(late)")
+                       "; (sleep 1; echo up > grouped) >/dev/null 2>&1 &", proj, 30);
+    T("background processes are not reported stopped", !strstr(o, "stopped"));
+    free(o);
+    int code = -1;
+    o = run_bash_net(DETACH("open F, q(>), q(online)"), proj, 30, &code);
+    T("network command: stopping is reported", !code && strstr(o, "stopped"));
     free(o);
     sleep(2);
-    T("detached process wrote nothing later", gone(proj, "n/.envrc"));
+    T("detached process wrote nothing protected", gone(proj, "n/.envrc"));
+    T("background servers survive", !gone(proj, "late") && !gone(proj, "grouped"));
+    T("nothing with network access survives", gone(proj, "online"));
     setenv("HOME", old, 1);
     free(old);
 }
@@ -2581,17 +2543,15 @@ static void test_many_items(void) {
     if (!old) { T("mkdtemp", false); return; }
     host(proj, "git init -q . && i=0; while [ $i -lt 1100 ]; do mkdir -p r$i/.git node_modules/p$i;"
                " echo safe > r$i/.git/config; echo safe > node_modules/p$i/.envrc; i=$((i+1)); done;"
-               " git init -q --bare bare.git; mkdir -p b/objects b/refs; echo safe > b/config");
+               " git init -q n0");
     int code = -1;
     char *o = run_bash_status("echo hi", proj, 60, &code);
     T("many nested items: commands still run", !code && strstr(o, "hi"));
     free(o);
-    char *bare = slurp(under(proj, "bare.git/config"));
     in_dir(proj);
     quiet("echo evil > r7/.git/config; echo evil > r1099/.GIT/CONFIG; echo evil > node_modules/p9/.envrc;"
           " mkdir r7/.git/hooks; echo evil > r7/.git/hooks/pre-commit; echo evil > r8/.git/commondir;"
-          " mv r7/.git g; mv r9 q; echo evil > q/.git/config; mkdir n; echo evil > n/.EnvRC;"
-          " echo evil > bare.git/config; echo evil > b/config; mv b b2");
+          " mv r7/.git g; mv r9 q; echo evil > q/.git/config; mkdir n; echo evil > n/.EnvRC");
     quiet("mkdir 'r8/.git/hook\xc5\xbf'; echo evil > 'r8/.git/con\xef\xac\x81g'");
     T("many: nested configs closed", holds(under(proj, "r7/.git/config"), "safe\n")
       && holds(under(proj, "r1099/.git/config"), "safe\n") && holds(under(proj, "r8/.git/config"), "safe\n")
@@ -2600,9 +2560,6 @@ static void test_many_items(void) {
       && gone(proj, "n/.envrc"));
     T("many: nothing planted", gone(proj, "r7/.git/hooks") && gone(proj, "r8/.git/commondir")
       && gone(proj, "r8/.git/hooks") && gone(proj, "g"));
-    T("many: bare repositories closed", bare && holds(under(proj, "bare.git/config"), bare)
-      && holds(under(proj, "b/config"), "safe\n") && gone(proj, "b2"));
-    free(bare);
     o = run_bash_status("echo a > a && git add a && git -c user.name=t -c user.email=t@t commit -qm a",
                         proj, 60, &code);
     T("many: git in the root works", !code);
@@ -2611,61 +2568,114 @@ static void test_many_items(void) {
     free(old);
 }
 
-/* a tree the check cannot cover is closed up front, not skipped */
-static void test_partial_scan(void) {
+/* nested git files, .envrc and .git link files: create, replace, rename into
+   place, symlink, hard link, renamed parents */
+static void test_blocked_writes(void) {
     char base[PATH_MAX], home[PATH_MAX], proj[PATH_MAX];
     char *old = review_dirs(base, home, proj);
     if (!old) { T("mkdtemp", false); return; }
-    host(proj, "git init -q . && mkdir pad && i=0; while [ $i -lt 60 ]; do : > pad/$i; i=$((i+1)); done;"
-               " mkdir -p deep/er/x.git deep/er/n/.git; echo safe > deep/er/x.git/config;"
-               " echo safe > deep/er/n/.git/config");
-    size_t cap = fw_scan_cap;
-    fw_scan_cap = 20;
-    int code = -1;
-    char *o = run_bash_status("echo hi > f", proj, 30, &code);
-    T("partial: ordinary writes work, and it says so", !code && strstr(o, "nothing was renamed"));
-    free(o);
+    host(proj, "git init -q . && git -c user.name=t -c user.email=t@t commit -qm one --allow-empty"
+               " && git init -q sub && git init -q --bare .git/modules/m && git worktree add -q wt -b wt"
+               " && mkdir env link n m s f h q k && echo safe > env/.envrc"
+               " && echo 'gitdir: ../.git/modules/m' > link/.git && echo evil > t");
+    char *cfg = slurp(under(proj, "sub/.git/config"));
+    char *mod = slurp(under(proj, ".git/modules/m/config"));
+    char *com = slurp(under(proj, ".git/worktrees/wt/commondir"));
+    if (!cfg || !mod || !com) { T("fixture", false); setenv("HOME", old, 1); free(old); return; }
     in_dir(proj);
-    quiet("echo evil > deep/er/x.git/config; echo evil > deep/er/n/.git/config; git init -q z; mkdir -p m/.git;"
-          " mkdir d; mkdir d/objects d/refs; echo 'ref: refs/heads/main' > d/HEAD;"
-          " mkdir -p $TMPDIR/p/.git; echo evil > $TMPDIR/p/.git/config; mv $TMPDIR/p moved;"
-          " mkdir deep/er/y; echo evil > deep/er/y/.envrc");
-    T("partial: unseen repositories closed", holds(under(proj, "deep/er/x.git/config"), "safe\n")
-      && holds(under(proj, "deep/er/n/.git/config"), "safe\n"));
-    T("partial: no new repository", gone(proj, "z/.git") && gone(proj, "m/.git") && gone(proj, "d/HEAD")
-      && gone(proj, "moved/.git/config")
-      && gone(proj, "deep/er/y/.envrc"));
 
-    /* padding made by the command itself hides nothing */
-    snprintf(proj, sizeof proj, "%s/small", base);
-    mkdir(proj, 0700);
-    o = run_bash("mkdir a && cd a && i=0; while [ $i -lt 60 ]; do : > $i; i=$((i+1)); done; cd .. &&"
-                 " git init -q zz && " EVIL_CFG " >> zz/.git/config", proj, 30);
-    T("padding does not switch the check off", strstr(o, "quarantined") && gone(proj, "zz/.git/config"));
+    /* new .envrc and .git entries of any type */
+    quiet("echo evil > n/.envrc; echo evil > n/.ENVRC; mkdir m/.envrc; ln -s ../t s/.envrc;"
+          " cp t m/.envrc; mv t q/.envrc; ln t h/.envrc; echo evil > .ENVRC");
+    quiet("echo 'gitdir: x' > f/.git; mkdir m/.git; ln -s ../sub/.git s/.git; ln t h/.git;"
+          " mv t q/.GIT; mkdir k/.Git");
+    quiet("echo evil > $TMPDIR/e; mv $TMPDIR/e q/.envrc; mkdir -p $TMPDIR/p/.git; mv $TMPDIR/p/.git k/.git;"
+          " echo evil > $TMPDIR/.envrc; mv $TMPDIR/.envrc q/.envrc");
+    T("no .envrc made", gone(proj, "n/.envrc") && gone(proj, "m/.envrc") && gone(proj, "s/.envrc")
+      && gone(proj, "q/.envrc") && gone(proj, "h/.envrc") && gone(proj, ".envrc"));
+    T("no .git made", gone(proj, "f/.git") && gone(proj, "m/.git") && gone(proj, "s/.git")
+      && gone(proj, "h/.git") && gone(proj, "q/.git") && gone(proj, "k/.git"));
+    T("rename source kept", !gone(proj, "t"));
+
+    /* what is there cannot be replaced, removed or reached by another name */
+    quiet("echo evil > env/.envrc; rm -f env/.envrc; mv env/.envrc e1; mv -f t env/.envrc;"
+          " ln -sf ../t env/.envrc; ln env/.envrc a1 && echo evil >> a1");
+    quiet("echo evil > link/.git; rm -f link/.git; mv link/.git e2; mv -f t link/.git;"
+          " ln -sfn ../t link/.git; ln link/.git a2 && echo evil >> a2");
+    quiet("ln sub/.git/config a3 && echo evil >> a3; ln .git/modules/m/config a4 && echo evil >> a4");
+    T(".envrc unchanged", holds(under(proj, "env/.envrc"), "safe\n") && gone(proj, "e1")
+      && gone(proj, "a1"));
+    T(".git link file unchanged", holds(under(proj, "link/.git"), "gitdir: ../.git/modules/m\n")
+      && gone(proj, "e2") && gone(proj, "a2"));
+    T("no hard link to a nested config", gone(proj, "a3") && gone(proj, "a4"));
+
+    /* every spelling the filesystem folds to a protected name */
+    static const char *const spelled[] = {
+        "con\xef\xac\x81g", "con\xef\xac\x81g.worktree", "config.wor\xe2\x84\xaatree",
+        "con\xef\xac\x81g.wor\xe2\x84\xaatree", "hoo\xe2\x84\xaas", "hook\xc5\xbf",
+        "hoo\xe2\x84\xaa\xc5\xbf", "COMMONDIR", "CONFIG"};
+    for (int i = 0; i < (int)(sizeof spelled / sizeof *spelled); i++) {
+        char cmd[300];
+        snprintf(cmd, sizeof cmd, "echo evil >> 'sub/.git/%s'; echo evil > 'sub/.git/%s/pre-commit';"
+                 " echo evil >> '.git/module\xc5\xbf/m/%s'", spelled[i], spelled[i], spelled[i]);
+        quiet(cmd);
+    }
+    quiet("echo evil > '.git/wor\xe2\x84\xaatree\xc5\xbf/wt/commondir';"
+          " mkdir '.git/wor\xe2\x84\xaatree\xc5\xbf/zz' '.git/module\xc5\xbf/zz'");
+    T("folded spellings blocked", holds(under(proj, "sub/.git/config"), cfg)
+      && holds(under(proj, ".git/modules/m/config"), mod)
+      && holds(under(proj, ".git/worktrees/wt/commondir"), com)
+      && gone(proj, "sub/.git/config.worktree") && gone(proj, "sub/.git/commondir")
+      && gone(proj, "sub/.git/hooks/pre-commit") && gone(proj, ".git/modules/m/config.worktree")
+      && gone(proj, ".git/modules/m/commondir") && gone(proj, ".git/worktrees/zz")
+      && gone(proj, ".git/modules/zz"));
+
+    /* a prepared directory cannot be moved or linked to where git looks */
+    quiet("mkdir -p w/hooks && echo evil > w/config; mv w .git/modules/w; mv w .git/worktrees/w;"
+          " ln -s ../../w .git/modules/l; mv w k/.git; mkdir -p $TMPDIR/g/modules; mv $TMPDIR/g k/.git");
+    T("prepared directory not moved in", !gone(proj, "w/config") && gone(proj, ".git/modules/w")
+      && gone(proj, ".git/worktrees/w") && gone(proj, ".git/modules/l") && gone(proj, "k/.git"));
+
+    /* a renamed parent takes the protection along */
+    quiet("mv .git/modules mods; mv .git/worktrees wts; mv .git/modules/m .git/m2; mv .git g;"
+          " mv sub/.git sub/g");
+    T("git directories not renamed", gone(proj, "mods") && gone(proj, "wts") && gone(proj, ".git/m2")
+      && gone(proj, "g") && gone(proj, "sub/g"));
+    quiet("mv sub sub2; mv env env2; echo evil >> sub2/.git/config; echo evil > sub2/.git/hooks/pre-commit;"
+          " rm -f sub2/.git/config; echo evil > env2/.envrc; mv env2 env; mv sub2 sub");
+    T("protected after renaming the parent", holds(under(proj, "sub/.git/config"), cfg)
+      && gone(proj, "sub/.git/hooks/pre-commit") && holds(under(proj, "env/.envrc"), "safe\n"));
+    free(cfg);
+    free(mod);
+    free(com);
+
+    /* the repository of the project itself still works */
+    int code = -1;
+    char *o = run_bash_status("echo a > a && git add a && git -c user.name=t -c user.email=t@t commit -qm a"
+                              " && git branch new && git switch -q new && git switch -q -", proj, 30, &code);
+    T("git add, commit and branch work", !code);
     free(o);
-    fw_scan_cap = cap;
 
-    /* a directory that cannot be read makes the check partial */
+    /* rules do not depend on being able to read the tree or write the root */
     snprintf(proj, sizeof proj, "%s/locked", base);
     mkdir(proj, 0700);
-    host(proj, "mkdir shut && chmod 000 shut");
-    o = run_bash("git init -q z", proj, 30);
-    T("unreadable directory: fails closed and says so", strstr(o, "nothing was renamed")
-      && gone(proj, "z/.git"));
-    free(o);
+    host(proj, "mkdir shut sub && chmod 000 shut");
+    free(run_bash("chmod 555 .", proj, 30));
+    free(run_bash("mkdir sub/.git; echo evil > sub/.envrc; chmod 700 shut; mkdir shut/.git", proj, 30));
+    T("unreadable tree, read-only root: still blocked", gone(proj, "sub/.git")
+      && gone(proj, "sub/.envrc") && gone(proj, "shut/.git"));
+    chmod(proj, 0755);
     chmod(under(proj, "shut"), 0700);
 
-    /* a root that takes no mark: closed up front, not left unchecked */
-    snprintf(proj, sizeof proj, "%s/ro", base);
+    /* a root that is already a bare repository */
+    snprintf(proj, sizeof proj, "%s/bare", base);
     mkdir(proj, 0700);
-    host(proj, "mkdir sub");
-    free(run_bash("chmod 555 .", proj, 30));
-    o = run_bash("git init -q sub/z; mkdir -p sub/z/.git; " EVIL_CFG " >> sub/z/.git/config;"
-                 " echo evil > sub/.envrc", proj, 30);
-    T("read-only root: nested config and .envrc blocked", gone(proj, "sub/z/.git/config")
-      && gone(proj, "sub/.envrc") && strstr(o, "nothing was renamed"));
-    free(o);
-    chmod(proj, 0755);
+    host(proj, "git init -q --bare .");
+    char *rootcfg = slurp(under(proj, "config"));
+    free(run_bash("echo evil >> config; echo evil > hooks/pre-commit; echo /tmp > commondir", proj, 30));
+    T("bare root: config and hooks closed", rootcfg && holds(under(proj, "config"), rootcfg)
+      && gone(proj, "hooks/pre-commit") && gone(proj, "commondir"));
+    free(rootcfg);
     setenv("HOME", old, 1);
     free(old);
 }
@@ -2767,7 +2777,7 @@ int main(void) {
     if (sandbox_available()) {
         test_detached();
         test_many_items();
-        test_partial_scan();
+        test_blocked_writes();
         test_sandbox();
         test_sandbox_escapes();
         test_nested_git();
