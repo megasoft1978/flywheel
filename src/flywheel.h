@@ -43,11 +43,22 @@ extern volatile sig_atomic_t g_abort;   /* Esc pressed / SIGINT during request *
 extern void (*fw_tick_hook)(void);      /* TUI render tick during streaming */
 
 /* msgs.c — conversation store */
+#define IMG_MAX_COUNT 64          /* server limit, per request */
+#define IMG_MAX_TOTAL 32000000    /* server limit, bytes of data URIs */
+typedef struct {
+    char *url;           /* data: URI, sent to the server, never logged */
+    char *source;        /* path or URL the user gave */
+    char sha256[65];     /* of the bytes sent (after any downscale) */
+    size_t size;         /* ditto */
+} ImagePart;             /* built by image.c */
+typedef struct { ImagePart *v; int n; } Images;
+
 typedef struct {
     char *role;          /* system|user|assistant|tool */
     char *content;       /* may be NULL */
     char *tool_call_id;  /* tool msgs only */
     cJSON *tool_calls;   /* assistant msgs only: raw array, owned */
+    Images images;       /* owned; content becomes a parts array when n > 0 */
 } Msg;
 
 typedef struct { Msg *v; int n, cap; } Msgs;
@@ -59,6 +70,13 @@ void  msgs_insert(Msgs *, int at, const char *role, const char *content);
 void  msgs_trunc(Msgs *, int n);
 void  msgs_free(Msgs *);
 cJSON *msgs_to_json(Msgs *);
+void  image_part_free(ImagePart *);
+/* moves *p into set (zeroing *p); NULL on success, else why not (*p kept).
+   conv (may be NULL) counts toward the limits and must not contain set */
+const char *images_add(Images *set, ImagePart *p, const Msgs *conv);
+Images images_copy(const Images *);
+void  images_free(Images *);
+cJSON *images_log_json(const Images *);   /* [{path,sha256,size}] for transcripts */
 
 /* http.c — one streamed (or plain) chat completion */
 typedef struct {
