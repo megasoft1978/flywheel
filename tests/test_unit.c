@@ -683,7 +683,14 @@ static void test_agent(void) {
 
     static const char *const same[] = {"bash", "{\"command\":\"true\"}"};
     new_task(&m);
+    ImagePart shot = {.url = str_dup("data:image/png;base64,AAAA"), .source = str_dup("shot.png")};
+    images_add(&m.v[m.n - 1].images, &shot, &m);
     run_agent(&m, "tool_calls", 1, same, 6, &ui);
+    int held = 0;
+    for (int i = 0; i < m.n; i++)
+        if (m.v[i].images.n == 1 && m.v[i].content && strstr(m.v[i].content, "CURRENT TASK") &&
+            !strcmp(m.v[i].images.v[0].url, "data:image/png;base64,AAAA")) held++;
+    T("task image survives reset", held == 1);
     T("loop reset happened", has_msg(&m, "user", "Context reset"));
     T("current task survives reset", has_msg(&m, "user", "CURRENT TASK"));
     msgs_free(&m);
