@@ -20,6 +20,7 @@ from flywheel_agent import (  # noqa: E402
     WALL_MARGIN_SEC,
     FlywheelAgent,
     task_budget_sec,
+    wall_limit_sec,
 )
 
 
@@ -73,6 +74,31 @@ class TaskBudgetTest(unittest.TestCase):
             with self.subTest(task=name):
                 self.assertLess(sec - WALL_MARGIN_SEC, sec)
                 self.assertGreater(sec - WALL_MARGIN_SEC, CMD_TIMEOUT_SEC)
+
+
+class WallLimitTest(unittest.TestCase):
+    def test_budget_minus_margin(self):
+        self.assertEqual(wall_limit_sec(3600), 3540)
+        self.assertEqual(wall_limit_sec(600), 540)
+
+    def test_budget_at_or_under_margin_is_refused(self):
+        # -W 0 is unlimited in flywheel (src/main.c), so it must not reach the command line
+        for budget in (WALL_MARGIN_SEC, WALL_MARGIN_SEC - 1, 0, -5):
+            with self.subTest(budget=budget):
+                with self.assertRaises(ValueError):
+                    wall_limit_sec(budget)
+
+    def test_budget_just_above_margin_gives_one_second(self):
+        self.assertEqual(wall_limit_sec(WALL_MARGIN_SEC + 1), 1)
+
+    def test_run_refuses_short_budget_before_any_container_write(self):
+        # 600 s table value x 0.05 = 30 s budget, which is under the margin
+        logs = Path(tempfile.mkdtemp())
+        agent = FlywheelAgent(logs_dir=logs, timeout_multiplier=0.05)
+        env = FakeEnvironment("modernize-scientific-stack")
+        with self.assertRaises(ValueError):
+            asyncio.run(agent.run("x", env, SimpleNamespace()))
+        self.assertEqual(env.exec_calls, [])
 
 
 class RunCommandTest(unittest.TestCase):

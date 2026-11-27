@@ -31,10 +31,13 @@ CONTEXT_OVERFLOW = re.compile(
     r"context.{0,24}(length|window|size|limit)|maximum context|prompt is too long|exceeds? the context",
     re.IGNORECASE,
 )
-# flywheel's -W is checked only between turns and inside model requests, so it can end up to
-# one command (-t) late. The margin leaves room for the last turn to finish before Harbor's kill.
+# flywheel's -W is checked only at the start of each turn and inside model requests (src/agent.c:106,
+# 123), so a command started just before it can run up to -t more. The margin is not a guarantee;
+# Harbor's kill (asyncio.wait_for) is the only hard cap. Open blocker in bench/PROTOCOL.md.
 WALL_MARGIN_SEC = 60
-# per-command limit (-t): Terminus 2 waits at most 180 s per command by default (tmux_session.py:792)
+# per-command limit (-t), a flywheel setting chosen in FW-TBTIME. It is not matched to Terminus 2:
+# Terminus 2 sends commands non-blocking and waits min(duration, 60) s without killing them
+# (terminus_2.py:1400, :1434). flywheel gates get 2x -t (src/agent.c:39).
 CMD_TIMEOUT_SEC = 180
 # -T must not bind before -W; the largest tb21 budget is 12000 s and a model turn takes >1 s
 MAX_TURNS = 20000
@@ -54,6 +57,17 @@ def task_budget_sec(task_name: str, multiplier: float, table: Path = TIMEOUTS_TS
         if name == task_name:
             return float(agent_sec) * multiplier
     raise KeyError(f"no agent timeout for task {task_name!r} in {table.name}")
+
+
+def wall_limit_sec(budget_sec: float) -> int:
+    """flywheel -W for a Harbor budget. -W 0 means unlimited in flywheel, so refuse it."""
+    wall = int(budget_sec - WALL_MARGIN_SEC)
+    if wall <= 0:
+        raise ValueError(
+            f"budget {budget_sec:g} s leaves no flywheel wall limit after the "
+            f"{WALL_MARGIN_SEC} s margin"
+        )
+    return wall
 
 
 class FlywheelAgent(BaseAgent):
@@ -95,6 +109,9 @@ class FlywheelAgent(BaseAgent):
         environment: BaseEnvironment,
         context: AgentContext,
     ) -> None:
+        # resolve the budget before touching the container
+        budget = task_budget_sec(environment.environment_name, self._timeout_multiplier)
+        wall = wall_limit_sec(budget)
         # write the instruction into the container (avoids quoting hell)
         instr = shlex.quote(instruction)
         await environment.exec(
@@ -107,8 +124,6 @@ class FlywheelAgent(BaseAgent):
         }
         if self._model:
             env["FW_MODEL"] = self._model
-        budget = task_budget_sec(environment.environment_name, self._timeout_multiplier)
-        wall = int(budget - WALL_MARGIN_SEC)
         cmd = (
             "cd /app 2>/dev/null || cd /; "
             # the task container is throwaway and tasks write outside /app;
