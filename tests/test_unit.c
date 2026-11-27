@@ -2987,6 +2987,11 @@ static void test_data_volume(void) {
         {"alias: nofollow link", "mv .git gd && ln -s \"/.nofollow$(pwd -P)/gd\" .git", "gd/config"},
         {"alias: vol gitdir", "mv .git gd && echo \"gitdir: /.VOL$(pwd -P)/gd\" > .git", "gd/config"},
         {"alias: resolve link", "mv .git gd && ln -s \"/.resolve$(pwd -P)/gd\" .git", "gd/config"},
+        {"alias: file gitdir", "mv .git gd && echo \"gitdir: /.file$(pwd -P)/gd\" > .git", "gd/config"},
+        {"alias: any dot link", "mv .git gd && ln -s \"/.Future$(pwd -P)/gd\" .git", "gd/config"},
+        {"dev: fd gitdir", "mv .git gd && echo 'gitdir: /dev/fd/3/gd' > .git", "gd/config"},
+        {"dev: fd link", "mv .git gd && ln -s /DEV/fd/3 .git", "gd/config"},
+        {"dev: stdin link", "mv .git gd && ln -s /dev/stdin/gd .git", "gd/config"},
     };
     struct stat st;
     if (stat("/System/Volumes/Data", &st)) { setenv("HOME", old, 1); free(old); return; }
@@ -3006,6 +3011,143 @@ static void test_data_volume(void) {
         T(how[i].name, !strncmp(o, "error:", 6) && !mentions(under(dir, how[i].config), "evil"));
         free(o);
     }
+    setenv("HOME", old, 1);
+    free(old);
+}
+
+#define HOOKS(v) "git config core.hooksPath " v
+
+/* what core.hooksPath names is run by git outside: closed like .git/hooks */
+static void test_hooks_path(void) {
+    char base[PATH_MAX], home[PATH_MAX], proj[PATH_MAX];
+    char *old = review_dirs(base, home, proj);
+    if (!old) { T("mkdtemp", false); return; }
+    char *xdg = getenv("XDG_CONFIG_HOME") ? str_dup(getenv("XDG_CONFIG_HOME")) : NULL;
+    char *glob = getenv("GIT_CONFIG_GLOBAL") ? str_dup(getenv("GIT_CONFIG_GLOBAL")) : NULL;
+    unsetenv("XDG_CONFIG_HOME");
+    unsetenv("GIT_CONFIG_GLOBAL");
+    static const char *const repo = "git init -q . && git config user.name t && git config user.email t@t"
+                                    " && git commit -qm one --allow-empty";
+    /* each in its own HOME, which holds the project. setup runs outside;
+       target: what a command and the file tools try to create, from cwd */
+    static const struct { const char *name, *setup, *cwd, *target; } how[] = {
+        {"relative", "mkdir th && " HOOKS("th"), ".", "th/pre-commit"},
+        {"absolute", "mkdir th && " HOOKS("\"$(pwd -P)/th\""), ".", "th/pre-commit"},
+        {"tilde", "mkdir th && " HOOKS("'~/p/th'"), ".", "th/pre-commit"},
+        {"not there yet", HOOKS("no/such/dir"), ".", "no/such/dir/pre-commit"},
+        {"quoted", "mkdir 't h' && printf '[Core] HooksPath = \"t h\" ; x\\n' >> .git/config", ".",
+         "'t h'/pre-commit"},
+        {"global", "mkdir th && printf '[core]\\n\\thooksPath = th\\n' > \"$HOME/.gitconfig\"", ".",
+         "th/pre-commit"},
+        {"xdg", "mkdir th \"$HOME/.config\" \"$HOME/.config/git\""
+         " && printf '[core]\\nhooksPath=th\\n' > \"$HOME/.config/git/config\"", ".", "th/pre-commit"},
+        {"include", "mkdir th && printf '[core]\\nhooksPath=th\\n' > inc.cfg"
+         " && git config include.path ../inc.cfg", ".", "th/pre-commit"},
+        {"included file", "printf '[user]\\nx=1\\n' > inc.cfg && git config include.path ../inc.cfg",
+         ".", "inc.cfg"},
+        {"included, not there", "git config include.path ../inc.cfg", ".", "inc.cfg"},
+        {"includeIf", "mkdir th && printf '[core]\\nhooksPath=th\\n' > inc.cfg"
+         " && git config includeIf.onbranch:nope.path ../inc.cfg", ".", "th/pre-commit"},
+        {"config.worktree", "mkdir th && git config extensions.worktreeConfig true"
+         " && git config --worktree core.hooksPath th", ".", "th/pre-commit"},
+        {"linked worktree", "git worktree add -q wt && mkdir wt/th && " HOOKS("th"), "wt", "th/pre-commit"},
+        {"worktree below", "git worktree add -q wt && mkdir wt/th && " HOOKS("th"), ".", "wt/th/pre-commit"},
+        {"project below", "mkdir -p sub/th && " HOOKS("sub/th"), "sub", "th/pre-commit"},
+        {"submodule", "mkdir -p .git/modules && git init -q --separate-git-dir=.git/modules/s s"
+         " && git --git-dir=.git/modules/s config core.worktree ../../../s && mkdir s/th"
+         " && git --git-dir=.git/modules/s config core.hooksPath th", ".", "s/th/pre-commit"},
+        {"linked hook", "mkdir th scripts && : > scripts/pc && ln -s ../scripts/pc th/pre-commit && "
+         HOOKS("th"), ".", "scripts/pc"},
+        {"husky script", "mkdir -p .husky/_ && " HOOKS(".husky/_/"), ".", ".husky/pre-commit"},
+        {"husky stub", "mkdir -p .husky/_ && " HOOKS(".husky/_"), ".", ".husky/_/pre-commit"},
+    };
+    for (int i = 0; i < (int)(sizeof how / sizeof *how); i++) {
+        char h[PATH_MAX], dir[PATH_MAX], at[PATH_MAX], cmd[600], rel[100];
+        snprintf(h, sizeof h, "%s/h%d", base, i);
+        snprintf(dir, sizeof dir, "%s/h%d/p", base, i);
+        mkdir(h, 0700);
+        mkdir(dir, 0700);
+        setenv("HOME", h, 1);
+        host(dir, repo);
+        host(dir, how[i].setup);
+        snprintf(at, sizeof at, "%s%s%s", dir, strcmp(how[i].cwd, ".") ? "/" : "",
+                 strcmp(how[i].cwd, ".") ? how[i].cwd : "");
+        in_dir(at);
+        snprintf(rel, sizeof rel, "%s", how[i].target);
+        if (rel[0] == '\'') snprintf(rel, sizeof rel, "t h/pre-commit");
+        snprintf(cmd, sizeof cmd, "mkdir -p \"$(dirname %s)\"; echo 'touch PWNED' >> %s; echo ran > ran",
+                 how[i].target, how[i].target);
+        char *o = run_bash(cmd, at, 30);
+        char file[PATH_MAX * 2];
+        snprintf(file, sizeof file, "%s/%s", at, rel);
+        T(how[i].name, !gone(at, "ran") && !mentions(file, "PWNED"));
+        free(o);
+        refused(how[i].name, tool_write_file(at, rel, "touch PWNED\n"));
+        T(how[i].name, !mentions(file, "PWNED"));
+        free(tool_write_file(at, "other", "x"));
+        T(how[i].name, holds(under(at, "other"), "x"));
+        if (!strcmp(how[i].name, "worktree below")) {
+            /* nor may a command make the next one lose sight of it */
+            free(run_bash("rm -f .git/worktrees/wt/gitdir", at, 30));
+            T(how[i].name, !gone(at, ".git/worktrees/wt/gitdir"));
+        }
+        /* not from a submodule, nor below the repository: .git is out of reach there */
+        if (strcmp(how[i].name, "submodule") && strcmp(how[i].name, "project below")) {
+            int code = -1;
+            o = run_bash_status("echo a > a && git add a && git commit -qm a", at, 30, &code);
+            T(how[i].name, !code);
+            free(o);
+        }
+    }
+
+    /* the whole project, or what cannot be resolved: nothing runs, and it says why */
+    static const struct { const char *name, *setup; } stop[] = {
+        {"hooks: dot", HOOKS(".")},
+        {"hooks: project", HOOKS("\"$(pwd -P)\"")},
+        {"hooks: above", HOOKS("..")},
+        {"hooks: root", HOOKS("/")},
+        {"hooks: link to project", "ln -s . self && " HOOKS("self")},
+        {"hooks: global dot", "printf '[core]\\nhooksPath=.\\n' > \"$HOME/.gitconfig\""},
+        {"hooks: husky is the project", "ln -s . .husky && mkdir _ && " HOOKS(".husky/_")},
+        {"hooks: unknown user", HOOKS("'~no-such-user-fw/h'")},
+        {"hooks: prefix", HOOKS("'%(prefix)/h'")},
+        {"hooks: broken config", "printf '[core\\n' >> \"$HOME/.gitconfig\""},
+        {"hooks: include loop", "git config include.path config"},
+    };
+    for (int i = 0; i < (int)(sizeof stop / sizeof *stop); i++) {
+        char h[PATH_MAX], dir[PATH_MAX];
+        snprintf(h, sizeof h, "%s/s%d", base, i);
+        snprintf(dir, sizeof dir, "%s/s%d/p", base, i);
+        mkdir(h, 0700);
+        mkdir(dir, 0700);
+        setenv("HOME", h, 1);
+        host(dir, repo);
+        host(dir, stop[i].setup);
+        in_dir(dir);
+        char *o = run_bash("echo ran > ran", dir, 30);
+        T(stop[i].name, !strncmp(o, "error:", 6) && gone(dir, "ran")
+          && (strstr(o, "core.hooksPath") || strstr(o, "cannot follow or read ")));
+        free(o);
+        o = tool_write_file(dir, "ran", "x");
+        T(stop[i].name, !strncmp(o, "error:", 6) && gone(dir, "ran"));
+        free(o);
+    }
+
+    /* /dev/null turns hooks off: nothing to close, and it stays writable */
+    setenv("HOME", home, 1);
+    host(proj, repo);
+    host(proj, HOOKS("/dev/null") " && rm -rf .git/hooks && ln -s /dev/null .git/hooks");
+    in_dir(proj);
+    int code = -1;
+    char *o = run_bash_status("echo x > /dev/null && echo a > a && git add a && git commit -qm a", proj,
+                              30, &code);
+    T("hooks: /dev/null", !code);
+    free(o);
+
+    if (xdg) setenv("XDG_CONFIG_HOME", xdg, 1);
+    if (glob) setenv("GIT_CONFIG_GLOBAL", glob, 1);
+    free(xdg);
+    free(glob);
     setenv("HOME", old, 1);
     free(old);
 }
@@ -3244,6 +3386,7 @@ int main(void) {
         test_unreadable_git();
         test_hook_links();
         test_data_volume();
+        test_hooks_path();
         test_sandbox();
         test_sandbox_escapes();
         test_nested_git();

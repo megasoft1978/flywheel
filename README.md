@@ -138,10 +138,18 @@ untrusted repository or task in a VM.
   repository (or has a `HEAD` file), the same names are closed there. Every link and `gitdir:` or
   `commondir` file on the way to the project's protected files is closed too, so none can be pointed
   elsewhere, and so is whatever a linked hook in a protected hooks directory leads to. A path
-  through `/System/Volumes/Data`, `/.nofollow`, `/.vol` or `/.resolve` (second spellings the rules
-  would miss) is refused. If the rules cannot be built, a store is a link that cannot be followed (a loop), or a protected file or git
+  through `/System/Volumes/Data`, a name at the root starting with a dot (`/.vol`, `/.nofollow`:
+  second spellings the rules would miss) or `/dev` (other than `/dev/null`) is refused. If the rules cannot be built, a store is a link that cannot be followed (a loop), or a protected file or git
   directory cannot be followed or read (a loop, or no permission), the command is not run and the
   file tools do not write; the message names the path.
+- What `core.hooksPath` names is closed like `.git/hooks`, also to the file tools and before it
+  exists; for husky's `.husky/_`, all of `.husky`. Every value in the system, global, repository,
+  worktree and submodule configs counts, also one that another overrides, and every `include` and
+  `includeIf` file is followed whatever its condition; those config files are closed too. Linked
+  hooks directly in such a directory are followed. If a value covers the whole project (`.`, the
+  project root or a directory above it), cannot be resolved (`%(prefix)`, an unknown `~user`) or a
+  config cannot be read or parsed, no command runs, the file tools do not write, and the message
+  says why. `/dev/null` turns hooks off and is fine.
 - A command that was given the network has all its processes killed when it ends, detached ones
   included, so that none keeps that access. Other background processes (a dev server) keep
   running, still inside the sandbox.
@@ -166,7 +174,9 @@ What stops working inside it:
 - Tools that write under `$HOME`: package caches and global installs (`cargo`, `pip --user`,
   Gradle and the like). Fetch dependencies yourself first.
 - `git init`, and anything that writes `.git/config` or hooks: `git config`, `git remote add`,
-  `git push -u`, `git branch -u`, hook installers such as husky or `pre-commit install`. `add`,
+  `git push -u`, `git branch -u`, hook installers such as husky or `pre-commit install`.
+  Neither can anything that changes a `core.hooksPath` directory, such as editing `.husky/` or a
+  checkout, merge or stash that touches files tracked there. `add`,
   `commit`, branches and stash work in the project's own repository. Git may report success
   although the setting was not saved; the tool output says so.
 - `git init`, `clone`, `worktree add` and `submodule add` anywhere below the project, also in
@@ -191,8 +201,8 @@ What stops working inside it:
 Where it does not protect you:
 
 - Other files inside the project can be changed, including build scripts, `Makefile`,
-  `package.json` and hook directories named by `core.hooksPath` (such as `.husky`). You or your
-  editor may later run them **outside** the sandbox.
+  `package.json` and the scripts your hooks call from elsewhere. You or your editor may later run
+  them **outside** the sandbox.
 - Only a `.git` and what is under it is recognized by name. A bare repository under another name,
   existing or written by hand (`HEAD`, `objects`, `refs`, `config`), can be created and changed
   by commands (and assembled with the file tools), and git run later inside it obeys it; the same holds for the target of a `.git`
@@ -200,8 +210,9 @@ Where it does not protect you:
   or submodule hook links, point to, for hard links that already exist, and for new directories
   under a `.git/modules/<group>/` of submodules with a `/` in their name.
 - Links in subdirectories of a hooks directory are not followed: what they point to can be changed.
-- Files that git config pulls in through `include.path` or `includeIf`: if one is inside the
-  project (or `$TMPDIR`), commands can change it, and git outside the sandbox obeys it.
+- `core.hooksPath` is looked for in the repository the project is in, its submodules and its
+  worktrees inside the project. Not in other repositories below the project, in the system config
+  of a git installed somewhere unusual, or in `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG_COUNT`.
 - Started in your home directory (or above it), the sandbox makes all of it writable, except the
   stores listed above.
 - A store reached through a chain of several symlinks is protected at both ends, but a link in the

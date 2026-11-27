@@ -1429,12 +1429,16 @@ typedef enum {
 } Node;
 typedef void (*NodeFn)(Node kind, const char *path, void *arg);
 
-static char sbx_blocked[PATH_MAX];   /* what could not be followed or read */
+static char sbx_blocked[PATH_MAX];   /* what stopped the rules */
+static const char *sbx_reason;        /* and why */
 
-static bool cannot(const char *path) {
+static bool refuse(const char *reason, const char *path) {
+    sbx_reason = reason;
     snprintf(sbx_blocked, sizeof sbx_blocked, "%s", path);
     return false;
 }
+
+static bool cannot(const char *path) { return refuse("cannot follow or read", path); }
 
 static bool absent(void) { return errno == ENOENT || errno == ENOTDIR; }
 
@@ -1447,10 +1451,10 @@ static bool data_volume(const char *path, const struct stat *st) {
         || (st && !stat(data, &d) && d.st_dev == st->st_dev && d.st_ino == st->st_ino);
 }
 
-/* nor through the other root prefixes that spell a path again */
-static bool alias_root(const char *path) {
-    return !strcasecmp(path, "/.nofollow") || !strcasecmp(path, "/.vol")
-        || !strcasecmp(path, "/.resolve");
+/* nor through a dot name at the root (/.vol, /.nofollow, /.resolve, /.file and
+   whatever comes next), nor through /dev, where fd/N is the opener's */
+static bool alias_path(const char *path) {
+    return path[1] == '.' || (!strncasecmp(path, "/dev/", 5) && strcasecmp(path, "/dev/null"));
 }
 
 /* Follow the absolute path one component at a time, reporting every step. A
@@ -1482,7 +1486,7 @@ static bool walk(const char *path, bool closed, char *out, NodeFn fn, void *arg)
             if (!absent()) return cannot(out);
             there = false;
         }
-        if (alias_root(out) || data_volume(out, there ? &st : NULL)) return cannot(path);
+        if (alias_path(out) || data_volume(out, there ? &st : NULL)) return cannot(path);
         if (there && S_ISLNK(st.st_mode)) {
             ssize_t n = readlink(out, link, sizeof link - 1);
             if (n < 0 || ++hops > 32) return cannot(out);
@@ -1597,9 +1601,8 @@ static bool walk_common(const char *gitdir, NodeFn fn, void *arg) {
     return walk(next, false, out, fn, arg) && walk_files(out, GIT_CLOSED, fn, arg);
 }
 
-/* every step to every protected file of the project: SBX_PROJ, and the same
-   files wherever .git, gitdir: and commondir lead */
-static bool each_protected(const char *proj, NodeFn fn, void *arg) {
+/* SBX_PROJ, and the same files wherever .git, gitdir: and commondir lead */
+static bool each_gitfile(const char *proj, NodeFn fn, void *arg) {
     char p[PATH_MAX], other[PATH_MAX];
     struct stat st;
     if (!walk_files(proj, SBX_PROJ, fn, arg)) return false;
@@ -1613,6 +1616,354 @@ static bool each_protected(const char *proj, NodeFn fn, void *arg) {
         if (!S_ISDIR(st.st_mode)) return true;
     }
     return walk_common(moved ? other : p, fn, arg);
+}
+
+/* ----- core.hooksPath -----
+   What it names is run by git outside, like .git/hooks. The configs are read
+   here (asking git would run what PATH or the repository chose), every value of
+   every one counts, and every include is followed whatever its condition. */
+
+#define CFG_MAX (256 * 1024)
+#define CFG_VALUES 16
+#define CFG_FILES 64
+
+typedef struct { char *v[CFG_VALUES]; int n; } Values;
+typedef struct {
+    const char *proj;
+    NodeFn fn;
+    void *arg;
+    Values hooks, tree;     /* core.hooksPath, core.worktree */
+    int files;              /* read for the current repository */
+} Hooks;
+
+static void values_cut(Values *v, int n) {
+    while (v->n > n) free(v->v[--v->n]);
+}
+
+static bool values_add(Values *v, const char *s) {
+    for (int i = 0; i < v->n; i++)
+        if (!strcmp(v->v[i], s)) return true;
+    if (v->n == CFG_VALUES) return false;
+    v->v[v->n++] = str_dup(s);
+    return true;
+}
+
+static bool join(char *out, const char *dir, const char *rel) {
+    return snprintf(out, PATH_MAX, "%s%s%s", *rel == '/' ? "" : dir, *rel == '/' ? "" : "/", rel)
+           < PATH_MAX;
+}
+
+/* a path value as git reads it: ~ and ~user. False for what cannot be known. */
+static bool cfg_expand(const char *v, char *out) {
+    if (!strncmp(v, "%(", 2) || !strncmp(v, ":(", 2)) return false;
+    if (*v != '~') return snprintf(out, PATH_MAX, "%s", v) < PATH_MAX;
+    size_t n = strcspn(v + 1, "/");
+    char user[256];
+    if (n >= sizeof user) return false;
+    snprintf(user, sizeof user, "%.*s", (int)n, v + 1);
+    const struct passwd *pw = n ? getpwnam(user) : NULL;
+    const char *home = n ? (pw ? pw->pw_dir : NULL) : getenv("HOME");
+    return home && *home && snprintf(out, PATH_MAX, "%s%s", home, v + 1 + n) < PATH_MAX;
+}
+
+static bool cfg_file(Hooks *h, const char *path, int depth);
+
+/* one key; val is NULL when there is none or it does not fit */
+static bool cfg_key(Hooks *h, const char *path, const char *sec, bool sub, const char *key,
+                    const char *val, int depth) {
+    bool core = !sub && !strcmp(sec, "core");
+    bool hooks = core && !strcmp(key, "hookspath"), tree = core && !strcmp(key, "worktree");
+    bool inc = !strcmp(key, "path")
+        && (sub ? !strcmp(sec, "includeif") : !strcmp(sec, "include"));
+    if (!hooks && !tree && !inc) return true;
+    if (!val) return cannot(path);
+    if (!inc) return values_add(hooks ? &h->hooks : &h->tree, val) || cannot(path);
+    char file[PATH_MAX], dir[PATH_MAX], full[PATH_MAX];
+    if (!*val) return true;
+    parent_of(path, dir);
+    if (!cfg_expand(val, file) || !join(full, dir, file)) return cannot(path);
+    return cfg_file(h, full, depth + 1);
+}
+
+/* the value after '=', up to the end of its line; NULL for bad syntax */
+static const char *cfg_value(const char *s, char *out, bool *fits) {
+    size_t n = 0, keep = 0;
+    bool quote = false;
+    *fits = true;
+    s += strspn(s, " \t");
+    for (;; s++) {
+        char c = *s;
+        bool literal = false;
+        if (c == '\r' && s[1] == '\n') c = *++s;
+        if (!c || c == '\n') break;
+        if (!quote && (c == '#' || c == ';')) { s += strcspn(s, "\n"); break; }
+        if (c == '"') { quote = !quote; keep = n; continue; }
+        if (c == '\\') {
+            c = *++s;
+            if (c == '\r' && s[1] == '\n') c = *++s;
+            if (c == '\n') continue;
+            if (c == 'n') c = '\n';
+            else if (c == 't') c = '\t';
+            else if (c == 'b') c = '\b';
+            else if (c != '"' && c != '\\') return NULL;
+            literal = true;
+        }
+        if (n + 1 >= PATH_MAX) { *fits = false; continue; }
+        out[n++] = c;
+        if (quote || literal || !isspace((unsigned char)c)) keep = n;
+    }
+    out[keep] = 0;
+    return quote ? NULL : s;
+}
+
+/* git's config syntax; anything else fails */
+static bool cfg_parse(Hooks *h, const char *path, const char *s, int depth) {
+    char sec[32] = "", key[32], val[PATH_MAX];
+    bool sub = false;
+    if (!strncmp(s, "\xef\xbb\xbf", 3)) s += 3;
+    for (;;) {
+        s += strspn(s, " \t\r\n");
+        if (!*s) return true;
+        if (*s == '#' || *s == ';') { s += strcspn(s, "\n"); continue; }
+        size_t n = 0;
+        if (*s == '[') {
+            sub = false;
+            for (s++; isalnum((unsigned char)*s) || *s == '-' || *s == '.'; s++) {
+                if (*s == '.') sub = true;
+                else if (!sub && n + 1 < sizeof sec) sec[n++] = (char)tolower((unsigned char)*s);
+            }
+            sec[n] = 0;
+            if (*s == ' ' || *s == '\t') {
+                s += strspn(s, " \t");
+                if (*s++ != '"') return cannot(path);
+                for (sub = true; *s && *s != '"' && *s != '\n'; s++)
+                    if (*s == '\\' && s[1]) s++;
+                if (*s++ != '"') return cannot(path);
+            }
+            if (*s++ != ']') return cannot(path);
+            continue;
+        }
+        if (!isalpha((unsigned char)*s)) return cannot(path);
+        for (; isalnum((unsigned char)*s) || *s == '-'; s++)
+            if (n + 1 < sizeof key) key[n++] = (char)tolower((unsigned char)*s);
+        key[n] = 0;
+        s += strspn(s, " \t");
+        bool fits = false;
+        if (*s == '=') {
+            if (!(s = cfg_value(s + 1, val, &fits))) return cannot(path);
+        } else if (*s && !strchr("\r\n#;", *s)) return cannot(path);
+        if (!cfg_key(h, path, sec, sub, key, fits ? val : NULL, depth)) return false;
+    }
+}
+
+/* one config file: closed, there or not, since it can name a hooks directory */
+static bool cfg_file(Hooks *h, const char *path, int depth) {
+    char at[PATH_MAX];
+    if (!walk(path, true, at, h->fn, h->arg)) return false;
+    struct stat st;
+    if (stat(at, &st)) return absent() || cannot(at);
+    if (S_ISCHR(st.st_mode)) return true;   /* /dev/null */
+    if (!S_ISREG(st.st_mode) || depth > 10 || ++h->files > CFG_FILES) return cannot(at);
+    char *buf = malloc(CFG_MAX);
+    ssize_t n = read_small(at, buf, CFG_MAX);
+    bool ok = n >= 0 && n == (ssize_t)strlen(buf) ? cfg_parse(h, path, buf, depth) : cannot(at);
+    free(buf);
+    return ok;
+}
+
+static bool cfg_in(Hooks *h, const char *dir, const char *name) {
+    char p[PATH_MAX];
+    return join(p, dir, name) ? cfg_file(h, p, 0) : cannot(dir);
+}
+
+/* system and global: every place a git on this machine may look */
+static bool cfg_global(Hooks *h) {
+    static const char *const fixed[] = {
+        "/etc/gitconfig", "/opt/homebrew/etc/gitconfig", "/usr/local/etc/gitconfig",
+        "/opt/local/etc/gitconfig",
+        "/Applications/Xcode.app/Contents/Developer/usr/share/git-core/gitconfig",
+        "/Library/Developer/CommandLineTools/usr/share/git-core/gitconfig", NULL
+    };
+    static const char *const env[] = {"GIT_CONFIG_SYSTEM", "GIT_CONFIG_GLOBAL", NULL};
+    for (int i = 0; fixed[i]; i++)
+        if (!cfg_file(h, fixed[i], 0)) return false;
+    for (int i = 0; env[i]; i++) {
+        const char *v = getenv(env[i]);
+        char p[PATH_MAX];
+        if (v && *v && !(join(p, h->proj, v) ? cfg_file(h, p, 0) : cannot(v))) return false;
+    }
+    const char *xdg = getenv("XDG_CONFIG_HOME"), *home = getenv("HOME");
+    if (xdg && *xdg == '/' && !cfg_in(h, xdg, "git/config")) return false;
+    return !home || *home != '/'
+        || (cfg_in(h, home, ".config/git/config") && cfg_in(h, home, ".gitconfig"));
+}
+
+/* the directory is or contains `inner` */
+static bool covers(const char *dir, const char *inner) {
+    return !strcmp(dir, "/") || path_under(dir, inner);
+}
+
+static bool hooks_dir(Hooks *h, const char *path, const char *tree) {
+    char at[PATH_MAX];
+    if (!walk(path, true, at, h->fn, h->arg)) return false;
+    if (covers(at, h->proj) || (tree && covers(at, tree)))
+        return refuse("core.hooksPath covers the whole project:", path);
+    return walk_hooks(at, h->fn, h->arg);
+}
+
+/* husky points git at .husky/_, whose stubs run the scripts in .husky */
+static bool husky_stubs(const char *path) {
+    size_t n = strlen(path);
+    return n >= 9 && !strcasecmp(path + n - 9, "/.husky/_");
+}
+
+/* every core.hooksPath value, as seen from one work tree (or git directory);
+   NULL: no repository, only an absolute value means anything */
+static bool hooks_apply(Hooks *h, const char *tree) {
+    for (int i = 0; i < h->hooks.n; i++) {
+        const char *v = h->hooks.v[i];
+        if (!*v || !strcmp(v, "/dev/null")) continue;
+        char dir[PATH_MAX], full[PATH_MAX], at[PATH_MAX], up[PATH_MAX];
+        if (!cfg_expand(v, dir)) return refuse("cannot resolve core.hooksPath", v);
+        if (*dir != '/' && !tree) continue;
+        if (!join(full, tree ? tree : "", dir)) return refuse("cannot resolve core.hooksPath", v);
+        for (size_t n = strlen(full); n > 1 && full[n - 1] == '/'; ) full[--n] = 0;
+        if (!hooks_dir(h, full, tree)) return false;
+        if (husky_stubs(full)) {
+            parent_of(full, up);
+            if (!hooks_dir(h, up, tree)) return false;
+        }
+        if (realpath(full, at) && husky_stubs(at)) {
+            parent_of(at, up);
+            if (!hooks_dir(h, up, tree)) return false;
+        }
+    }
+    return true;
+}
+
+/* the work trees core.worktree names, relative to the git directory */
+static bool hooks_trees(Hooks *h, const char *gitdir) {
+    for (int i = 0; i < h->tree.n; i++) {
+        char dir[PATH_MAX], full[PATH_MAX];
+        if (!cfg_expand(h->tree.v[i], dir) || !join(full, gitdir, dir)) return cannot(gitdir);
+        if (!hooks_apply(h, full)) return false;
+    }
+    return true;
+}
+
+/* every submodule git directory below `dir`, with its own config */
+static bool hooks_modules(Hooks *h, const char *dir, int depth) {
+    DIR *d = opendir(dir);
+    if (!d) return absent() || cannot(dir);
+    bool ok = depth <= 8 || cannot(dir);
+    struct dirent *e;
+    while (ok && (errno = 0, e = readdir(d))) {
+        char p[PATH_MAX], sub[PATH_MAX];
+        struct stat st;
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        if (!join(p, dir, e->d_name)) { ok = cannot(dir); break; }
+        if (stat(p, &st)) { ok = absent() || cannot(p); continue; }
+        if (!S_ISDIR(st.st_mode)) continue;
+        if (!has_entry(p, "config") && !has_entry(p, "HEAD")) {
+            ok = hooks_modules(h, p, depth + 1);
+            continue;
+        }
+        int hooks = h->hooks.n, tree = h->tree.n;
+        h->files = 0;
+        ok = cfg_in(h, p, "config") && cfg_in(h, p, "config.worktree")
+             && (h->tree.n > tree ? hooks_trees(h, p) : hooks_apply(h, NULL));
+        values_cut(&h->hooks, hooks);
+        values_cut(&h->tree, tree);
+        if (ok) ok = join(sub, p, "modules") ? hooks_modules(h, sub, depth + 1) : cannot(p);
+    }
+    if (ok && errno) ok = cannot(dir);
+    closedir(d);
+    return ok;
+}
+
+/* the linked worktrees that lie inside the project */
+static bool hooks_worktrees(Hooks *h, const char *common) {
+    char dir[PATH_MAX];
+    if (!join(dir, common, "worktrees")) return cannot(common);
+    DIR *d = opendir(dir);
+    if (!d) return absent() || cannot(dir);
+    bool ok = true;
+    struct dirent *e;
+    while (ok && (errno = 0, e = readdir(d))) {
+        char wt[PATH_MAX], file[PATH_MAX], line[PATH_MAX], git[PATH_MAX], tree[PATH_MAX];
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        if (!join(wt, dir, e->d_name) || !join(file, wt, "gitdir")) { ok = cannot(dir); break; }
+        if (!first_line(file, line, sizeof line)) continue;
+        if (!join(git, wt, line)) { ok = cannot(file); break; }
+        parent_of(git, tree);
+        char at[PATH_MAX];
+        if (!realpath(tree, at) || !is_within(h->proj, at)) continue;
+        /* without this file the next command would not find the work tree */
+        char kept[PATH_MAX];
+        if (!walk(file, true, kept, h->fn, h->arg)) { ok = false; break; }
+        int hooks = h->hooks.n;
+        ok = cfg_in(h, wt, "config.worktree") && hooks_apply(h, at);
+        values_cut(&h->hooks, hooks);
+    }
+    if (ok && errno) ok = cannot(dir);
+    closedir(d);
+    return ok;
+}
+
+/* the configs of the repository the project is in, then of what is inside it */
+static bool hooks_repo(Hooks *h) {
+    char top[PATH_MAX], gitdir[PATH_MAX], common[PATH_MAX], p[PATH_MAX], line[PATH_MAX];
+    snprintf(top, sizeof top, "%s", h->proj);
+    bool bare = false, found = false;
+    for (bool first = true; ; first = false) {
+        if (has_entry(top, ".git")) found = true;
+        else if (first ? root_bare(top) : bare_like(top)) found = bare = true;
+        char *s = strrchr(top, '/');
+        if (found || !s || !s[1]) break;
+        s[s == top] = 0;
+    }
+    if (!found) return hooks_apply(h, NULL);
+    if (bare) snprintf(gitdir, sizeof gitdir, "%s", top);
+    else {
+        int moved = gitdir_elsewhere(top, gitdir, no_node, NULL);
+        if (moved < 0) return false;
+        if (!moved && !join(gitdir, top, ".git")) return cannot(top);
+    }
+    snprintf(common, sizeof common, "%s", gitdir);
+    struct stat st;
+    if (!join(p, gitdir, "commondir")) return cannot(gitdir);
+    if (!stat(p, &st) && S_ISREG(st.st_mode)) {
+        if (read_small(p, line, sizeof line) < 0) return cannot(p);
+        line[strcspn(line, "\r\n")] = 0;
+        if (*line && !join(common, gitdir, line)) return cannot(p);
+    } else if (stat(p, &st) && !absent()) return cannot(p);
+
+    int hooks = h->hooks.n, tree = h->tree.n;
+    h->files = 0;
+    if (!cfg_in(h, common, "config") || !cfg_in(h, common, "config.worktree")
+        || !cfg_in(h, gitdir, "config") || !cfg_in(h, gitdir, "config.worktree")
+        || !hooks_apply(h, top) || !hooks_trees(h, gitdir) || !hooks_worktrees(h, common))
+        return false;
+    values_cut(&h->hooks, hooks);
+    values_cut(&h->tree, tree);
+    if (!join(p, gitdir, "modules") || !hooks_modules(h, p, 0)) return false;
+    return !strcmp(common, gitdir) || (join(p, common, "modules") && hooks_modules(h, p, 0));
+}
+
+static bool hooks_paths(const char *proj, NodeFn fn, void *arg) {
+    Hooks h = {.proj = proj, .fn = fn, .arg = arg};
+    bool ok = cfg_global(&h) && hooks_repo(&h);
+    values_cut(&h.hooks, 0);
+    values_cut(&h.tree, 0);
+    return ok;
+}
+
+static bool sbx_probing;    /* the availability probe is not about any project */
+
+/* every step to every protected file of the project, and to what its
+   core.hooksPath names */
+static bool each_protected(const char *proj, NodeFn fn, void *arg) {
+    return each_gitfile(proj, fn, arg) && (sbx_probing || hooks_paths(proj, fn, arg));
 }
 
 /* ---------- linked worktree: git keeps its files outside the project ---------- */
@@ -1670,8 +2021,11 @@ static void sb_node(Node kind, const char *path, void *arg) {
     const Rules *r = arg;
     if (r->pins) {
         if (kind == N_PIN) sb_pin(r->b, path);
-    } else if (kind == N_CLOSED) sb_path(r->b, path);
-    else if (kind != N_PIN && strncmp(path, "/dev/", 5)) sb_pin(r->b, path);
+        return;
+    }
+    if (!strcasecmp(path, "/dev/null")) return;     /* links to it stay writable */
+    if (kind == N_CLOSED) sb_path(r->b, path);
+    else if (kind != N_PIN) sb_pin(r->b, path);
 }
 
 /* the protected files of the project: closed, along with every link and gitfile
@@ -1906,7 +2260,9 @@ bool sandbox_available(void) {
 #ifdef __APPLE__
     /* run something under a real profile: a nested sandbox or a policy that
        blocks sandbox-exec must count as unavailable */
+    sbx_probing = true;
     char *prof = sbx_profile("/usr/share", NULL, false, NULL);
+    sbx_probing = false;
     if (!prof) return false;
     pid_t pid = fork();
     if (pid == 0) {
@@ -2040,8 +2396,9 @@ static char *run_command(const char *cmd, const char *cwd, int timeout_s, int *c
             if (each_secret(secret_unresolved, NULL)
                 || !(prof = sbx_profile(cwd, tmp, net, *mark ? mark : NULL))) {
                 char why[PATH_MAX + 128];
-                snprintf(why, sizeof why, "error: cannot set up the sandbox for this directory%s%s"
-                         " — not executed", *sbx_blocked ? ": cannot follow or read " : "", sbx_blocked);
+                snprintf(why, sizeof why, "error: cannot set up the sandbox for this directory%s%s%s%s"
+                         " — not executed", *sbx_blocked ? ": " : "", *sbx_blocked ? sbx_reason : "",
+                         *sbx_blocked ? " " : "", sbx_blocked);
                 return str_dup(why);
             }
         }
@@ -2737,7 +3094,8 @@ static const char *protected_write(const char *cwd, const char *abs) {
     int moved = each_protected(root, guard_node, &g)
                 ? gitdir_elsewhere(root, other, no_node, NULL) : -1;
     if (moved < 0) {
-        snprintf(unsure, sizeof unsure, "error: cannot follow or read %s — not written", sbx_blocked);
+        snprintf(unsure, sizeof unsure, "error: %s %s — not written",
+                 *sbx_blocked ? sbx_reason : "cannot follow or read", sbx_blocked);
         return unsure;
     }
     if (g.hit) return why;
