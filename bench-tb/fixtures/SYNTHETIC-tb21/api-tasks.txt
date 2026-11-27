@@ -3,3 +3,5 @@ terminal-bench/zeta-task
 terminal-bench/eta-task
 terminal-bench/iota-task
 terminal-bench/theta-task
+terminal-bench/kappa-task
+terminal-bench/lambda-task

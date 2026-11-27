@@ -1,0 +1,2 @@
+{"type":"step_start","timestamp":1767225600000,"sessionID":"ses_SYNTHETIC","part":{"type":"step-start"}}
+{"type":"error","timestamp":1767225600000,"sessionID":"ses_SYNTHETIC","error":{"name":"UnknownError","data":{"message":"read ECONNRESET: connection reset by peer"}}}

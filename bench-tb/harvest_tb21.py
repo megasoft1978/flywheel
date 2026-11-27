@@ -7,7 +7,7 @@ stdlib only; run as: python3 -I harvest_tb21.py JOB_DIR [JOB_DIR ...] [--tasks F
 Reads every <job>/<trial>/result.json. Task names are compared without
 the "terminal-bench/" namespace. Per task:
   error    Harbor marks the reward invalid for the exception (checked first, any reward ignored),
-           or OpenCode reported an API or transport error (not a context overflow);
+           or OpenCode's event log has an API or transport error (and no context overflow);
            or no reward after an infrastructure (or unknown) exception, after verification ran
            and failed itself, or with no exception at all
   pass     verifier reward == 1.0 (also when the trial raised, e.g. AgentTimeoutError)
@@ -28,7 +28,7 @@ dataset, dataset digest, timeout overrides), or the list is not the 89-task list
 Result fields used (harbor 0.27.0 TrialResult): task_name, trial_name, agent_info.name,
 config.{task.source, agent, verifier, *timeout_multiplier}, verifier_result.rewards.reward,
 exception_info.{exception_type, policy}, verifier.started_at, started_at, finished_at;
-job config.json datasets[0].ref.
+job config.json datasets[0].ref; for OpenCode, <trial>/agent/opencode.txt error events.
 
 Outputs (in --out, default ./harvest-out): results.json, report.md,
   chart_rates.svg (bars + 95% Wilson whiskers), chart_grid.svg (task x harness pass/fail grid),
@@ -44,6 +44,8 @@ import math
 import os
 import re
 import sys
+import urllib.parse
+import urllib.request
 
 Z95 = 1.959963984540054
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -82,12 +84,15 @@ INVALID_REWARD_EXCEPTIONS = {
     "ServiceOperationsUnsupportedError", "VercelScopeError", "DspyImportError", "MissingExtraError",
     "RegradeError", "CancelledError",
 }
-# OpenCode reports its error events as NonZeroAgentExitCodeError. API or transport causes are infra
-# errors like flywheel's ApiError; a context-size rejection stays an agent fail.
-OPENCODE_EVENT = "OpenCode emitted error event"
+# OpenCode failures reach Harbor as NonZeroAgentExitCodeError whose message holds the command, so
+# the task text: the cause is read only from the error events in its `run --format=json` log. API or
+# transport causes are infra errors like flywheel's ApiError; a context-size rejection stays a fail.
+# Each event is one line, JSON.stringify({type, timestamp, sessionID, error: {name, data}}).
+OPENCODE_ERROR_PREFIX = '{"type":"error","timestamp":'
+OPENCODE_API_NAMES = {"APIError", "ProviderAuthError"}
 OPENCODE_API_ERROR = re.compile(
-    r"\b5\d\d\b|internal server error|connection ?(reset|refused|closed|error)|econnreset"
-    r"|econnrefused|socket hang up|transport|api ?(error|connection)", re.IGNORECASE)
+    r"cannot connect to api|\b5\d\d\b|internal server error|connection ?(reset|refused|closed|error)"
+    r"|econnreset|econnrefused|socket hang up|transport|api ?(error|connection)", re.IGNORECASE)
 # same wording as bench-tb/flywheel_agent.py
 CONTEXT_OVERFLOW = re.compile(
     r"context.{0,24}(length|window|size|limit)|maximum context|prompt is too long|exceeds? the context",
@@ -156,14 +161,55 @@ def provenance(harness, d):
     return bad
 
 
-def classify(d):
+def opencode_errors(trial_dir):
+    """The error objects of the error events in a trial's OpenCode log. The log is model-influenced:
+    only a whole line with the event envelope counts."""
+    path = os.path.join(trial_dir, "agent", "opencode.txt")
+    found = []
+    if os.path.islink(path) or not os.path.isfile(path):
+        return found
+    with open(path, "rb") as fh:
+        for raw in fh:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith(OPENCODE_ERROR_PREFIX):
+                continue
+            try:
+                event = json.loads(line)
+            except (ValueError, RecursionError):
+                continue
+            error = event.get("error")
+            if (event.get("type") == "error" and str(event.get("sessionID", "")).startswith("ses")
+                    and isinstance(error, dict)):
+                found.append(error)
+    return found
+
+
+def opencode_api_failure(errors):
+    api = False
+    for error in errors:
+        name = str(error.get("name") or "")
+        data = error.get("data") if isinstance(error.get("data"), dict) else {}
+        message = str(data.get("message") or "")
+        code = data.get("statusCode")
+        if name == "ContextOverflowError" or CONTEXT_OVERFLOW.search(message):
+            return False
+        api = api or (name in OPENCODE_API_NAMES or bool(OPENCODE_API_ERROR.search(message))
+                      or (isinstance(code, int) and (code == 429 or 500 <= code < 600)))
+    return api
+
+
+def classify(d, trial_dir=None):
+    """trial_dir defaults to the result's trial_uri."""
     rec = {"status": None, "reward": None, "reason": None, "seconds": None,
            "timeout": False, "trial": d.get("trial_name")}
     info = d.get("exception_info") or {}
     exc = info.get("exception_type")
-    msg = str(info.get("exception_message") or "")
-    opencode_api = (exc == "NonZeroAgentExitCodeError" and OPENCODE_EVENT in msg
-                    and bool(OPENCODE_API_ERROR.search(msg)) and not CONTEXT_OVERFLOW.search(msg))
+    opencode_api = False
+    if exc == "NonZeroAgentExitCodeError" and (d.get("agent_info") or {}).get("name") == "opencode":
+        uri = urllib.parse.urlparse(str(d.get("trial_uri") or ""))
+        if not trial_dir and uri.scheme == "file":
+            trial_dir = urllib.request.url2pathname(uri.path)
+        opencode_api = bool(trial_dir) and opencode_api_failure(opencode_errors(trial_dir))
     invalid = (exc in INVALID_REWARD_EXCEPTIONS or opencode_api
                or (info.get("policy") or {}).get("has_valid_reward") is False)
     verified = bool((d.get("verifier") or {}).get("started_at"))
@@ -210,7 +256,7 @@ def read_job(job_dir, harness, digest, expected):
         ref = (job.get("datasets") or [{}])[0].get("ref")
         if ref != digest:
             problems.append(f"{task}: job dataset digest is {ref!r}, expected {digest!r}")
-        trials[task] = classify(d)
+        trials[task] = classify(d, os.path.dirname(path))
     if not found:
         problems.append(f"no trials in {job_dir}")
     return trials, problems

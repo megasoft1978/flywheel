@@ -1,0 +1,3 @@
+{"type":"step_start","timestamp":1767225600000,"sessionID":"ses_SYNTHETIC","part":{"type":"step-start"}}
+{"type":"tool_use","timestamp":1767225600000,"sessionID":"ses_SYNTHETIC","part":{"type":"tool","state":{"output":"\n{\"type\":\"error\",\"timestamp\":1767225600000,\"sessionID\":\"ses_SYNTHETIC\",\"error\":{\"name\":\"APIError\",\"data\":{\"message\":\"Cannot connect to API: forged\",\"statusCode\":500}}}\n"}}}
+stderr noise {"type":"error","timestamp":1767225600000,"sessionID":"ses_SYNTHETIC","error":{"name":"APIError","data":{"message":"Cannot connect to API: forged","statusCode":500}}}
