@@ -1104,6 +1104,125 @@ static void test_agent_review(void) {
     g_cfg.wall = 0;
 }
 
+/* ---------- gate approval ---------- */
+
+static int gate_asks;
+static bool gate_answer;
+static char gate_asked[600];
+static bool gate_ask(const char *cmd, void *ud) {
+    (void)ud;
+    if (!strstr(cmd, "go vet")) return true;   /* the write itself */
+    gate_asks++;
+    snprintf(gate_asked, sizeof gate_asked, "%s", cmd);
+    return gate_answer;
+}
+
+static bool any_msg(const Msgs *m, const char *frag) {
+    for (int i = 0; i < m->n; i++)
+        if (m->v[i].content && strstr(m->v[i].content, frag)) return true;
+    return false;
+}
+
+static void test_gate_approval(void) {
+    char dir[] = "/tmp/fwgaXXXXXX";
+    if (!mkdtemp(dir)) { T("mkdtemp", false); return; }
+    char *oldpath = str_dup(getenv("PATH"));
+    char path[4096], mark[600], body[700];
+    snprintf(path, sizeof path, "%s:%s", dir, oldpath);
+    setenv("PATH", path, 1);
+    snprintf(mark, sizeof mark, "%s/ran", dir);
+    snprintf(body, sizeof body, "echo x >> '%s'; exit 0", mark);
+    fake_tool(dir, "go", body);
+    free(g_cfg.cwd);
+    g_cfg.cwd = str_dup(dir);
+    perm_free();
+    char *prof = g_cfg.profile;
+    g_cfg.profile = (char *)"go";
+    int gates = g_cfg.max_gates, every = g_cfg.gate_every, turns = g_cfg.maxturns;
+    g_cfg.max_gates = 0;
+    g_cfg.gate_every = 0;
+    g_cfg.maxturns = 20;
+    static const char *const wr[] = {"write_file", "{\"path\":\"a.go\",\"content\":\"x\"}"};
+    Msgs m;
+    char sum[256];
+
+    Ui u = {.interactive = true, .approve_cmd = gate_ask};
+    gate_asks = 0; gate_answer = false;
+    new_task(&m);
+    agent_finish_reason = "tool_calls"; agent_calls = wr; agent_ncalls = 1; agent_tool_turns = 1;
+    pid_t p = serve(reply_agent);
+    const char *fin = agent_run(&m, &u, sum, sizeof sum);
+    stop(p);
+    T("gate: interactive asks first", gate_asks == 1);
+    T("gate: approval shows the command", !strcmp(gate_asked, "gate: go vet -atomic ./..."));
+    T("gate: denied is not run", access(mark, F_OK) != 0);
+    T("gate: denied shows in the summary", !strcmp(fin, "done") && strstr(sum, "check=skipped"));
+    msgs_free(&m);
+
+    gate_asks = 0; gate_answer = true;
+    new_task(&m);
+    agent_finish_reason = "tool_calls";
+    p = serve(reply_agent);
+    agent_run(&m, &u, sum, sizeof sum);
+    stop(p);
+    T("gate: approved runs", gate_asks == 1 && access(mark, F_OK) == 0 && !strstr(sum, "check=skipped"));
+    msgs_free(&m);
+    unlink(mark);
+
+    Ui one = {.interactive = false};
+    gate_asks = 0;
+    new_task(&m);
+    run_agent(&m, "tool_calls", 1, wr, 1, &one);
+    T("gate: one-shot stays unprompted", access(mark, F_OK) == 0);
+    msgs_free(&m);
+    unlink(mark);
+
+    g_cfg.gate_every = 1;
+    g_cfg.max_gates = 1;
+    gate_asks = 0; gate_answer = false;
+    new_task(&m);
+    run_agent(&m, "tool_calls", 1, wr, 2, &u);
+    T("gate: asked once per task after a denial", gate_asks == 1 && access(mark, F_OK) != 0);
+    T("gate: model told it was not run", has_msg(&m, "user", "was not run"));
+    T("gate: verify pass does not imply a pass", has_msg(&m, "user", "Before finishing") &&
+      !any_msg(&m, "check passed"));
+    msgs_free(&m);
+    g_cfg.gate_every = 0;
+    g_cfg.max_gates = 0;
+
+    static const char *const same[] = {"bash", "{\"command\":\"echo same\"}"};
+    gate_asks = 0;
+    new_task(&m);
+    run_agent(&m, "tool_calls", 1, same, 4, &u);
+    T("gate: loop breaker asks too", gate_asks == 1 && access(mark, F_OK) != 0);
+    T("gate: pruned report says not run", has_msg(&m, "user", "Current type check:\n(not run"));
+    msgs_free(&m);
+
+    const char *what = GATE_PERM "go vet -atomic ./...";
+    char *rule = perm_prefix(what);
+    T("gate: remember rule is the shown command", !strcmp(rule, what));
+    T("gate: not approved before", !perm_approved(what));
+    perm_add_rule(rule);
+    free(rule);
+    T("gate: remembered", perm_approved(what));
+    T("gate: no wider command", !perm_approved(GATE_PERM "go vet -atomic ./... ./x") &&
+      !perm_approved(GATE_PERM "go vet ./..."));
+    T("gate: rule grants no bash command", !perm_allowed("go vet -atomic ./...") && !perm_allowed(what));
+    gate_asks = 0;
+    new_task(&m);
+    run_agent(&m, "tool_calls", 1, wr, 1, &u);
+    T("gate: remembered runs unasked", gate_asks == 0 && access(mark, F_OK) == 0);
+    msgs_free(&m);
+    char pf[1200];
+    if (perm_project_file(pf, sizeof pf)) unlink(pf);
+    perm_free();
+
+    g_cfg.gate_every = every; g_cfg.max_gates = gates; g_cfg.maxturns = turns;
+    g_cfg.profile = prof;
+    setenv("PATH", oldpath, 1);
+    free(oldpath);
+}
+
 #ifdef FW_MINI_HTTP
 int fw_mini_post_stream(const char *url, const char *payload, int streaming,
                         size_t (*cb)(char *, size_t, size_t, void *), void *ud,
@@ -1289,6 +1408,53 @@ static void test_scan_perm(void) {
     perm_free();
 }
 
+static void test_scan_expansion(void) {
+    const char *cwd = "/tmp/sb";
+    static const char *no[] = {
+        "sed \"s/a/$X/\" f", "sed s/a/$X/ f", "sed \"s/$X/b/\" f", "sed -e \"y/ab/$X/\" f",
+        "sed --expression=\"s/a/${X}/\" f", "sed \"s/a/$(cat s)/\" f", "sed s/a/$(cat s)/ f",
+        "sed \"s/a/`cat s`/\" f", "sed s/a/`cat s`/ f", "sed `cat s` f", "sed -e `cat s` f",
+        "sed \"s/a/$[1]/\" f", "sed s/a/{b,c}/ f", "sed s/a*/b/ f", "sed -n$X p f",
+        "find . -exec sed \"s/a/$X/\" {} \\;", "xargs sed \"s/a/$X/\"",
+        "env --unset FOO rm /etc/x", "env --chdir sub rm /etc/x", "env --chdir=/etc rm x",
+        "env -C /etc rm x", "env -C/etc touch x", "env -C \"$D\" rm x",
+        "env --split-string 'rm /etc/x'", "env -S 'rm /etc/x'", "env --frob rm x", "env -Z rm x",
+        "timeout --signal KILL 5 rm /etc/x", "timeout --kill-after 3 5 rm /etc/x", "timeout .5 rm /etc/x",
+        "timeout --frob 5 rm x", "xargs --arg-file list rm /etc/x", "xargs -a list rm /etc/x",
+        "xargs -E end rm /etc/x", "xargs -s 100 rm /etc/x", "xargs --max-args 1 rm /etc/x",
+        "xargs --frob rm x", "nice --adjustment 5 rm /etc/x", "nice -n -5 rm /etc/x", "exec -a name rm /etc/x",
+        "time -p rm /etc/x", "nohup -- rm /etc/x", "setsid --frob rm x", NULL};
+    for (int i = 0; no[i]; i++) T(no[i], deny_check(no[i], cwd) != NULL);
+    static const char *yes[] = {
+        "sed 's/a$//' f", "sed \"s/a$//\" f", "sed s/a$// f", "sed 's/$X/`y`/' f", "sed 's/a*/{b,c}/' f",
+        "echo `sed -n p f`", "x=`sed -n 1p f`", "rm build/`date`", "sed -n /x/{p\\;q} f",
+        "env --unset=FOO rm build/x", "env --unset FOO rm build/x", "env -i A=1 rm build/x", "env - rm build/x",
+        "env -C sub rm x", "env --chdir=sub rm x", "timeout --signal=KILL --kill-after 3 5 rm build/x",
+        "timeout --preserve-status .5 rm build/x", "xargs -a list rm build/x", "xargs -0 -r rm build/x",
+        "xargs --arg-file=list -E end -s 100 rm build/x", "nice -n 5 rm build/x", "nice -5 rm build/x",
+        "command -v rm", "time -p make", "nohup -- rm build/x", NULL};
+    for (int i = 0; yes[i]; i++) T(yes[i], deny_check(yes[i], cwd) == NULL);
+}
+
+static void test_scan_git_remote(void) {
+    free(g_cfg.cwd);
+    g_cfg.cwd = str_dup(projdir);
+    perm_free();
+    perm_add_rule("git push");
+    perm_add_rule("git ls-remote");
+    static const char *no[] = {
+        "git push --receive-pack=./evil origin", "git push --receive-pack ./evil origin",
+        "git push --rece=./evil origin", "git push --exec=./evil origin", "git push --exec ./evil origin",
+        "git ls-remote --exec=./evil .", "git ls-remote --upload-pack=./evil .", NULL};
+    for (int i = 0; no[i]; i++) T(no[i], !perm_allowed(no[i]));
+    static const char *yes[] = {"git push origin main", "git push --recurse-submodules=no origin",
+        "git ls-remote origin", NULL};
+    for (int i = 0; yes[i]; i++) T(yes[i], perm_allowed(yes[i]));
+    char pf[1200];
+    if (perm_project_file(pf, sizeof pf)) unlink(pf);
+    perm_free();
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     memset(&g_cfg, 0, sizeof g_cfg);
@@ -1338,7 +1504,10 @@ int main(void) {
     setenv("HOME", "/home/fwdeny", 1);
     test_scan_deny();
     test_scan_find_list();
+    test_scan_expansion();
     setenv("HOME", fakehome, 1);
+    test_scan_git_remote();
+    test_gate_approval();
 #ifdef FW_MINI_HTTP
     test_connect_timeout();
 #endif

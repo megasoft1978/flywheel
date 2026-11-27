@@ -4,13 +4,7 @@
 #define MAXPRUNES 8
 #define MAXRESETS 2
 
-static char *gate_out(const Profile *prof, const char *cwd, bool *failed) {
-    return gate_run(prof, cwd, g_cfg.cmd_timeout * 2, failed);
-}
-
-static bool wall_over(time_t wall0) {
-    return g_cfg.wall && time(NULL) - wall0 >= g_cfg.wall;
-}
+#define NOT_RUN "(not run: the user declined this check; its result is unknown, do not report it as passing)"
 
 static void emit(Ui *ui, void (*fn)(const char *, void *), const char *s) {
     if (fn) fn(s, ui->ud);
@@ -19,12 +13,36 @@ static void event(Ui *ui, const char *kind, const char *detail) {
     if (ui->emit_event) ui->emit_event(kind, detail, ui->ud);
 }
 
+/* The gate runs project code, so an interactive user approves it first. A
+   denial holds for the rest of the task (*denied). Never NULL; when not run,
+   *failed is false and the text says so. */
+static char *gate_out(const Profile *prof, Ui *ui, bool *denied, bool *failed) {
+    *failed = false;
+    if (!prof->gate_cmd) return str_dup("");
+    if (!*denied && ui->approve_cmd) {
+        char what[256];   /* exactly what gate_run executes */
+        snprintf(what, sizeof what, GATE_PERM "%s", prof->gate_cmd);
+        if (!perm_approved(what) && !ui->approve_cmd(what, ui->ud)) {
+            *denied = true;
+            snprintf(what, sizeof what, "check not run (denied): %s", prof->gate_cmd);
+            event(ui, "gate", what);
+        }
+    }
+    if (*denied) return str_dup(NOT_RUN);
+    if (g_abort) return str_dup("(not run: aborted)");
+    return gate_run(prof, g_cfg.cwd, g_cfg.cmd_timeout * 2, failed);
+}
+
+static bool wall_over(time_t wall0) {
+    return g_cfg.wall && time(NULL) - wall0 >= g_cfg.wall;
+}
+
 const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
     const Profile *prof = profile_detect(g_cfg.cwd, g_cfg.profile);
     Recent rec = {0};
     int prunes = 0, gates = 0, resets = 0, toks = 0, ptoks = 0, calls = 0, turns = 0;
     double secs = 0;
-    bool wrote = false;
+    bool wrote = false, gate_denied = false;
     int escape_turns = 0;
     time_t wall0 = time(NULL);
     const char *finish = "turns";
@@ -93,7 +111,7 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
                 .tok_per_sec = (r->secs > 0.05 && r->completion_tokens > 0)
                                ? (r->completion_tokens / r->secs)
                                : (secs > 0.05 ? toks / secs : 0.0),
-                .finish = NULL
+                .finish = NULL, .check_skipped = gate_denied
             };
             ui->emit_stats(&st, ui->ud);
         }
@@ -132,7 +150,7 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
             }
             if (prof->gate_cmd && (ui->deliverable || wrote)) {
                 bool bad;
-                char *go = gate_out(prof, g_cfg.cwd, &bad);
+                char *go = gate_out(prof, ui, &gate_denied, &bad);
                 if (bad && turn < g_cfg.maxturns - 2) {
                     snprintf(gbuf, sizeof gbuf,
                         "`%s` failed. Fix all errors, remove only broken scratch files you created yourself, then verify and reply DONE:\n%.1800s",
@@ -145,8 +163,10 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
             }
             if ((ui->deliverable || wrote) && !strcmp(r->finish, "stop") && gates < g_cfg.max_gates && turn < g_cfg.maxturns - 4) {
                 gates++;
-                msgs_push(msgs, "user",
-                    "Before finishing: list every requirement bullet in the task prompt and verify each one with a quick script or test run against your code (edge cases, error classes/shapes, concurrency, ordering, cleanup, defaults). Fix any mismatch, remove only scratch files you created yourself (never delete files you did not create), make sure the type check is clean, then reply DONE.");
+                snprintf(gbuf, sizeof gbuf, "%s%s%s",
+                    "Before finishing: list every requirement bullet in the task prompt and verify each one with a quick script or test run against your code (edge cases, error classes/shapes, concurrency, ordering, cleanup, defaults). Fix any mismatch, remove only scratch files you created yourself (never delete files you did not create), make sure the type check is clean, then reply DONE.",
+                    gate_denied ? "\nThe automatic check was not run: " : "", gate_denied ? NOT_RUN : "");
+                msgs_push(msgs, "user", gbuf);
                 event(ui, "gate", "verification pass");
                 chat_resp_free(r);
                 continue;
@@ -255,8 +275,10 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
         /* periodic gate */
         if (g_cfg.gate_every && wrote && turn % g_cfg.gate_every == g_cfg.gate_every - 1
             && turn < g_cfg.maxturns - 5 && prof->gate_cmd) {
-            bool bad;
-            char *go = gate_out(prof, g_cfg.cwd, &bad);
+            bool bad, was = gate_denied;
+            char *go = gate_out(prof, ui, &gate_denied, &bad);
+            if (gate_denied && !was)
+                msgs_push(msgs, "user", "The automatic check was not run: " NOT_RUN);
             if (bad) {
                 char gb[4096];
                 snprintf(gb, sizeof gb,
@@ -288,7 +310,7 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
             rec_clear(&rec);
             escape_turns = 2;
             bool bad;
-            char *go = gate_out(prof, g_cfg.cwd, &bad);
+            char *go = gate_out(prof, ui, &gate_denied, &bad);
             char *files = run_bash(
                 "find . -maxdepth 3 \\( -name node_modules -o -name .git \\) -prune -o -type f -print | head -40",
                 g_cfg.cwd, 10);
@@ -327,14 +349,15 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
             .turns = turns, .calls = calls, .prunes = prunes, .gates = gates, .resets = resets,
             .prompt_tokens = ptoks, .completion_tokens = toks, .secs = secs,
             .tok_per_sec = secs > 0.05 ? (toks / secs) : 0.0,
-            .finish = finish
+            .finish = finish, .check_skipped = gate_denied
         };
         ui->emit_stats(&st, ui->ud);
     }
     if (sum)
         snprintf(sum, sumcap,
-                 "finish=%s turns=%d prunes=%d gates=%d resets=%d calls=%d tokens=%d secs=%.0f",
-                 finish, turns, prunes, gates, resets, calls, toks, secs);
+                 "finish=%s turns=%d prunes=%d gates=%d resets=%d calls=%d tokens=%d secs=%.0f%s",
+                 finish, turns, prunes, gates, resets, calls, toks, secs,
+                 gate_denied ? " check=skipped" : "");
     if (tr) fclose(tr);
     rec_clear(&rec);
     free(taskmsg);

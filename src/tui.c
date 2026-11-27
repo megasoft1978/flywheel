@@ -1713,7 +1713,7 @@ static bool can_remember(const char *cmd, const char *rule) {
     g_cfg.cwd = NULL;
     perm_add_rule(rule);
     g_cfg.cwd = cwd;
-    bool ok = perm_allowed(cmd);
+    bool ok = perm_approved(cmd);
     perm_free();              /* drop the probe; the next check reloads from disk */
     return ok;
 }
@@ -1727,14 +1727,17 @@ static bool ui_approve(const char *cmd, void *ud) {
 
     char *rule = perm_prefix(cmd);
     bool remember = can_remember(cmd, rule);
+    bool gate = !strncmp(cmd, GATE_PERM, strlen(GATE_PERM));
     char opt2[256];
-    snprintf(opt2, sizeof opt2, "Yes, and don't ask again for `%s` commands", rule ? rule : cmd);
+    if (gate) snprintf(opt2, sizeof opt2, "Yes, and don't ask again for exactly this check");
+    else snprintf(opt2, sizeof opt2, "Yes, and don't ask again for `%s` commands", rule ? rule : cmd);
     const char *opts[3];
     int n = 0;
     opts[n++] = "Yes";
     if (remember) opts[n++] = opt2;
     opts[n++] = "No";
-    int pick = tui_choose_menu("⚠ Bash command", cmd, "Do you want to proceed?", opts, n,
+    int pick = tui_choose_menu(gate ? "⚠ Project check (runs project code)" : "⚠ Bash command",
+                               cmd, "Do you want to proceed?", opts, n,
                                remember ? "yan" : "yn", true);
     if (pick == 0) {
         set_status("approved once");
@@ -1813,6 +1816,9 @@ void tui_run_task(const char *prompt) {
         if (g_stat.last_final.gates)
             snprintf(extras + strlen(extras), sizeof extras - strlen(extras),
                      " · " BLUE "○ %d gate%s" RESET, g_stat.last_final.gates, g_stat.last_final.gates == 1 ? "" : "s");
+        if (g_stat.last_final.check_skipped)
+            snprintf(extras + strlen(extras), sizeof extras - strlen(extras),
+                     " · " YELLOW "check not run" RESET);
         snprintf(done, sizeof done,
                  GREEN "✓ done" RESET DIM " · %d turn%s · %d bash · %s tok" RESET "%s%s" DIM " · %.1fs" RESET,
                  g_stat.last_final.turns, g_stat.last_final.turns == 1 ? "" : "s",

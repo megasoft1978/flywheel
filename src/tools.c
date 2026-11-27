@@ -81,12 +81,14 @@ static bool in_ranges(const Range *r, int n, const char *p) {
    the first command substitution found inside double quotes (or NULL),
    *expands whether the shell would substitute something into the word. */
 static bool starts_expansion(const char *p) {
-    return *p == '`' || (*p == '$' && p[1] && (isalnum((unsigned char)p[1]) || strchr("_{(@*#?!$-", p[1])));
+    return *p == '`' || (*p == '$' && p[1] && (isalnum((unsigned char)p[1]) || strchr("_{([@*#?!$-", p[1]) ||
+                                               (p[1] == '\\' && p[2] == '\n')));
 }
 
 static void read_word(const char **s, char *out, const char **sub, bool *expands) {
     const char *p = *s;
     char *w = out;
+    int brace = 0;   /* unquoted "{", then "," or "..", then "}" */
     if (sub) *sub = NULL;
     if (expands) *expands = false;
     while (*p && !strchr(" \t\r\n;&|<>()`", *p)) {
@@ -123,6 +125,12 @@ static void read_word(const char **s, char *out, const char **sub, bool *expands
         } else {
             /* `$` before `(` ends the word here, so look at the input */
             if (expands && starts_expansion(p)) *expands = true;
+            /* globs, tilde and brace lists are expansions too */
+            if (expands && (*p == '*' || *p == '?' || (*p == '[' && strchr(p + 1, ']')) ||
+                            (*p == '~' && w == out) || (*p == '}' && brace == 2)))
+                *expands = true;
+            if (*p == '{') brace = brace ? brace : 1;
+            else if (brace == 1 && (*p == ',' || (*p == '.' && p[1] == '.'))) brace = 2;
             *w++ = *p++;
         }
     }
@@ -346,14 +354,11 @@ static const char *sed_file(const char **p, const char *cwd) {
 /* w/W and s///w write files without -i, e runs a shell command */
 static const char *check_sed_script(const char *p, const char *cwd) {
     if (g_cfg.outside_writes || !*p) return NULL;
-    if (strchr(p, OPAQUE)) return E_OUTSIDE;
-    /* p ends where its word does; scan_script stores the flag after the NUL */
-    bool expands = p[strlen(p) + 1];
+    /* p ends where its word does; scan_script stores the flag after the NUL.
+       Anything the shell substitutes anywhere in it can add commands. */
+    if (strchr(p, OPAQUE) || p[strlen(p) + 1]) return E_OUTSIDE;
     const char *err = NULL;
     while (!err && *p) {
-        /* a command held in a shell variable cannot be seen; otherwise `$`
-           is the last-line address */
-        if (expands && *p == '$' && (!p[1] || starts_expansion(p))) return E_OUTSIDE;
         if (strchr(" \t\r\n;{}!,+~$", *p) || isdigit((unsigned char)*p)) { p++; continue; }
         if (*p == '/') { p = sed_part(p + 1, '/', true); p += strspn(p, "IM"); continue; }
         if (*p == '\\' && p[1]) { p = sed_part(p + 2, p[1], true); p += strspn(p, "IM"); continue; }
@@ -391,6 +396,8 @@ static const char *check_sed(char **a, int na, const char *cwd) {
         const char *o = a[k], *code = NULL;
         if (opts && !strcmp(o, "--")) { opts = false; continue; }
         if (!opts || o[0] != '-' || !o[1]) { files[nf++] = a[k]; continue; }
+        /* an expanded option word may carry a script of its own */
+        if (o[strlen(o) + 1] && !g_cfg.outside_writes) { err = E_OUTSIDE; break; }
         if (o[1] == '-') {
             const char *eq = strchr(o, '=');
             size_t len = eq ? (size_t)(eq - o - 2) : strlen(o + 2);
@@ -641,34 +648,82 @@ static const char *check_operands(const char *base, char **a, int na, const char
     return err;
 }
 
+/* Commands that run another command. Options: `flags` take no value, `valued`
+   take one (attached or next word), `attached` only an attached one. Anything
+   unlisted could shift or hide the command, so it is refused. */
+typedef struct {
+    const char *cmd, *flags, *valued, *attached, *lflags, *lvalues;
+} Wrapper;
+
+static const Wrapper WRAPPERS[] = {
+    {"env", "i0v", "uPCa", "", "ignore-environment null debug block-signal default-signal "
+        "ignore-signal list-signal-handling", "unset chdir argv0"},
+    {"nohup", "", "", "", "", ""},
+    {"command", "pvV", "", "", "", ""},
+    {"exec", "cl", "a", "", "", ""},
+    {"nice", "", "n", "", "", "adjustment"},
+    {"xargs", "0tprxo", "adEIJLnPRSs", "eil", "null verbose interactive no-run-if-empty exit open-tty "
+        "show-limits eof replace max-lines",
+        "arg-file delimiter max-args max-procs max-chars process-slot-var"},
+    {"timeout", "fpv", "sk", "", "foreground preserve-status verbose", "signal kill-after"},
+    {"setsid", "cfw", "", "", "ctty fork wait", ""},
+    {"time", "pvlha", "", "", "portability verbose", ""},
+};
+
+/* skip the options of wrapper `w` from v[*i]; *i ends on the command */
+static const char *skip_wrapper(const Wrapper *w, char **v, int n, int *i, const char *cwd) {
+    bool env = !strcmp(w->cmd, "env"), nice = !strcmp(w->cmd, "nice");
+    for (; *i < n; ++*i) {
+        const char *o = v[*i], *val = NULL;
+        bool chdir_ = false;
+        if (env && !strcmp(o, "-")) continue;
+        if (o[0] != '-' || !o[1]) break;
+        if (!strcmp(o, "--")) { ++*i; break; }
+        if (o[1] == '-') {
+            const char *name = o + 2, *eq = strchr(name, '=');
+            size_t len = eq ? (size_t)(eq - name) : strlen(name);
+            if (word_in(w->lvalues, name, len)) {
+                val = eq ? eq + 1 : *i + 1 < n ? v[++*i] : NULL;
+                chdir_ = env && len == 5 && !strncmp(name, "chdir", len);
+            } else if (!word_in(w->lflags, name, len) && !word_in("help version", name, len))
+                return E_RULE;
+        } else if (!(nice && o[1 + strspn(o + 1, "-0123456789")] == 0)) {
+            for (const char *c = o + 1; *c; c++) {
+                if (strchr(w->flags, *c)) continue;
+                if (strchr(w->attached, *c)) break;
+                if (!strchr(w->valued, *c)) return E_RULE;
+                val = c[1] ? c + 1 : *i + 1 < n ? v[++*i] : NULL;
+                chdir_ = env && *c == 'C';
+                break;
+            }
+        }
+        /* the command's relative paths are judged from cwd: stay inside it */
+        if (chdir_ && val && ((val[strlen(val) + 1] && !g_cfg.outside_writes) || !target_ok(val, cwd)))
+            return E_OUTSIDE;
+    }
+    return NULL;
+}
+
 /* inspect one simple command (words after quote removal) */
 static const char *check_simple(char **v, int n, const char *cwd, int depth) {
-    static const char *const kw[] = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "time", NULL};
-    static const char *const wrap[] = {"env", "nohup", "command", "exec", "nice", "xargs", "timeout", "setsid", NULL};
+    static const char *const kw[] = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", NULL};
     static const char *const shells[] = {"sh", "bash", "zsh", "dash", NULL};
     int i = 0;
-    const char *valued = NULL;   /* short options of the wrapper that take a word */
-    bool wrapped = false;
     const char *base = NULL;
-    for (; i < n; i++) {
+    while (i < n) {
         const char *w = v[i];
         const char *eq = strchr(w, '=');
-        if (eq && eq > w && !memchr(w, '/', (size_t)(eq - w)) && w[0] != '-') continue;
-        if (one_of(w, kw)) continue;
-        if (wrapped && w[0] == '-') {
-            if (w[1] && w[1] != '-') {
-                const char *c = w + 1;
-                while (*c && !strchr(valued, *c)) c++;
-                if (*c && !c[1]) i++;   /* separate value, not the command */
-            }
-            continue;
-        }
-        if (wrapped && isdigit((unsigned char)w[0])) continue;
+        if (eq && eq > w && !memchr(w, '/', (size_t)(eq - w)) && w[0] != '-') { i++; continue; }
+        if (one_of(w, kw)) { i++; continue; }
         base = strrchr(w, '/') ? strrchr(w, '/') + 1 : w;
-        if (!one_of(base, wrap)) break;
-        wrapped = true;
-        valued = !strcmp(base, "env") ? "uC" : !strcmp(base, "xargs") ? "InPLd" :
-                 !strcmp(base, "timeout") ? "sk" : "";
+        const Wrapper *wr = NULL;
+        for (size_t k = 0; k < sizeof WRAPPERS / sizeof *WRAPPERS; k++)
+            if (!strcmp(base, WRAPPERS[k].cmd)) wr = &WRAPPERS[k];
+        if (!wr) break;
+        i++;
+        const char *err = skip_wrapper(wr, v, n, &i, cwd);
+        if (err) return err;
+        if (!strcmp(wr->cmd, "timeout")) i++;   /* the duration */
     }
     if (i >= n) return NULL;
     if (strchr(v[i], OPAQUE)) return E_RULE;
@@ -725,8 +780,9 @@ static const char *scan_script(const char *s, const char *cwd, int depth) {
     char delim[MAXHEREDOC][64];
     bool dash[MAXHEREDOC];
     int n = 0, nd = 0;
-    bool redir_out = false, redir_in = false;
-    const char *err = NULL, *p = s;
+    bool redir_out = false, redir_in = false, tick = false;
+    const char *err = NULL, *p = s, *word_end = NULL;
+    static char subst[] = {'$', 0, 1};   /* stands for a `...` word */
     while (!err) {
         char c = *p;
         if (c == ' ' || c == '\t' || c == '\r') { p++; continue; }
@@ -770,6 +826,13 @@ static const char *scan_script(const char *s, const char *cwd, int depth) {
             if (*p != '(') redir_in = true;
             continue;
         }
+        if (c == '`') {   /* opening one: part of the current command's words */
+            if (!tick && !redir_out && !redir_in) {
+                if (n && word_end == p) v[n - 1][strlen(v[n - 1]) + 1] = 1;
+                else if (n && n < MAXWORDS) v[n++] = subst;
+            }
+            tick = !tick;
+        }
         if (!c || strchr("\n;&|()`", c)) {
             if (n) err = check_simple(v, n, cwd, depth);
             n = 0;
@@ -799,6 +862,7 @@ static const char *scan_script(const char *s, const char *cwd, int depth) {
         bool expands;
         char *w = top;
         read_word(&p, w, &sub, &expands);
+        word_end = p;
         top += strlen(w) + 2;
         top[-1] = expands;
         if (sub) err = scan_script(sub, cwd, depth + 1);
@@ -1220,7 +1284,8 @@ static bool has_mutating_args(const char *cmd) {
         if (git && (!strncmp(a, "--output", 8) || abbrev(a, "--output", 3) || abbrev(a, "--ext-diff", 4) ||
                     (abbrev(a, "--textconv", 5) && strcmp(a, "--text")) ||
                     abbrev(a, "--show-signature", 8) || strstr(a, "signature") || has_sig_format(a))) bad = true;
-        if (git && abbrev(a, "--upload-pack", 5)) bad = true;
+        if (git && (abbrev(a, "--upload-pack", 5) || abbrev(a, "--receive-pack", 5) ||
+                    abbrev(a, "--exec", 4))) bad = true;   /* runs a program */
         if (go && a[0] == '-') {   /* run another program or write any file */
             const char *name = a + (a[1] == '-' ? 2 : 1);
             size_t len = strcspn(name, "=");
@@ -1351,9 +1416,24 @@ static bool reads_outside(const char *cmd) {
     return out;
 }
 
+static bool is_gate(const char *s) {
+    return !strncmp(s, GATE_PERM, sizeof GATE_PERM - 1);
+}
+
+/* A verification gate is remembered as its whole command, matched exactly and
+   never applied to the model's own commands. */
+bool perm_approved(const char *what) {
+    if (!is_gate(what)) return perm_allowed(what);
+    perm_load();
+    for (int i = 0; i < nrules; i++)
+        if (!strcmp(rules[i], what)) return true;
+    return perm_allowed(what + sizeof GATE_PERM - 1);
+}
+
 bool perm_allowed(const char *cmd) {
     perm_load();
     while (*cmd == ' ') cmd++;
+    if (is_gate(cmd)) return false;
     /* a leading VAR=value makes the real command whatever follows it */
     if (cmd[strcspn(cmd, "= \t")] == '=') return false;
     if (has_shell_meta(cmd) || has_expansion(cmd) || has_mutating_args(cmd)) return false;
@@ -1396,6 +1476,7 @@ static const char *PLAIN_TOOLS = "rm rmdir mkdir touch cp mv ln chmod uname whoa
 /* "always" rule derived from a command: the tool, or tool and subcommand
    ("npm run" also needs the script name). "" = nothing safe to remember. */
 char *perm_prefix(const char *cmd) {
+    if (is_gate(cmd)) return str_dup(cmd);   /* nothing broader than shown */
     char w[3][96] = {{0}};
     for (int i = 0; i < 3; i++) {
         while (*cmd == ' ' || *cmd == '\t') cmd++;

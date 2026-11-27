@@ -94,6 +94,8 @@ bool  cmd_is_write(const char *cmd);
 /* permission rules: builtin safe reads + ~/.config/flywheel/allow +
    ~/.config/flywheel/projects/<project>.allow (never read from the project) */
 bool  perm_allowed(const char *cmd);   /* rule match — no prompt needed */
+#define GATE_PERM "gate: "             /* approval string of a verification gate */
+bool  perm_approved(const char *what); /* like perm_allowed, also for gates */
 void  perm_load(void);                 /* load rule files once */
 void  perm_add_rule(const char *rule); /* remember + persist per project */
 bool  perm_project_file(char *out, size_t cap); /* path of this project's rules */
@@ -142,6 +144,7 @@ typedef struct {
     double secs;                /* cumulative generation secs */
     double tok_per_sec;         /* latest/average generation tok/s */
     const char *finish;         /* NULL while running, else "done"|"aborted"|... */
+    bool check_skipped;         /* the user declined the verification gate */
 } AgentStats;
 
 typedef struct {
