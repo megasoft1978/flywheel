@@ -105,8 +105,16 @@ Project instructions come from the first of `.flywheel.md`, `AGENTS.md` or `CLAU
 - Keep typing while the agent works: Enter queues, `Esc` interrupts, scrollback stays put.
 - Streaming markdown, code boxes, tables and links.
 - Tool output and thinking collapse; click or `^O` to expand.
-- Slash menu (`/init /clear /model /allow /status /help /exit`), input history,
+- Slash menu (`/init /clear /model /allow /status /copy /mouse /help /exit`), input history,
   large-paste collapse.
+- `/copy` copies the last assistant reply as plain text (escape sequences and control characters
+  removed). It uses `pbcopy` on a local macOS session, otherwise, over SSH or if `pbcopy` fails,
+  OSC 52 (replies up to 74994 bytes). A terminal never confirms OSC 52, so paste to check; tmux
+  needs `set-clipboard on`.
+- Mouse reporting is on by default and takes over drag-to-select. Hold the terminal's bypass key
+  while dragging (usually `Shift`; `Option` in iTerm2, `Fn` in Terminal.app), or type `/mouse` to
+  turn reporting off. While it is off, scroll with `PgUp`/`PgDn` and expand the latest block with
+  `^O`; `/mouse` turns it back on.
 - Live tokens per second (end to end), context gauge and completion summary.
 
 ## Safety

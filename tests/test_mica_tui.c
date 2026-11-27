@@ -289,6 +289,19 @@ static void handle_client(int cfd) {
     if (handle_probe(cfd, last_msg)) return;
     if (handle_security(cfd, last_msg)) return;
 
+    if (strstr(last_msg, "BIG_REPLY")) {       /* 100 lines of 1000 bytes */
+        char j[1200], fill[1000];
+        memset(fill, 'q', sizeof fill - 1);
+        fill[sizeof fill - 1] = 0;
+        for (int i = 0; i < 100; i++) {
+            snprintf(j, sizeof j, "{\"choices\":[{\"delta\":{\"content\":\"%s\\n\"}}]}", fill);
+            send_sse_chunk(cfd, j);
+        }
+        send_all(cfd, "data: [DONE]\n\n", 14);
+        close(cfd);
+        return;
+    }
+
     if (strstr(last_msg, "STREAM_TEST")) {
         const char *think[] = {"Let", "'s", " take", " a", " look", NULL};
         for (int i = 0; think[i]; i++) {
@@ -802,6 +815,148 @@ static void input_tests(const char *dir, const char *cmd) {
     mica_session_destroy(s);
 }
 
+/* ---------- /copy and /mouse ---------- */
+
+/* SEC_TEXT's reply with every escape sequence and control byte removed */
+#define SEC_PLAIN "abc\n```xlang\ncodehid\n```\n[l](ftp://u)"
+
+static size_t slurp(const char *path, char *buf, size_t cap) {
+    FILE *f = fopen(path, "r");
+    size_t n = f ? fread(buf, 1, cap - 1, f) : 0;
+    if (f) fclose(f);
+    buf[n] = 0;
+    return n;
+}
+
+static void ask(MicaSession *s, const char *msg) {
+    submit(s, msg);
+    wait_for_text(s, "✓ done", 8000);
+    pump(s, 200);
+}
+
+/* every session here finds a fake pbcopy first on PATH: the real clipboard is never touched */
+static void copy_tests(const char *dir, const char *cmd) {
+    char bin[1100], script[1200], clip[1200], failflag[1200];
+    snprintf(bin, sizeof bin, "%s/fakebin", dir);
+    snprintf(script, sizeof script, "%s/pbcopy", bin);
+    snprintf(clip, sizeof clip, "%s/clip.txt", dir);
+    snprintf(failflag, sizeof failflag, "%s/pbfail", dir);
+    assert(mkdir(bin, 0700) == 0);
+    FILE *f = fopen(script, "w");
+    assert(f != NULL);
+    fprintf(f, "#!/bin/sh\nif [ -e '%s' ]; then cat >/dev/null; exit 1; fi\nexec cat > '%s'\n", failflag, clip);
+    fclose(f);
+    assert(chmod(script, 0700) == 0);
+
+    static char full[8192], got[1 << 17];
+    snprintf(full, sizeof full, "unset SSH_CONNECTION SSH_TTY SSH_CLIENT TMUX; export TERM_PROGRAM=Apple_Terminal; "
+             "export PATH='%s':\"$PATH\"; %s", bin, cmd);
+    MicaSession *s = mica_session_create(dir, full, 24, 80);
+    assert(s != NULL);
+    CHECK(s, "copy: ready", wait_for_text(s, "ready", 3000));
+    pump(s, 150);
+
+    keys(s, "/");
+    CHECK(s, "menu lists every command", find_row(s, "/copy") >= 0 && find_row(s, "/mouse") >= 0 &&
+          find_row(s, "/help") >= 0 && find_row(s, "/quit") >= 0);
+    keys(s, "\x03" "/help\r");
+    CHECK(s, "help names /copy, /mouse and the select key",
+          find_row(s, "/copy /mouse /help") >= 0 && find_row(s, "hold Fn") >= 0);
+
+    keys(s, "/clear\r");
+    keys(s, "/copy\r");
+    CHECK(s, "copy: nothing to copy yet", wait_for_text(s, "nothing to copy", 2000));
+    CHECK(s, "copy: pbcopy not run without a reply", access(clip, F_OK) != 0);
+
+    ask(s, "SEC_TEXT");
+    keys(s, "/copy\r");
+    CHECK(s, "copy: reports pbcopy", wait_for_text(s, "copied the last reply", 3000));
+    slurp(clip, got, sizeof got);
+    CHECK(s, "copy: reply text without escapes or controls", !strcmp(got, SEC_PLAIN));
+    char *osc = mica_session_take_clipboard_write(s);
+    CHECK(s, "copy: no OSC 52 when pbcopy worked", osc == NULL);
+    free(osc);
+
+    ask(s, "BIG_REPLY");
+    keys(s, "/copy\r");
+    CHECK(s, "copy: big reply reported", wait_for_text(s, "(99999 bytes, pbcopy)", 5000));
+    CHECK(s, "copy: big reply arrives whole", slurp(clip, got, sizeof got) == 99999);
+
+    f = fopen(failflag, "w");
+    assert(f != NULL);
+    fclose(f);
+    ask(s, "SEC_TEXT");
+    keys(s, "/copy\r");
+    CHECK(s, "copy: pbcopy failure is said, OSC 52 not confirmed",
+          wait_for_text(s, "pbcopy failed. Sent", 3000) && find_row(s, "Not confirmed") >= 0);
+    pump(s, 200);
+    osc = mica_session_take_clipboard_write(s);
+    CHECK(s, "copy: fallback OSC 52 carries the plain text", osc && !strcmp(osc, SEC_PLAIN));
+    free(osc);
+
+    /* mouse reporting off, then on */
+    keys(s, "/clear\r");
+    CHECK(s, "mouse: on at start", mica_session_reports_mouse(s));
+    keys(s, "\033[<0;5;5M\033[<0;5;5m");
+    CHECK(s, "mouse: a plain click shows no hint", find_row(s, "to select:") < 0);
+    keys(s, "\033[<0;5;5M\033[<0;20;5m");
+    CHECK(s, "mouse: a drag shows the select key", find_row(s, "to select: hold Fn and drag, or /mouse") >= 0);
+    keys(s, "/mouse\r");
+    CHECK(s, "mouse off: reporting disabled", !mica_session_reports_mouse(s));
+    CHECK(s, "mouse off: says how to scroll and expand",
+          find_row(s, "drag to select text") >= 0 && find_row(s, "PgUp/PgDn") >= 0 && find_row(s, "^O") >= 0);
+    submit(s, "STREAM_TEST");
+    CHECK(s, "mouse off: modal", wait_for_text(s, "Do you want to proceed?", 4000));
+    pump(s, 700);
+    CHECK(s, "mouse off: dialog does not offer clicking",
+          find_row(s, "Esc cancel") >= 0 && find_row(s, "or click") < 0);
+    keys(s, "y");
+    CHECK(s, "mouse off: task completes", wait_for_text(s, "✓ done", 4000));
+    pump(s, 200);
+    CHECK(s, "mouse off: collapsed hint names only ^O",
+          find_row(s, "(^O to expand)") >= 0 && find_row(s, "click or") < 0);
+    CHECK(s, "mouse off: stays off across a task", !mica_session_reports_mouse(s));
+    keys(s, "/mouse\r");
+    CHECK(s, "mouse on again", mica_session_reports_mouse(s) && find_row(s, "mouse on:") >= 0);
+    keys(s, "/mouse\r");
+    keys(s, "/exit\r");
+    CHECK(s, "mouse off: clean exit", wait_for_exit(s, 3000));
+    pump(s, 100);
+    CHECK(s, "mouse off: terminal restored", !mica_session_reports_mouse(s) && !mica_session_bracketed_paste(s));
+    mica_session_destroy(s);
+
+    /* over SSH: OSC 52 only, with a size cap */
+    unlink(clip);
+    unlink(failflag);
+    snprintf(full, sizeof full, "unset SSH_TTY SSH_CLIENT TMUX; export SSH_CONNECTION='1 2 3 4'; "
+             "export PATH='%s':\"$PATH\"; %s", bin, cmd);
+    s = mica_session_create(dir, full, 24, 80);
+    assert(s != NULL);
+    CHECK(s, "ssh copy: ready", wait_for_text(s, "ready", 3000));
+    pump(s, 150);
+    ask(s, "SEC_TEXT");
+    keys(s, "/copy\r");
+    CHECK(s, "ssh copy: says unconfirmed", wait_for_text(s, "Not confirmed", 3000));
+    pump(s, 200);
+    osc = mica_session_take_clipboard_write(s);
+    CHECK(s, "ssh copy: OSC 52 carries the plain text", osc && !strcmp(osc, SEC_PLAIN));
+    free(osc);
+    CHECK(s, "ssh copy: pbcopy not used", access(clip, F_OK) != 0);
+    ask(s, "BIG_REPLY");
+    keys(s, "/copy\r");
+    CHECK(s, "ssh copy: over the cap is refused",
+          wait_for_text(s, "not copied:", 3000) && find_row(s, "OSC 52 limit") >= 0);
+    pump(s, 200);
+    osc = mica_session_take_clipboard_write(s);
+    CHECK(s, "ssh copy: nothing sent over the cap", osc == NULL);
+    free(osc);
+    keys(s, "/exit\r");
+    CHECK(s, "mouse on: clean exit", wait_for_exit(s, 3000));
+    pump(s, 100);
+    CHECK(s, "mouse on: terminal restored", !mica_session_reports_mouse(s));
+    mica_session_destroy(s);
+}
+
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     const char *fw_bin = (argc > 1) ? argv[1] : "./flywheel";
@@ -1178,6 +1333,7 @@ int main(int argc, char **argv) {
     mica_session_destroy(s);
     security_tests(testdir, cmd);
     input_tests(testdir, cmd);
+    copy_tests(testdir, cmd);
     stop_mock_server(srv_th);
 
     char rm[1200];
