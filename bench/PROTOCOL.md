@@ -6,10 +6,19 @@ compared with two other harnesses on the same model. The result is published wha
 Status: Terminal-Bench 2.1 preparation only. No scored run has started. Nothing here is a result.
 
 ## Open blockers (resolve before freeze)
-- flywheel time limit: `bench-tb/flywheel_agent.py` stops flywheel after a fixed 900 s
-  (`wall_timeout`), 150 turns (`turn_timeout`) and 180 s per command, whatever the task allows.
-  Task agent timeouts run from 600 s to 12000 s; Terminus 2 and OpenCode get no such flywheel
-  cap, so the harnesses do not have the same time limit. Do not start a scored run until fixed.
+- flywheel time limit (code fixed in FW-TBTIME, not yet smoke-tested, not fully fixed):
+  flywheel gets the task's Harbor agent timeout (task.toml `agent.timeout_sec` x
+  `--timeout-multiplier`, read from `bench-tb/tb21-timeouts.tsv` by task name). Harbor does not
+  pass it to custom agents; only its `asyncio.wait_for` around `run()` enforces it
+  (`harbor/trial/trial.py:784`, `:1724`). flywheel `-W` = budget - 60 s (refused if <= 0),
+  `-T` 20000 (never binds), `-t` 180 s.
+  - Overrun: `-W` is checked only at the start of each turn and inside model requests
+    (`src/agent.c:106,123`). A command started late can run up to `-t` more, further tool calls
+    in that turn still start, and gate runs get 2x `-t` (`src/agent.c:39`). Harbor's kill is the
+    only hard cap. Fix needs a change in `src/`; not done in FW-TBTIME.
+  - Before a scored run: one smoke task must show flywheel exiting before Harbor's kill
+    (`FW_EXIT`, `finish=wall`), and whether the kill stops the flywheel process in the container
+    before the verifier runs (not checked in the Docker exec path).
 
 ## Tracks
 1. Terminal-Bench 2.1 through Harbor: all 89 tasks, three harnesses, same local model.
@@ -26,8 +35,9 @@ Status: Terminal-Bench 2.1 preparation only. No scored run has started. Nothing 
   `sha256:7d7bdc1cbedad549fc1140404bd4dc45e5fd0ea7c4186773687d177ad3a0699a`. The runner passes
   `-d <dataset>@<digest>` and the harvester rejects any other digest. Re-check it at freeze.
 - `bench-tb/tb21-timeouts.tsv` holds agent and verifier timeouts from `task.toml` in the official
-  repo (commit `12b7565679ce5006230b820666353673a133db93`). Reference only: it has not been
-  checked against the registry task hashes.
+  repo (commit `12b7565679ce5006230b820666353673a133db93`). Load-bearing: flywheel's time limit
+  reads it (`bench-tb/flywheel_agent.py`). It is not verified against the pinned dataset digest
+  above; check it against the downloaded task.toml files at freeze.
 - Harbor version: 0.27.0 (`harbor --version`). Agents: `terminus-2` and `opencode` are built
   into Harbor; flywheel is the custom agent `bench-tb/flywheel_agent.py`
   (`--agent flywheel_agent:FlywheelAgent`).
@@ -61,12 +71,19 @@ Cannot match, and to be disclosed with the results:
 - flywheel raises temperature to 0.5 (top_p 0.95) to escape loops. At temperature 0 it sends no
   top_p.
 - OpenCode's title agent keeps its own temperature (0.5).
-- Turn and time limits: flywheel stops at 150 turns and 900 s (see Open blockers); Terminus 2 has
-  no turn limit by default.
+- Time limits: all three harnesses are cut by the same Harbor per-task agent timeout. flywheel's
+  `-W` is a soft stop, checked only at the start of each turn and inside model requests. A
+  command started late can run `-t` (180 s) more, further calls in that turn still start, and gates
+  get 2x `-t`. Harbor's kill is the hard cap. This is an open blocker, not a matched limit. Terminus 2
+  sends commands non-blocking and waits min(duration, 60) s without killing them
+  (`harbor/agents/terminus_2/terminus_2.py:1400`, `:1434`); its 180 s blocking cap
+  (`tmux_session.py:792`) is not on that path. It has no turn limit by default. flywheel's
+  20000-turn limit (`-T`) is not expected to bind. OpenCode's own bash timeout is not in Harbor's
+  source and is not checked yet.
 - OpenCode automatic context compaction is off (context limit set to 0). Each harness otherwise
   keeps its own context handling, prompts and tool set.
-- The Terminus 2 and OpenCode behaviour above was checked in their source and the resolved Harbor
-  config only. Confirm the actual requests in the engine log at smoke time.
+- The Terminus 2 behaviour above was checked in Harbor's source. OpenCode's was not. The resolved
+  Harbor config was checked only. Confirm the actual requests in the engine log at smoke time.
 
 ## Run settings
 - Trials: 1 per task (`-k 1`). The official leaderboard requires 5 trials per task; this is
