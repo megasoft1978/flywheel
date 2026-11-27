@@ -1363,6 +1363,8 @@ static void test_atomic(void) {
         waitpid(pid, &st, 0);
         T("failed in-place write does not claim nothing changed", WIFEXITED(st) && WEXITSTATUS(st) == 0);
         chmod(sub_, 0755);
+    } else {
+        puts("skipped as root: in-place write tests");
     }
     snprintf(p, sizeof p, "%s/run.sh", dir);
 

@@ -1,7 +1,9 @@
 #!/bin/sh
 # Record demo/demo.tape against a model server that is already running, then check
-# the result. Leaves the take (demo.mp4, transcript.jsonl, the edited copy) in the
-# directory it prints; nothing in the repo is touched.
+# the result. Rebuilds flywheel in the repo (make clean && make). The take goes to
+# the directory it prints: demo.mp4, plus the edited copy and transcript.jsonl
+# under home/. The tape approves every command the model asks to run, and a
+# temporary HOME is not a sandbox.
 set -eu
 repo=$(cd "$(dirname "$0")/.." && pwd)
 make -C "$repo" clean >/dev/null && make -C "$repo" >/dev/null
