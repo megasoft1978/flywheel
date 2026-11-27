@@ -421,6 +421,7 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
             escape_turns = 2;
             bool bad, walled;
             char *go = gate_out(prof, ui, &gate_denied, &bad, &check, wall0, &walled);
+            if (walled) { finish = "wall"; free(go); break; }
             char *files = wall_over(wall0) ? str_dup("") : run_bash(
                 "find . -maxdepth 3 \\( -name node_modules -o -name .git \\) -prune -o -type f -print | head -40",
                 g_cfg.cwd, wall_clamp(10, wall0));

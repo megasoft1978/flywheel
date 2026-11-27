@@ -1623,6 +1623,20 @@ static void test_wall_limit(void) {
     T("-W cuts a running periodic gate", access(ran, F_OK) == 0 && secs <= 5 && !strcmp(fin, "wall"));
     T("-W: a cut periodic gate leaves no fix-this message", !has_msg(&m, "user", "Automatic type check"));
     msgs_free(&m);
+    unlink(ran);
+
+    g_cfg.gate_every = 0;
+    static const char *const same[] = {"bash", "{\"command\":\"echo same\"}"};
+    agent_finish_reason = "tool_calls"; agent_calls = same; agent_ncalls = 1; agent_tool_turns = 15;
+    pid_t srv = serve(reply_agent);
+    new_task(&m);
+    fin = agent_run(&m, &u, sum, sizeof sum);
+    stop(srv);
+    agent_tool_turns = 1;
+    T("-W cuts a loop-prune gate", access(ran, F_OK) == 0 && !strcmp(fin, "wall") &&
+      !strstr(sum, "prunes=0 "));
+    T("-W: a cut loop-prune gate is not quoted", !has_msg(&m, "user", "Current type check"));
+    msgs_free(&m);
 
     g_cfg.wall = 0;
     g_cfg.transcript = NULL;
