@@ -57,6 +57,7 @@ static const struct { const char *cmd, *desc; } SLASH[] = {
     {"/model",  "show or switch model (/model NAME)"},
     {"/allow",  "list permission rules (.flywheel.allow)"},
     {"/status", "engine, model, profile, conversation size"},
+    {"/diagnose", "fresh-context review of recent failures, then continue"},
     {"/help",   "keys, mouse, and commands"},
     {"/exit",   "quit flywheel"},
     {"/quit",   "quit flywheel"},
@@ -1555,6 +1556,7 @@ static void ui_event(const char *kind, const char *detail, void *ud) {
     char b[512];
     if (!strcmp(kind, "prune")) snprintf(b, sizeof b, YELLOW "  ✂ loop pruned (%s)" RESET, detail);
     else if (!strcmp(kind, "reset")) snprintf(b, sizeof b, YELLOW "  ↺ context reset (%s)" RESET, detail);
+    else if (!strcmp(kind, "hint")) snprintf(b, sizeof b, GRAY "  ? %s" RESET, detail);
     else if (!strcmp(kind, "rescue")) snprintf(b, sizeof b, YELLOW "  ✚ failure spiral: fresh-context diagnosis (%s)" RESET, detail);
     else if (!strcmp(kind, "gate")) snprintf(b, sizeof b, BLUE "  ○ %s" RESET, detail);
     else snprintf(b, sizeof b, "  %s %s", kind, detail);
@@ -1614,11 +1616,11 @@ static void refresh_system(void) {
     g_msgs->v[0].content = ns;
 }
 
-void tui_run_task(const char *prompt) {
+static void run_task(const char *prompt, const char *display) {
     scroll_off = 0;
     msgs_push(g_msgs, "user", prompt);
     TItem *u = item_new(T_USER);
-    item_append(u, prompt);
+    item_append(u, display);
     render_screen();
 
     Ui ui = {.emit_text = ui_text, .emit_think = ui_think, .emit_tool = ui_tool,
@@ -1672,6 +1674,8 @@ void tui_run_task(const char *prompt) {
     drain_queue();
 }
 
+void tui_run_task(const char *prompt) { run_task(prompt, prompt); }
+
 static void ins(const char *s, int n) {
     if (ilen + n >= (int)sizeof inbuf - 1) return;
     memmove(inbuf + icur + n, inbuf + icur, (size_t)(ilen - icur));
@@ -1698,10 +1702,11 @@ static void run_slash(const char *cmd) {
         push_raw(GREEN "  ✓ init done" RESET);
     } else if (!strcmp(cmd, "/clear")) {
         while (g_msgs->n > 1) msgs_trunc(g_msgs, 1);
+        agent_reset_state();
         transcript_clear();
         render_screen();
     } else if (!strcmp(cmd, "/help")) {
-        push_raw("commands: /init /clear /model /allow /status /help /exit\n"
+        push_raw("commands: /init /clear /model /allow /status /diagnose /help /exit\n"
                  "keys: ↑↓ history · Shift/Alt+Enter newline · ^O expand/collapse cmd · Cmd/Ctrl+V image · PgUp/PgDn or wheel scroll · Esc aborts · ^C clear · ^D quit");
     } else if (!strncmp(cmd, "/model", 6)) {
         if (cmd[6] == ' ' && cmd[7]) {
@@ -1750,6 +1755,26 @@ static void run_slash(const char *cmd) {
         } else {
             push_raw("  permission rules (.flywheel.allow): (none yet — approve with option 2 to add)");
         }
+    } else if (!strcmp(cmd, "/diagnose")) {
+        if (g_msgs->n < 2) { push_raw("  nothing to diagnose yet"); return; }
+        g_abort = 0;
+        working = true;
+        set_status("diagnosing…");
+        render_screen();
+        fw_tick_hook = tui_pump;
+        char *dx = agent_diagnose();
+        fw_tick_hook = NULL;
+        working = false;
+        set_status("ready");
+        if (!dx) { push_raw(YELLOW "  diagnosis failed (engine error or aborted)" RESET); return; }
+        char b[2600];
+        snprintf(b, sizeof b, CYAN "  ✚ diagnosis" RESET "\n%.2200s", dx);
+        push_raw(b);
+        char note[2400];
+        snprintf(note, sizeof note,
+            "Automatic diagnosis from a fresh-context review of the recent failures (step back from your previous patches):\n%.2000s\nContinue the task applying it, unless you can show it is wrong.", dx);
+        free(dx);
+        run_task(note, "/diagnose");
     } else if (!strcmp(cmd, "/status")) {
         char b[600];
         const Profile *prof = profile_detect(g_cfg.cwd, g_cfg.profile);

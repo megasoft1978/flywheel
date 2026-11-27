@@ -40,7 +40,7 @@ static void usage(FILE *f) {
 "  --temp X --topp X --pp X     sampling (def 0, 0.95, 0)\n"
 "  --think N  thinking budget   (def 0=server default)\n"
 "  --gates N  verify passes     (def 1)\n"
-"  --spiral N failures before a fresh-context diagnosis (def 3, 0=off)\n"
+"  --spiral N failures before an automatic fresh-context diagnosis\n             (def 3 one-shot, off in the TUI where /diagnose is on demand; 0=off)\n"
 "  --transcript FILE            JSONL log\n"
 "  --sys TEXT  extra system-prompt text\n"
 "  -q         quiet (non-interactive)\n");
@@ -116,6 +116,7 @@ static void p_status(const char *s, void *ud) { (void)s; (void)ud; }
 static void p_event(const char *k, const char *d, void *ud) { (void)ud;
     if (!strcmp(k, "prune")) printf(YELLOW "  ⚡ loop pruned (%s)" RESET "\n", d);
     else if (!strcmp(k, "reset")) printf(YELLOW "  ⚡ context reset (%s)" RESET "\n", d);
+    else if (!strcmp(k, "hint")) printf(GRAY "  ? %s" RESET "\n", d);
     else if (!strcmp(k, "rescue")) printf(YELLOW "  ⚡ failure spiral: fresh-context diagnosis (%s)" RESET "\n", d);
     fflush(stdout);
 }
@@ -351,7 +352,7 @@ int main(int argc, char **argv) {
     g_cfg.endpoint = str_dup("http://127.0.0.1:8312/v1");
     g_cfg.model = str_dup("local/qwen-pi4");
     g_cfg.maxturns = 60; g_cfg.wall = 0; g_cfg.cmd_timeout = 30;
-    g_cfg.maxtok = 12000; g_cfg.gate_every = 8; g_cfg.max_gates = 1; g_cfg.spiral = 3;
+    g_cfg.maxtok = 12000; g_cfg.gate_every = 8; g_cfg.max_gates = 1; g_cfg.spiral = -1;
     g_cfg.temp = 0.0; g_cfg.top_p = 0.95; g_cfg.pp = 0.0; g_cfg.loop_temp = 0.5;
     g_cfg.color = isatty(1);
     char cwd[1024];
@@ -380,7 +381,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--pp")) g_cfg.pp = atof(REQD("0"));
         else if (!strcmp(a, "--think")) g_cfg.think_budget = atoi(REQD("0"));
         else if (!strcmp(a, "--gates")) g_cfg.max_gates = atoi(REQD("1"));
-        else if (!strcmp(a, "--spiral")) g_cfg.spiral = atoi(REQD("3"));
+        else if (!strcmp(a, "--spiral")) g_cfg.spiral = atoi(REQD("0"));
         else if (!strcmp(a, "--transcript")) g_cfg.transcript = str_dup(REQ);
         else if (!strcmp(a, "--sys")) g_cfg.sys_extra = str_dup(REQ);
         else if (!strcmp(a, "--no-color")) g_cfg.color = false;

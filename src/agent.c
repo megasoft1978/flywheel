@@ -54,16 +54,26 @@ static void event(Ui *ui, const char *kind, const char *detail) {
 }
 
 #define MAXRESCUES 3
+#define HINT_AT 3
+
+/* session state: survives across agent_run calls so /diagnose can use it */
+static Graveyard g_gy;
+static char g_lastfail[1300];
+static char g_task[2600];
+
+void agent_reset_state(void) { gy_clear(&g_gy); g_lastfail[0] = 0; g_task[0] = 0; }
+
+static int effective_spiral(const Ui *ui) {
+    if (g_cfg.spiral >= 0) return g_cfg.spiral;
+    return ui->interactive ? 0 : 3;
+}
 
 /* Fresh-context diagnosis: the main conversation is polluted by a streak of
    failures, so ask the model once, from a clean slate, what the root cause is.
    Inputs are only the task, the graveyard and the latest failure. Returns a
    malloc'd diagnosis or NULL. Adds its cost to *toks / *secs. */
-static char *spiral_diagnose(const Msgs *msgs, const Graveyard *gy, const char *lastfail,
-                             int *toks, double *secs) {
-    const char *task = "";
-    for (int i = 0; i < msgs->n; i++)
-        if (!strcmp(msgs->v[i].role, "user") && msgs->v[i].content) { task = msgs->v[i].content; break; }
+static char *spiral_diagnose(const Graveyard *gy, const char *lastfail, int *toks, double *secs) {
+    const char *task = g_task;
     char *gys = gy_format(gy);
     size_t cap = strlen(task) + strlen(gys) + strlen(lastfail) + 1200;
     char *u = malloc(cap);
@@ -101,14 +111,22 @@ static char *spiral_diagnose(const Msgs *msgs, const Graveyard *gy, const char *
     return out;
 }
 
+char *agent_diagnose(void) {
+    int t = 0; double sc = 0;
+    return spiral_diagnose(&g_gy, g_lastfail, &t, &sc);
+}
+
 const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
     const Profile *prof = profile_detect(g_cfg.cwd, g_cfg.profile);
     Recent rec = {0};
     int *starts = malloc((g_cfg.maxturns + 8) * sizeof(int));
     int prunes = 0, gates = 0, resets = 0, rescues = 0, toks = 0, ptoks = 0, calls = 0, turns = 0;
-    Graveyard gy = {0};
     int fail_streak = 0;
-    char lastfail[1300] = "";
+    bool hinted = false;
+    const int spiral_n = effective_spiral(ui);
+    if (!ui->interactive) agent_reset_state();   /* one-shot/bench: fresh slate per task */
+    if (msgs->n > 0 && !strcmp(msgs->v[msgs->n - 1].role, "user") && msgs->v[msgs->n - 1].content)
+        snprintf(g_task, sizeof g_task, "%.2500s", msgs->v[msgs->n - 1].content);
     double secs = 0;
     bool wrote = false;
     int escape_turns = 0;
@@ -271,8 +289,8 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
             rec_push(&rec, reckey);
             if (spiral_is_failure(is_bash, bash_exit, out)) {
                 fail_streak++;
-                gy_add(&gy, reckey, out);
-                snprintf(lastfail, sizeof lastfail, "%.1250s", out);
+                gy_add(&g_gy, reckey, out);
+                snprintf(g_lastfail, sizeof g_lastfail, "%.1250s", out);
             } else if (strncmp(out, "error", 5)) {
                 fail_streak = 0;   /* a clean result breaks the streak */
             }
@@ -319,7 +337,7 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
                 "find . -maxdepth 3 -path ./node_modules -prune -o -type f \\( -name '*.ts' -o -name '*.tsx' -o -name '*.py' -o -name '*.go' -o -name '*.rs' -o -name '*.js' \\) -print | head -25",
                 g_cfg.cwd, 10);
             char pb[8192];
-            char *gys = gy_format(&gy);
+            char *gys = gy_format(&g_gy);
             fail_streak = 0;
             if (prunes % 2 == 0 && resets < MAXRESETS) {
                 resets++;
@@ -342,12 +360,16 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
         }
 
         /* failure spiral: N consecutive failing tool results -> fresh-context diagnosis */
-        if (g_cfg.spiral > 0 && fail_streak >= g_cfg.spiral && rescues < MAXRESCUES
+        if (spiral_n == 0 && ui->interactive && !hinted && fail_streak >= HINT_AT) {
+            hinted = true;
+            event(ui, "hint", "3 failures in a row · type /diagnose for a fresh-context review");
+        }
+        if (spiral_n > 0 && fail_streak >= spiral_n && rescues < MAXRESCUES
             && turn < g_cfg.maxturns - 3 && !g_abort) {
             char detail[32];
             snprintf(detail, sizeof detail, "%d failures", fail_streak);
             event(ui, "rescue", detail);
-            char *dx = spiral_diagnose(msgs, &gy, lastfail, &toks, &secs);
+            char *dx = spiral_diagnose(&g_gy, g_lastfail, &toks, &secs);
             rescues++;
             fail_streak = 0;
             if (dx) {
@@ -384,7 +406,6 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
                  finish, turns, prunes, gates, resets, rescues, calls, toks, secs);
     if (tr) fclose(tr);
     rec_free(&rec);
-    gy_clear(&gy);
     free(starts);
     return finish;
 }

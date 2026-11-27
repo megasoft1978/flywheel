@@ -25,7 +25,8 @@ typedef struct {
     int   maxtok;        /* default 12000 */
     int   gate_every;    /* default 8, 0=off */
     int   max_gates;     /* default 1 */
-    int   spiral;        /* consecutive failing tool results that trigger a fresh-context diagnosis; default 3, 0=off */
+    int   spiral;        /* consecutive failing tool results that trigger a fresh-context diagnosis;
+                            -1 (default) = 3 in one-shot/bench, off in the TUI (use /diagnose); 0 = off */
     double temp;         /* default 0.0 */
     double top_p;        /* default 0.95 */
     double pp;           /* presence penalty, default 0.0 */
@@ -149,6 +150,10 @@ typedef struct {
 
 /* runs the task to DONE/cap; returns finish string (static); out_summary filled if non-NULL */
 const char *agent_run(Msgs *, Ui *, char *out_summary, size_t);
+/* on-demand fresh-context diagnosis of the session so far (TUI /diagnose);
+   returns malloc'd text or NULL. Uses the persisted graveyard + last task. */
+char *agent_diagnose(void);
+void  agent_reset_state(void);   /* forget graveyard/task (e.g. on /clear) */
 
 /* tui.c */
 void tui_repl(void);

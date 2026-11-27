@@ -64,7 +64,7 @@ flywheel -f prompt.md -T 60 -W 900 --transcript run.jsonl
   arrow keys or mouse, persisted per-prefix rules in `.flywheel.allow`.
 - Structured tools `write_file` / `edit_file` (path-confined to the
   project, unique-match edits) beside `bash`.
-- Slash menu `/init /clear /model /allow /status /help /exit` with
+- Slash menu `/init /clear /model /allow /status /diagnose /help /exit` with
   live filtering, bracketed paste collapse, clipboard-image paste
   (ctrl+V), live telemetry: tok/s, context gauge, completion pills.
 
@@ -89,10 +89,14 @@ flywheel -f prompt.md -T 60 -W 900 --transcript run.jsonl
   model does not walk back into a dead end it already tried. Failure = non-zero
   exit with real output, timeout, or tool error (silent probes like a `grep`
   miss don't count).
-- **failure-spiral rescue** (`--spiral N`, def 3, 0=off): after N consecutive
-  failing tool results, one fresh-context call (task + graveyard + latest
-  failure only, ≤1600 tok) diagnoses the root cause and is injected as a user
-  message. Max 3 per task; counted as `rescues=` in the run summary. Idea from
+- **failure-spiral rescue** (`--spiral N`): after N consecutive failing tool
+  results, one fresh-context call (task + graveyard + latest failure only,
+  ≤1600 tok) diagnoses the root cause and is injected as a user message. Max 3
+  per task; counted as `rescues=` in the run summary. Default: **3 in one-shot /
+  bench mode, off in the interactive TUI** (failing tests are normal there). In
+  the TUI a hint appears after 3 failures in a row and `/diagnose` runs the
+  same review on demand, then continues the task with it. `--spiral 0` disables
+  everything automatic; `--spiral N` forces auto mode in the TUI too. Idea from
   Cortheon's graveyard backtracking / death-spiral rescue.
 
 ## Language profiles
@@ -148,7 +152,7 @@ claude-code-style: pinned rounded input box, status line, scroll-region output,
 line editing (←→ home/end/del, ^W ^U ^K ^A ^E), history (↑↓), alt+enter
 multiline, bracketed paste with large-paste `[paste#N]` collapse, ctrl+V
 clipboard-image paste (macOS, saves `.flywheel/paste-N.png`), slash menu
-(/init /clear /model /allow /status /help /exit) with live filtering.
+(/init /clear /model /allow /status /diagnose /help /exit) with live filtering.
 
 ## Permissions
 
