@@ -2,7 +2,7 @@ CC      = clang
 CFLAGS  = -O2 -Wall -Wextra -std=c17 -D_POSIX_C_SOURCE=200809L
 LDFLAGS = -lcurl
 SRC     = src/main.c src/util.c src/agent.c src/http.c src/msgs.c src/tools.c src/bench.c \
-          src/args.c src/sim.c src/profile.c src/tui.c \
+          src/args.c src/sim.c src/profile.c src/tui.c src/image.c \
           third_party/cjson/cJSON.c
 BIN     = flywheel
 # sanitizer builds get their own directory: make does not track CFLAGS, so
@@ -29,7 +29,7 @@ MICA_CFLAGS = -I$(MICA_DIR)/include -I$(MICA_DIR)/third_party/libvterm/include
 MICA_LIBS = $(MICA_DIR)/src/session.c $(MICA_DIR)/build/libvterm.a -framework CoreFoundation -framework SystemConfiguration -framework Network -framework Security -framework CoreImage -lpthread
 
 clean:
-	rm -f $(BIN) tests/test_unit tests/test_unit_mini tests/test_mica_tui
+	rm -f $(BIN) tests/test_unit tests/test_unit_mini tests/test_mica_tui tests/test_image tests/test_image_mini
 	rm -rf $(SAN)
 
 .PHONY: clean debug install test test-unit test-mica sanitize
@@ -68,4 +68,22 @@ $(TESTDIR)/test_mica_tui: tests/test_mica_tui.c $(MICA_DIR)/src/session.c $(MICA
 
 sanitize:
 	mkdir -p $(SAN)
-	$(MAKE) -B BIN=$(SAN)/flywheel TESTDIR=$(SAN) CFLAGS='$(SAN_CFLAGS)' test-unit test-mica
+	$(MAKE) -B BIN=$(SAN)/flywheel TESTDIR=$(SAN) CFLAGS='$(SAN_CFLAGS)' test-unit test-image test-mica
+
+# image loading, URL fetch guards and image message parts; both transports.
+# FW_IMAGE_TEST (tests only) lets one loopback port through the address filter.
+IMAGE_SRC = tests/test_image.c src/image.c src/msgs.c src/tools.c src/args.c src/sim.c \
+            src/util.c third_party/cjson/cJSON.c
+
+$(TESTDIR)/test_image: $(IMAGE_SRC) src/image.h src/flywheel.h
+	$(CC) $(CFLAGS) -DFW_IMAGE_TEST -Isrc -Ithird_party/cjson -o $@ $(IMAGE_SRC) -lcurl
+
+$(TESTDIR)/test_image_mini: $(IMAGE_SRC) src/image.h src/flywheel.h
+	$(CC) $(CFLAGS) -D_DARWIN_C_SOURCE -DFW_IMAGE_TEST -DFW_MINI_HTTP -Isrc -Ithird_party/cjson -o $@ $(IMAGE_SRC)
+
+.PHONY: test-image
+test-image: $(TESTDIR)/test_image $(TESTDIR)/test_image_mini
+	./$(TESTDIR)/test_image
+	./$(TESTDIR)/test_image_mini
+
+test: test-image
