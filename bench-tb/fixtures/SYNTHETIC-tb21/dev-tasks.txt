@@ -1,0 +1,2 @@
+# SYNTHETIC FIXTURE - not benchmark data
+terminal-bench/alpha-task

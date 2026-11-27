@@ -1,1 +1,1 @@
-{"task_name":"gamma-task","trial_name":"t3__b","verifier_result":{"rewards":{"reward":1.0}},"started_at":"2026-01-01T00:00:00Z","finished_at":"2026-01-01T00:08:00Z"}
+{"task_name":"terminal-bench/gamma-task","trial_name":"t3__b","agent_info":{"name":"opencode"},"config":{"task":{"source":"terminal-bench/terminal-bench-2-1"},"timeout_multiplier":1.0,"agent":{"name":"opencode","model_name":"local/local/qwen-pi4","kwargs":{}}},"verifier_result":{"rewards":{"reward":1.0}},"exception_info":null,"started_at":"2026-01-01T00:00:00Z","finished_at":"2026-01-01T00:08:00Z"}

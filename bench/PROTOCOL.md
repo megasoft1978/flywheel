@@ -5,6 +5,12 @@ compared with two other harnesses on the same model. The result is published wha
 
 Status: Terminal-Bench 2.1 preparation only. No scored run has started. Nothing here is a result.
 
+## Open blockers (resolve before freeze)
+- flywheel time limit: `bench-tb/flywheel_agent.py` stops flywheel after a fixed 900 s
+  (`wall_timeout`), 150 turns (`turn_timeout`) and 180 s per command, whatever the task allows.
+  Task agent timeouts run from 600 s to 12000 s; Terminus 2 and OpenCode get no such flywheel
+  cap, so the harnesses do not have the same time limit. Do not start a scored run until fixed.
+
 ## Tracks
 1. Terminal-Bench 2.1 through Harbor: all 89 tasks, three harnesses, same local model.
 2. About 20 everyday tasks (bug fix, small feature, data wrangling, git recovery),
@@ -15,48 +21,90 @@ Status: Terminal-Bench 2.1 preparation only. No scored run has started. Nothing 
   Official sources: https://github.com/harbor-framework/terminal-bench-2-1 and
   https://www.vals.ai/benchmarks/terminal-bench-2-1 (the Vals page says 2.1 is archived and
   superseded by Terminal-Bench 4.0; we still use 2.1 because it is the dataset the owner chose).
-- The registry `latest` tag moves. At freeze, record the dataset manifest digest from
-  `harbor dataset download` output and the 89-line task list in `bench-tb/tb21-tasks.txt`
-  (not yet generated; generate from the downloaded dataset, never from memory).
+- The registry `latest` tag moves. `bench-tb/tb21-tasks.txt` holds the 89 task names and the
+  manifest digest read from the registry metadata on 2026-11-27 (no task content downloaded):
+  `sha256:7d7bdc1cbedad549fc1140404bd4dc45e5fd0ea7c4186773687d177ad3a0699a`. The runner passes
+  `-d <dataset>@<digest>` and the harvester rejects any other digest. Re-check it at freeze.
+- `bench-tb/tb21-timeouts.tsv` holds agent and verifier timeouts from `task.toml` in the official
+  repo (commit `12b7565679ce5006230b820666353673a133db93`). Reference only: it has not been
+  checked against the registry task hashes.
 - Harbor version: 0.27.0 (`harbor --version`). Agents: `terminus-2` and `opencode` are built
-  into Harbor; flywheel is the custom agent `bench-tb/flywheel_agent.py` (import path
-  `flywheel_agent:FlywheelAgent`).
-- Note: Harbor reported `--ak` kwargs as ignored in the 2.0 pilot. Verify at smoke time; the
-  flywheel defaults in `flywheel_agent.py` are authoritative until then.
+  into Harbor; flywheel is the custom agent `bench-tb/flywheel_agent.py`
+  (`--agent flywheel_agent:FlywheelAgent`).
+- `--ak` kwargs reach the agent (checked with `harbor run --print-config` and the Harbor
+  source, not with a real run).
 
-## Runners (same tasks, containers, time limits, model)
+## Runners (same tasks, containers, model)
 - flywheel + local `local/qwen-pi4` (Splash on :8312 on the host)
-- Terminus 2 + the same local model
-- OpenCode + the same local model
-- Endpoint from containers: `http://host.docker.internal:8312/v1`.
-- Run via `bench-tb/run-tb21.sh --harness <name>`. Dry-run prints the exact command.
-- Not in scope for this slice: Claude Haiku 5.5 through Harbor's claude-code agent. Needs owner credential.
+- Terminus 2 + the same local model (`--model openai/local/qwen-pi4`; the server sees
+  `local/qwen-pi4`)
+- OpenCode 1.19.6 (pinned) + the same local model (`--model local/local/qwen-pi4`; OpenCode takes
+  `local` as the provider and sends `local/qwen-pi4`)
+- flywheel and OpenCode run inside the task container: `http://host.docker.internal:8312/v1`
+  (`TB_ENDPOINT`). Terminus 2 calls the model from the host: `http://127.0.0.1:8312/v1`
+  (`TB_HOST_ENDPOINT`), with a dummy API key.
+- Run via `bench-tb/run-tb21.sh --harness <name>` (`-h` for options). `--dry-run` prints the
+  exact command.
+
+## Model settings
+Set the same where the harness allows it:
+
+| setting | flywheel | Terminus 2 | OpenCode |
+|---|---|---|---|
+| temperature | 0 | 0 | 0 (build, general, explore, compaction agents) |
+| max output tokens | 12000 | 12000 | 12000 (model output limit) |
+
+The engine's thinking budget (`--thinking-token-budget`) is a server setting, so it applies to
+all three.
+
+Cannot match, and to be disclosed with the results:
+- flywheel raises temperature to 0.5 (top_p 0.95) to escape loops. At temperature 0 it sends no
+  top_p.
+- OpenCode's title agent keeps its own temperature (0.5).
+- Turn and time limits: flywheel stops at 150 turns and 900 s (see Open blockers); Terminus 2 has
+  no turn limit by default.
+- OpenCode automatic context compaction is off (context limit set to 0). Each harness otherwise
+  keeps its own context handling, prompts and tool set.
+- The Terminus 2 and OpenCode behaviour above was checked in their source and the resolved Harbor
+  config only. Confirm the actual requests in the engine log at smoke time.
 
 ## Run settings
 - Trials: 1 per task (`-k 1`). The official leaderboard requires 5 trials per task; this is
   not a leaderboard submission, so 1 trial is allowed and labelled as such.
 - Per-task timeout: dataset defaults from each task's own config, timeout multiplier 1.0,
   no per-task overrides (`--timeout-multiplier 1.0`). Record the per-task values at freeze.
+  A `TB_TIMEOUT_MULT` other than 1.0 makes the harvest fail.
 - Concurrency: 1 trial at a time (`-n 1 --n-concurrent-agents 1`). The local engine is
   single-slot and parallel trials would share one model server.
 - Never run two jobs on the same engine or the same Docker host at once.
 
 ## Reporting
-- Report two rows per harness:
-  - all 89 tasks (primary)
-  - the 79 tasks not used in development
-- Development set: the 10 tasks in the README pilot table
-  (count-dataset-tokens, chess-best-move, extract-elf, circuit-fibsqrt, fix-git,
-  make-mips-interpreter, git-multibranch, dna-insert, filter-js-from-html, gcode-to-text).
-  Shown separately as development tasks, never as the held-out score. Confirm each name
-  exists in 2.1 at freeze; 26 tasks changed from 2.0.
-- Pass rate with a 95% Wilson interval (`harvest_tb21.py`). Missing and error trials count as
-  not passed in the primary rate; the scored-only rate is shown next to it with its own
-  interval. Every missing or errored task is listed by name.
-- Time per task (wall seconds from `result.json`), plus the three charts from the harvester.
+- Harvest: `python3 -I harvest_tb21.py JOB_DIR...` (from `bench-tb/`). Three rows per harness:
+  - all-89 (primary)
+  - held-out-79, the tasks not used in development
+  - dev-10, shown only as development tasks, never as the held-out score
+- Development set: the 10 tasks in the README pilot table, in `bench-tb/tb21-dev-tasks.txt`.
+  All 10 names are in the 2.1 list; 26 tasks changed from 2.0. The harvester checks 89/10/79.
+- Classification: a verifier reward is pass (1.0) or fail, even if the trial also raised. No
+  reward after an agent timeout or other agent-side exception is fail. `error` is only an
+  infrastructure or unknown failure without a reward. Agent timeouts are also flagged and counted.
+  Note: `NonZeroAgentExitCodeError` counts as agent-side, even if the cause was the model server
+  being down; check those trials and re-run with `--rerun` if so.
+- Pass rate with a 95% Wilson interval. Missing and error trials count as not passed in the
+  primary rate; the scored-only rate is shown next to it with its own interval. Every missing or
+  errored task is listed by name, and so is every archived or re-run trial.
+- Time per task is the whole trial time (`started_at` to `finished_at`: environment setup, agent
+  and verifier), plus the three charts from the harvester.
+- The harvester writes nothing and exits nonzero on: no trials, unexpected or duplicate trials,
+  unreadable results, wrong dataset, digest, agent, model or timeout settings, or a task list
+  that is not the 89-task list. `--partial` (subset) and `--synthetic` (fixtures) relax the last
+  check; every output, charts included, is stamped PARTIAL or SYNTHETIC. A run with missing
+  tasks is stamped PARTIAL.
 - Trajectories published with the results after a secret and personal-data check.
 - Required label on every published table: "self-run on the official dataset and harness,
-  trajectories public". Never claim a leaderboard rank, never "beats Claude".
+  trajectories public". The harvester adds the trajectories part only with
+  `--trajectories-url <published URL>`; pass it only once they are really public. Never claim a
+  leaderboard rank, never "beats Claude".
 - Published third-party rows (for example the Vals AI Terminus 2 table, Oct 2026) may be cited
   only as separate rows labelled "different infrastructure" (Daytona remote execution, their
   own time limits, their own trial counts), never placed in the same table as our rows.
@@ -68,19 +116,30 @@ Status: Terminal-Bench 2.1 preparation only. No scored run has started. Nothing 
 - No tuning on scored tasks. Harness work uses the development set, one task at a time:
   run, read the trajectory, fix the general cause in the harness, add a test, re-run.
 - A fix must be general. Nothing task-specific goes into the harness or its prompts.
-- Every attempt counts. Re-run only infrastructure failures (agent never started), and list each one.
-- Resumable: `run-tb21.sh` only runs tasks without a `result.json`. Existing job dirs are never deleted.
+- Every attempt counts. Re-run only infrastructure failures (agent never started), with
+  `run-tb21.sh --harness <name> --rerun <task>`: the old trial is archived and logged in the job's
+  `reruns.jsonl`, which the report includes.
+- Resume: run the same command again. It passes Harbor the same dataset digest and full task list
+  (Harbor refuses a job whose config differs); Harbor skips finished trials. Before that, trial
+  dirs with no usable result (which Harbor would delete) and cancelled trials are moved to
+  `jobs/tb21-archive/<job>/`. Existing job dirs are never deleted.
+- Subsets (`--include`, `--tasks`) need their own `--job-name`. `--smoke` runs the first task in
+  `jobs/tb21-smoke/`, apart from the scored jobs.
+- One runner at a time (lock `jobs/tb21.lock`; after a killed run, remove it by hand).
 - No paid model calls anywhere in the benchmark or its tests.
 
-## Estimated runtime (estimate, not measured)
-- Assumption: average 15 min per task including setup and verification; 89 tasks.
+## Estimated runtime (rough guess, not measured)
+- Guess: average 15 min per task including setup and verification; 89 tasks.
 - Per harness: about 22 h wall time sequentially. Three harnesses: about 67 h.
+- Worst case for agent time alone: the 89 agent timeouts sum to 42.2 h per harness, so
+  126.6 h for the three harnesses (sum x 3). Environment builds and verifiers come on top
+  (verifier timeouts sum to 41.4 h per harness).
 - Overnight-sized chunks: resume across nights with `run-tb21.sh`.
 - Real numbers replace this after the smoke test and the first development-set pass.
 
 ## Order of work
-1. Check: dataset download and task count (89), per-task timeouts, Docker resources, Harbor
-   agent kwargs, host engine reachable from containers.
+1. Check: dataset digest and per-task timeouts against the downloaded dataset, Docker resources,
+   flywheel time limit (Open blockers), host engine reachable from containers and from the host.
 2. Smoke: one task per harness, sequential, only when Docker and the host are not loaded.
    Not yet run (host load average was 67 when this was prepared).
 3. Fix what would waste runs on the development set.
@@ -88,6 +147,5 @@ Status: Terminal-Bench 2.1 preparation only. No scored run has started. Nothing 
 5. Freeze, run, harvest, build the landing page.
 
 ## Needs the owner
-- Claude credential for the Haiku runs inside containers (set by the owner, never committed).
 - OK before publishing the page.
 - Confirmation that 1 trial per task is acceptable (the official leaderboard needs 5).

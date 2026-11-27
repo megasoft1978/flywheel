@@ -2,23 +2,30 @@
 """Harvest Harbor job dirs for Terminal-Bench 2.1 into results JSON + inline SVG charts.
 
 stdlib only; run as: python3 -I harvest_tb21.py JOB_DIR [JOB_DIR ...] [--tasks FILE]
-                                              [--out DIR] [--label TEXT]
+       [--dev-tasks FILE] [--partial] [--synthetic] [--trajectories-url URL] [--out DIR] [--label TEXT]
 
-Reads every <job>/<trial>/result.json that has a task_name. Per task:
-  pass     verifier reward == 1.0
-  fail     verifier ran, reward != 1.0
-  error    trial raised an exception (exception_info set) or no verifier result
-  missing  task in --tasks list but no trial result at all
+Reads every <job>/<trial>/result.json. Task names are compared without
+the "terminal-bench/" namespace. Per task:
+  pass     verifier reward == 1.0 (also when the trial raised, e.g. AgentTimeoutError)
+  fail     verifier reward != 1.0, or no reward after an agent-side exception or timeout
+  error    no reward and an infrastructure (or unknown) exception, or no exception at all
+  missing  task in the list but no trial result
+A trial that ended in AgentTimeoutError also carries a timeout flag.
 Missing and error trials are never dropped: they stay in the denominator
 (the primary rate treats them as not passed) and are listed by name.
 
-Assumed Harbor result.json fields (checked against harbor 0.27.0 output at smoke time):
-  task_name, trial_name, verifier_result.rewards.reward, exception_info,
-  started_at, finished_at (ISO-8601). Unknown shapes become "error" with the reason.
+Nothing is written and the exit code is nonzero when: a job has no trials, a trial is not in the
+task list, a task has two trials, a result is unreadable, the provenance is wrong (agent, model,
+dataset, dataset digest, timeout overrides), or the list is not the 89-task list and neither
+--partial nor --synthetic was given.
+
+Result fields used (harbor 0.27.0 TrialResult): task_name, trial_name, agent_info.name,
+config.{task.source, agent, verifier, *timeout_multiplier}, verifier_result.rewards.reward,
+exception_info.exception_type, started_at, finished_at; job config.json datasets[0].ref.
 
 Outputs (in --out, default ./harvest-out): results.json, report.md,
   chart_rates.svg (bars + 95% Wilson whiskers), chart_grid.svg (task x harness pass/fail grid),
-  chart_time.svg (per-task wall-time strip). Never writes into docs/ or README.
+  chart_time.svg (whole trial time per task). Never writes into docs/ or README.
 """
 
 import argparse
@@ -31,6 +38,23 @@ import os
 import sys
 
 Z95 = 1.959963984540054
+HERE = os.path.dirname(os.path.abspath(__file__))
+TASKS_FILE = os.path.join(HERE, "tb21-tasks.txt")
+DEV_FILE = os.path.join(HERE, "tb21-dev-tasks.txt")
+DATASET = "terminal-bench/terminal-bench-2-1"
+MODEL = "local/qwen-pi4"
+# harness -> (where the trial config names the model, expected value); matches run-tb21.sh
+HARNESS_MODEL = {
+    "flywheel": (("kwargs", "fw_model"), MODEL),
+    "terminus-2": (("model_name",), "openai/" + MODEL),
+    "opencode": (("model_name",), "local/" + MODEL),
+}
+# Exceptions raised by the agent's own run: without a reward they are a fail, not an infra error.
+AGENT_EXCEPTIONS = {
+    "AgentTimeoutError", "NonZeroAgentExitCodeError", "ContextWindowExceededError",
+    "ContextLengthExceededError", "OutputTokenExceededError", "OutputLengthExceededError",
+    "AgentSafetyRefusalError", "ContentPolicyViolationError",
+}
 
 
 def wilson(k, n):
@@ -54,64 +78,135 @@ def parse_iso(s):
         return None
 
 
-def read_trials(job_dir):
-    """Yield (task_name, record) for each trial result.json under a job dir."""
-    for path in glob.glob(os.path.join(job_dir, "**", "result.json"), recursive=True):
-        try:
-            with open(path, encoding="utf-8") as fh:
-                d = json.load(fh)
-        except (OSError, json.JSONDecodeError) as exc:
-            yield (os.path.basename(os.path.dirname(path)), {"status": "error", "reason": f"unreadable: {exc}"})
+def bare(name):
+    return name.rsplit("/", 1)[-1]
+
+
+def load_json(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            d = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return d if isinstance(d, dict) else None
+
+
+def provenance(harness, d):
+    """Return the reasons why trial result d does not belong to a scored run of this harness."""
+    cfg = d.get("config") or {}
+    agent = cfg.get("agent") or {}
+    bad = []
+    name = (d.get("agent_info") or {}).get("name")
+    if name != harness:
+        bad.append(f"agent is {name!r}, expected {harness!r}")
+    keys, want = HARNESS_MODEL[harness]
+    got = agent
+    for k in keys:
+        got = (got or {}).get(k)
+    if got != want:
+        bad.append(f"model is {got!r}, expected {want!r}")
+    source = (cfg.get("task") or {}).get("source")
+    if source != DATASET or not str(d.get("task_name", "")).startswith("terminal-bench/"):
+        bad.append(f"dataset is {source!r}, expected {DATASET!r}")
+    if cfg.get("timeout_multiplier") != 1.0:
+        bad.append(f"timeout multiplier is {cfg.get('timeout_multiplier')!r}, expected 1.0")
+    over = [k for k, v in cfg.items() if k.endswith("_timeout_multiplier") and v not in (None, 1.0)]
+    for part in ("agent", "verifier"):
+        over += [f"{part}.{k}" for k, v in (cfg.get(part) or {}).items()
+                 if k in ("override_timeout_sec", "max_timeout_sec") and v is not None]
+    if over:
+        bad.append("timeout overrides set: " + ", ".join(over))
+    return bad
+
+
+def classify(d):
+    rec = {"status": None, "reward": None, "reason": None, "seconds": None,
+           "timeout": False, "trial": d.get("trial_name")}
+    exc = (d.get("exception_info") or {}).get("exception_type")
+    vr = d.get("verifier_result") or {}
+    rw = (vr.get("rewards") or {}).get("reward")
+    rec["reason"] = exc
+    rec["timeout"] = exc == "AgentTimeoutError"
+    if rw is not None:
+        rec["reward"] = float(rw)
+        rec["status"] = "pass" if float(rw) == 1.0 else "fail"
+    elif exc in AGENT_EXCEPTIONS:
+        rec["status"] = "fail"
+    else:
+        rec["status"] = "error"
+        rec["reason"] = exc or "no verifier reward"
+    s, e = parse_iso(d.get("started_at")), parse_iso(d.get("finished_at"))
+    if s and e:
+        rec["seconds"] = round((e - s).total_seconds(), 1)
+    return rec
+
+
+def read_job(job_dir, harness, digest, expected):
+    """Return ({task: record}, [problems]) for one job dir."""
+    trials, problems, found = {}, [], 0
+    for path in sorted(glob.glob(os.path.join(job_dir, "*", "result.json"))):
+        d = load_json(path)
+        if d is None:
+            problems.append(f"unreadable result: {path}")
             continue
-        if not isinstance(d, dict) or "task_name" not in d:
+        found += 1
+        task = bare(d.get("task_name") or "?")
+        if task not in expected:
+            problems.append(f"unexpected trial: {task} ({path})")
             continue
-        task = d.get("task_name") or "?"
-        rec = {"status": None, "reward": None, "reason": None, "seconds": None, "trial": d.get("trial_name")}
-        if d.get("exception_info"):
-            rec["status"] = "error"
-            rec["reason"] = str(d["exception_info"].get("exception_type", "exception"))
-        else:
-            vr = d.get("verifier_result") or {}
-            rw = (vr.get("rewards") or {}).get("reward") if isinstance(vr, dict) else None
-            if rw is None:
-                rec["status"] = "error"
-                rec["reason"] = "no verifier reward"
-            else:
-                rec["reward"] = float(rw)
-                rec["status"] = "pass" if float(rw) == 1.0 else "fail"
-        s, e = parse_iso(d.get("started_at")), parse_iso(d.get("finished_at"))
-        if s and e:
-            rec["seconds"] = round((e - s).total_seconds(), 1)
-        yield task, rec
+        if task in trials:
+            problems.append(f"duplicate trial for {task}: {path}")
+            continue
+        problems += [f"{task}: {why}" for why in provenance(harness, d)]
+        job = load_json(os.path.join(os.path.dirname(os.path.dirname(path)), "config.json")) or {}
+        ref = (job.get("datasets") or [{}])[0].get("ref")
+        if ref != digest:
+            problems.append(f"{task}: job dataset digest is {ref!r}, expected {digest!r}")
+        trials[task] = classify(d)
+    if not found:
+        problems.append(f"no trials in {job_dir}")
+    return trials, problems
 
 
 def harness_name(job_dir):
-    """Harness = job dir basename; strip a leading 'tb21-' so 'tb21-flywheel' -> 'flywheel'."""
+    """'tb21-flywheel[-suffix]' -> 'flywheel'; None when the dir names no known harness."""
     base = os.path.basename(os.path.normpath(job_dir))
-    return base[5:] if base.startswith("tb21-") else base
+    base = base[5:] if base.startswith("tb21-") else base
+    return next((h for h in HARNESS_MODEL if base == h or base.startswith(h + "-")), None)
 
 
-def load_expected(path):
-    if not path:
-        return None
+def load_reruns(job_dir):
+    path = os.path.join(job_dir, "reruns.jsonl")
+    if not os.path.exists(path):
+        return []
     with open(path, encoding="utf-8") as fh:
-        return [ln.strip() for ln in fh if ln.strip() and not ln.lstrip().startswith("#")]
+        return [json.loads(ln) for ln in fh if ln.strip()]
+
+
+def load_names(path):
+    with open(path, encoding="utf-8") as fh:
+        return [bare(ln.strip()) for ln in fh if ln.strip() and not ln.lstrip().startswith("#")]
+
+
+def load_digest(path):
+    with open(path, encoding="utf-8") as fh:
+        return next((ln.split(":", 1)[1].strip() for ln in fh if ln.startswith("# dataset-digest:")), None)
 
 
 def summarise(name, trials, expected):
-    """trials: {task: record} (last record wins if duplicated and counted as duplicates)."""
-    tasks = expected if expected is not None else sorted(trials)
+    """trials: {task: record}; expected: the task names that form the denominator."""
     rows = {}
     counts = {"pass": 0, "fail": 0, "error": 0, "missing": 0}
-    for t in tasks:
+    for t in expected:
         rec = trials.get(t)
         if rec is None:
-            st = {"status": "missing", "reward": None, "reason": "no trial result", "seconds": None}
+            st = {"status": "missing", "reward": None, "reason": "no trial result", "seconds": None,
+                  "timeout": False}
         else:
             st = rec
         rows[t] = st
         counts[st["status"]] += 1
-    n = len(tasks)
+    n = len(expected)
     k = counts["pass"]
     lo, hi = wilson(k, n)
     scored = counts["pass"] + counts["fail"]
@@ -120,8 +215,8 @@ def summarise(name, trials, expected):
     return {
         "harness": name,
         "n_tasks": n,
-        "expected_list": expected is not None,
         "counts": counts,
+        "timeouts": sum(r["timeout"] for r in rows.values()),
         "pass_rate": k / n if n else 0.0,
         "wilson95": [lo, hi],
         "scored_n": scored,
@@ -130,6 +225,14 @@ def summarise(name, trials, expected):
         "median_seconds": sorted(times)[len(times) // 2] if times else None,
         "tasks": rows,
     }
+
+
+def stamp_svg(body, stamps, x, y, anchor):
+    if not stamps:
+        return body
+    text = (f'<text x="{x}" y="{y}" text-anchor="{anchor}" font-size="14" font-weight="bold" '
+            f'fill="#c62828">{" ".join(stamps)}</text>')
+    return body.replace("</svg>", text + "\n</svg>")
 
 
 def svg_bars(summaries):
@@ -195,7 +298,7 @@ def svg_time(summaries):
     H = top + row_h * max(len(summaries), 1) + 40
     out = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" '
            'font-family="sans-serif" font-size="11">',
-           f'<text x="{pad_l}" y="18" font-size="14">Wall time per task (s), one dot per task</text>']
+           f'<text x="{pad_l}" y="18" font-size="14">Time per task: whole trial (s), one dot per task</text>']
     for j, s in enumerate(summaries):
         y = top + row_h * j + row_h / 2
         out.append(f'<text x="{pad_l-6}" y="{y+4:.1f}" text-anchor="end">{html.escape(s["harness"])}</text>')
@@ -211,18 +314,35 @@ def svg_time(summaries):
     return "\n".join(out)
 
 
-def report_md(summaries, label):
-    lines = [f"# Terminal-Bench 2.1 harvest: {label}", "",
-             "Self-run on the official dataset and harness, trajectories public. Not a leaderboard entry.",
-             "Primary rate counts missing and error trials as not passed. Scored rate excludes them.", "",
-             "| harness | tasks | pass | fail | error | missing | pass rate (95% Wilson) | scored pass rate (95% Wilson) |",
-             "|---|---|---|---|---|---|---|---|"]
+def rate(p, interval, n=None):
+    s = f"{p*100:.1f}% [{interval[0]*100:.1f}, {interval[1]*100:.1f}]"
+    return s if n is None else f"{s} (n={n})"
+
+
+def report_md(summaries, label, stamps, url):
+    lines = [f"# {' '.join(stamps + [''])}Terminal-Bench 2.1 harvest: {label}", ""]
+    if "SYNTHETIC" in stamps:
+        lines.append("SYNTHETIC test data. Not a benchmark result.")
+    elif url:
+        lines.append(f"Self-run on the official dataset and harness, trajectories public: {url} "
+                     "Not a leaderboard entry.")
+    else:
+        lines.append("Self-run on the official dataset and harness. Not a leaderboard entry.")
+    if "PARTIAL" in stamps:
+        lines.append("PARTIAL: tasks are missing. Do not publish as a result.")
+    lines += ["Primary rate counts missing and error trials as not passed. Scored rate excludes them.",
+              "Timeouts are agent time-limit hits; each is also counted as pass or fail.", "",
+              "| harness | set | tasks | pass | fail | error | missing | timeouts | pass rate (95% Wilson) "
+              "| scored pass rate (95% Wilson) |",
+              "|---|---|---|---|---|---|---|---|---|---|"]
     for s in summaries:
-        c = s["counts"]
-        sr = f'{s["scored_pass_rate"]*100:.1f}% [{s["scored_wilson95"][0]*100:.1f}, {s["scored_wilson95"][1]*100:.1f}] (n={s["scored_n"]})' \
-            if s["scored_pass_rate"] is not None else "n/a"
-        lines.append(f'| {s["harness"]} | {s["n_tasks"]} | {c["pass"]} | {c["fail"]} | {c["error"]} | '
-                     f'{c["missing"]} | {s["pass_rate"]*100:.1f}% [{s["wilson95"][0]*100:.1f}, {s["wilson95"][1]*100:.1f}] | {sr} |')
+        for name, r in s["sets"].items():
+            c = r["counts"]
+            sr = rate(r["scored_pass_rate"], r["scored_wilson95"], r["scored_n"]) \
+                if r["scored_pass_rate"] is not None else "n/a"
+            lines.append(f'| {s["harness"]} | {name} | {r["n_tasks"]} | {c["pass"]} | {c["fail"]} | '
+                         f'{c["error"]} | {c["missing"]} | {r["timeouts"]} | '
+                         f'{rate(r["pass_rate"], r["wilson95"])} | {sr} |')
     lines.append("")
     for s in summaries:
         bad = [(t, r) for t, r in s["tasks"].items() if r["status"] in ("error", "missing")]
@@ -231,42 +351,85 @@ def report_md(summaries, label):
             for t, r in bad:
                 lines.append(f"- {t}: {r['status']} ({r.get('reason') or '-'})")
             lines.append("")
+    lines.append("## Rerun log")
+    log = [(s["harness"], e) for s in summaries for e in s["reruns"]]
+    for h, e in log:
+        lines.append(f"- {h} {e.get('task')}: {e.get('kind')} at {e.get('time')} "
+                     f"(reward {e.get('reward')}, exception {e.get('exception') or '-'}, "
+                     f"old trial {e.get('trial')})")
+    if not log:
+        lines.append("- no entries")
+    lines.append("")
     return "\n".join(lines)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("job_dirs", nargs="+")
-    ap.add_argument("--tasks", help="file with the expected task names (one per line)")
+    ap.add_argument("--tasks", default=TASKS_FILE, help="expected task list (one name per line)")
+    ap.add_argument("--dev-tasks", default=DEV_FILE, help="development tasks, reported separately")
+    ap.add_argument("--partial", action="store_true", help="allow a task list other than the 89")
+    ap.add_argument("--synthetic", action="store_true", help="test data: stamp every output")
+    ap.add_argument("--trajectories-url", help="where the trajectories are published")
     ap.add_argument("--out", default="harvest-out")
     ap.add_argument("--label", default="run")
     a = ap.parse_args()
-    expected = load_expected(a.tasks)
+
+    expected = load_names(a.tasks)
+    dev = load_names(a.dev_tasks)
+    full = load_names(TASKS_FILE)
+    digest = load_digest(TASKS_FILE)
+    problems = []
+    if len(set(expected)) != len(expected) or len(set(dev)) != len(dev) or not expected:
+        problems.append("empty task list or repeated names in a task list")
+    dev_in = [t for t in expected if t in set(dev)]
+    held = [t for t in expected if t not in set(dev)]
+    if not (a.partial or a.synthetic):
+        if sorted(expected) != sorted(full) or len(full) != 89:
+            problems.append(f"task list is not the 89-task list ({len(expected)} names); "
+                            "use --partial for a subset")
+        elif (len(dev), len(dev_in), len(held)) != (10, 10, 79):
+            problems.append(f"expected 10 dev and 79 held-out tasks, got {len(dev_in)} and {len(held)}")
+
     summaries = []
     for jd in a.job_dirs:
-        if not os.path.isdir(jd):
-            print(f"not a directory: {jd}", file=sys.stderr)
+        harness = harness_name(jd)
+        if not os.path.isdir(jd) or harness is None:
+            print(f"not a job directory of a known harness: {jd}", file=sys.stderr)
             return 2
-        trials = {}
-        dup = 0
-        for task, rec in read_trials(jd):
-            if task in trials:
-                dup += 1
-            trials[task] = rec
-        s = summarise(harness_name(jd), trials, expected)
-        s["duplicate_trials_ignored"] = dup
+        if any(s["harness"] == harness for s in summaries):
+            problems.append(f"two job dirs for {harness}")
+        trials, bad = read_job(jd, harness, digest, set(expected))
+        problems += [f"{harness}: {p}" for p in bad]
+        s = summarise(harness, trials, expected)
+        s["sets"] = {}
+        for kind, names in (("all", expected), ("held-out", held), ("dev", dev_in)):
+            r = summarise(harness, trials, names)
+            del r["harness"], r["tasks"]
+            s["sets"][f"{kind}-{len(names)}"] = r
+        s["reruns"] = load_reruns(jd)
         summaries.append(s)
+    if problems:
+        for p in problems:
+            print(f"ERROR: {p}", file=sys.stderr)
+        return 1
+
+    stamps = ["SYNTHETIC"] if a.synthetic else []
+    if len(expected) < len(full) and not a.synthetic or any(s["counts"]["missing"] for s in summaries):
+        stamps.append("PARTIAL")
+    report = report_md(summaries, a.label, stamps, a.trajectories_url)
     os.makedirs(a.out, exist_ok=True)
     with open(os.path.join(a.out, "results.json"), "w", encoding="utf-8") as fh:
-        json.dump({"label": a.label, "summaries": summaries}, fh, indent=2)
+        json.dump({"label": a.label, "stamps": stamps, "dataset_digest": digest,
+                   "trajectories_url": a.trajectories_url, "summaries": summaries}, fh, indent=2)
     with open(os.path.join(a.out, "report.md"), "w", encoding="utf-8") as fh:
-        fh.write(report_md(summaries, a.label))
-    for fname, body in (("chart_rates.svg", svg_bars(summaries)),
-                        ("chart_grid.svg", svg_grid(summaries)),
-                        ("chart_time.svg", svg_time(summaries))):
+        fh.write(report)
+    for fname, body in (("chart_rates.svg", stamp_svg(svg_bars(summaries), stamps, 556, 18, "end")),
+                        ("chart_grid.svg", stamp_svg(svg_grid(summaries), stamps, 4, 16, "start")),
+                        ("chart_time.svg", stamp_svg(svg_time(summaries), stamps, 616, 18, "end"))):
         with open(os.path.join(a.out, fname), "w", encoding="utf-8") as fh:
             fh.write(body)
-    print(report_md(summaries, a.label))
+    print(report)
     return 0
 
 
