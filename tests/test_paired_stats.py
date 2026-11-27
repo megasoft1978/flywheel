@@ -58,6 +58,14 @@ class Loaders(unittest.TestCase):
             self.assertEqual(got, {"a": True, "b": False})
             self.assertEqual(multi, 0)
 
+    def test_harbor_nested_job_layout(self):
+        # run-slice.sh uses `harbor -o JOB`, which nests <JOB>/<timestamp>/<trial>/result.json
+        with tempfile.TemporaryDirectory() as d:
+            inner = os.path.join(d, "2026-11-27__10-00-00")
+            os.makedirs(inner)
+            self._harbor(inner, [("a", 1.0), ("b", 0.0)])
+            self.assertEqual(ps.load(d)[0], {"a": True, "b": False})
+
     def test_harbor_multi_trial(self):
         with tempfile.TemporaryDirectory() as d:
             self._harbor(d, [("a", 1.0), ("a", 1.0), ("a", 0.0), ("b", 0.0), ("b", 0.0)])

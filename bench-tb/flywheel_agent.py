@@ -27,6 +27,9 @@ class FlywheelAgent(BaseAgent):
         self._model = kwargs.pop("fw_model", None)
         self._turn_timeout = kwargs.pop("turn_timeout", 90)
         self._wall_timeout = kwargs.pop("wall_timeout", 900)
+        # failure-spiral rescue: None = binary default, 0 = off, N = after N failures
+        spiral = kwargs.pop("spiral", None)
+        self._spiral = None if spiral in (None, "") else int(spiral)
         super().__init__(*args, **kwargs)
 
     @staticmethod
@@ -72,10 +75,11 @@ class FlywheelAgent(BaseAgent):
         }
         if self._model:
             env["FW_MODEL"] = self._model
+        spiral_flag = f"--spiral {self._spiral} " if self._spiral is not None else ""
         cmd = (
             "cd /app 2>/dev/null || cd /; "
             f"flywheel -q -f /tmp/fw_instruction.txt -T {self._turn_timeout} "
-            f"-W {self._wall_timeout} --transcript /tmp/fw_transcript.jsonl "
+            f"-W {self._wall_timeout} {spiral_flag}--transcript /tmp/fw_transcript.jsonl "
             "> /tmp/fw_out.log 2>&1; echo FW_EXIT_$?"
         )
         res = await environment.exec(

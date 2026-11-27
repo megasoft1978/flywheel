@@ -49,7 +49,7 @@ def mcnemar_exact(b, c):
 
 def _load_harbor(path):
     rewards = {}
-    for rj in glob.glob(os.path.join(path, "*", "result.json")):
+    for rj in glob.glob(os.path.join(path, "**", "result.json"), recursive=True):
         try:
             with open(rj) as f:
                 d = json.load(f)
