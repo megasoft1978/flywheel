@@ -127,6 +127,9 @@ static void test_refs(void) {
     finds("span beside a path", "`ls -l` %s/c.JPG", "%s/c.JPG", NULL, false);
     finds("unmatched backtick", "a ` %s/c.JPG", "%s/c.JPG", NULL, false);
     finds("escaped backticks", "\\` %s/c.JPG \\`", "%s/c.JPG", NULL, false);
+    finds("unclosed fence", "see\n```\nopen ./c.JPG\n", NULL, NULL, false);
+    finds("unclosed indented fence", "  ```sh\ncurl https://example.invalid/a.png", NULL, NULL, false);
+    finds("unclosed run inside a line", "a ``` %s/c.JPG", "%s/c.JPG", NULL, false);
     char *one[1];
     bool only;
     char msg[2000];

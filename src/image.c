@@ -442,9 +442,11 @@ static char *as_ref(const char *cwd, char *p, bool url) {
 
 /* blank out code spans and fences: what they quote is only mentioned. A run of
    backticks is closed by the next run of the same length (a fence of three or
-   more also by a longer one); an unclosed or escaped one is plain text. True if
-   anything was blanked. */
+   more also by a longer one). A fence opened at the start of a line and never
+   closed runs to the end; any other unclosed or escaped run is plain text. True
+   if anything was blanked. */
 static bool blank_code(char *s) {
+    const char *text = s;
     bool any = false;
     while (*s) {
         if (*s == '\\' && s[1]) { s += 2; continue; }
@@ -455,7 +457,13 @@ static bool blank_code(char *s) {
             m = strspn(p, "`");
             if (m == n || (n >= 3 && m > n)) break;
         }
-        if (!p) { s += n; continue; }
+        if (!p) {
+            const char *b = s;
+            while (b > text && (b[-1] == ' ' || b[-1] == '\t')) b--;
+            if (n < 3 || (b > text && b[-1] != '\n')) { s += n; continue; }
+            memset(s, ' ', strlen(s));
+            return true;
+        }
         memset(s, ' ', (size_t)(p + m - s));
         s = p + m;
         any = true;

@@ -1359,9 +1359,41 @@ static void image_tests(const char *cmd) {
     pump(s, 600);
     CHECK(s, "queue: only the first was sent", find_row(s, "follow") < 0);
     unlink(slow);
-    keys(s, "\x15IMGQ fixed\r");
+    keys(s, "\x15/help\r");
+    pump(s, 600);
+    CHECK(s, "queue: /help leaves it held", find_row(s, "follow") < 0);
+    CHECK(s, "queue: image alone is held", sends(s, "./shot.png", "1 image attached"));
+    pump(s, 600);
+    CHECK(s, "queue: image alone leaves it held", find_row(s, "follow") < 0);
+    keys(s, "IMGQ fixed\r");
     CHECK(s, "queue: held goes after the next one",
           wait_for_text(s, "follow", 8000));
+    pump(s, 600);
+
+    /* /clear drops what was held: it must not run in the new conversation */
+    keys(s, "/clear\r");
+    put_file(slow, "", 0, 0600);
+    keys(s, "/paste\r");
+    keys(s, "IMGQ ./bad.png\r");
+    keys(s, "IMGQ follow\r");
+    CHECK(s, "queue: held before /clear", wait_for_text(s, "1 queued message held", 8000));
+    unlink(slow);
+    keys(s, "\x15/clear\r");
+    pump(s, 600);
+    CHECK(s, "queue: /clear says it dropped", find_row(s, "queued messages dropped") >= 0);
+    CHECK(s, "queue: /clear did not send it", find_row(s, "follow") < 0);
+    CHECK(s, "queue: sends after /clear", sends(s, "IMGQ", "GOT last=0 all=0"));
+    pump(s, 600);
+    CHECK(s, "queue: nothing left after /clear", find_row(s, "follow") < 0);
+
+    /* a /clear queued ahead of a message still runs, then the message */
+    put_file(slow, "", 0, 0600);
+    keys(s, "/paste\r");
+    keys(s, "/clear\r");
+    keys(s, "IMGQ queued after clear\r");
+    CHECK(s, "queue: message behind a queued /clear runs",
+          wait_for_text(s, "GOT last=0 all=0", 8000));
+    unlink(slow);
     pump(s, 600);
 
     /* Esc while the model is being asked about vision, images already held */

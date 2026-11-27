@@ -2648,6 +2648,10 @@ static void run_slash(const char *cmd) {
         while (g_msgs->n > 1) msgs_trunc(g_msgs, 1);
         images_free(&pending);
         transcript_clear();
+        if (qheld) {                /* not into the new conversation */
+            queue_clear();
+            set_notice("queued messages dropped");
+        }
         render_screen();
     } else if (!strcmp(cmd, "/paste")) {
         paste_clipboard();
@@ -2900,10 +2904,10 @@ static void submit(const char *cmd, const char *raw) {
                      old ? "\n  This conversation holds images: /clear drops them." : "");
             push_raw(b);
             keep_unsent(raw);
-            qheld = !g_abort;           /* a cancel drops the queue instead */
-            if (qheld && qn) {
+            qheld = !g_abort && qn;     /* a cancel drops the queue instead */
+            if (qheld) {
                 snprintf(b, sizeof b, YELLOW "  %d queued message%s held:" RESET
-                         " sent after your next one (^C drops %s)",
+                         " sent after your next one (^C or /clear drops %s)",
                          qn, qn == 1 ? "" : "s", qn == 1 ? "it" : "them");
                 push_raw(b);
             }
@@ -2912,6 +2916,7 @@ static void submit(const char *cmd, const char *raw) {
         }
         if (only) { say_attached(); return; }
     }
+    qheld = false;      /* held messages follow this one */
     tui_run_task(cmd);
 }
 
@@ -3094,7 +3099,6 @@ if (busy) {
         }
         if (isexit) { want_exit = true; free(cmd); free(raw); return; }
         render_screen();
-        qheld = false;
         submit(cmd, raw);
         free(cmd);
         free(raw);

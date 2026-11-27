@@ -134,10 +134,10 @@ In the interactive UI only (one-shot mode sends text only):
 
 A message holding only images keeps them for your next one; `^C` or `/clear` drops them. If one cannot
 be loaded, nothing is sent and the message returns to the input box; messages queued behind it wait
-for your next one (`^C` drops them). Only what you type or paste is searched, never model output, tool
-output or project files. A pasted block of several lines is not searched, and nothing in a backtick
-code span or fence is attached or fetched. Naming an image file attaches it, even outside the
-project.
+until your next message is sent (`^C` or `/clear` drops them). Only what you type or paste is
+searched, never model output, tool output or project files. A pasted block of several lines is not
+searched, and nothing in a backtick code span or fence (also one left unclosed) is attached or
+fetched. Naming an image file attaches it, even outside the project.
 
 Limits: 10 MB per file, and 64 images or 32 MB (encoded) per conversation. On macOS, images over
 1568 px on a side are downscaled. Images stay in the conversation until `/clear`, also one the server
