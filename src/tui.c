@@ -2232,7 +2232,9 @@ static char *plain_text(const char *s) {
         unsigned cp = c & (0x7Fu >> len);
         for (int i = 1; i < len; i++) cp = (cp << 6) | (p[i] & 0x3F);
         int take = flag_len(p);
-        if (!take && cp >= 0xA0 && !(cp >= 0xE0000 && cp <= 0xE007F) && !is_hidden_cp(cp, false))
+        /* ZWNJ joins Persian and Indic words: it is kept although is_hidden_cp flags it */
+        if (!take && cp >= 0xA0 && !(cp >= 0xE0000 && cp <= 0xE007F) &&
+            (cp == 0x200C || !is_hidden_cp(cp, false)))
             take = len;                                   /* below A0: C1 controls */
         memcpy(d + o, p, (size_t)take);
         o += (size_t)take;
@@ -2245,18 +2247,53 @@ static char *plain_text(const char *s) {
     return d;
 }
 
-static bool path_within(const char *path, const char *dir) {
-    size_t n = strlen(dir);
-    if (n && dir[n - 1] == '/') n--;
-    return !strncmp(path, dir, n) && (path[n] == '/' || !path[n]);
+/* True if path is the project root or below it. Compared by device and inode
+   on each parent, so firmlink and bind aliases of the same directory match. */
+static bool path_within(const char *path, const struct stat *root) {
+    char p[PATH_MAX];
+    snprintf(p, sizeof p, "%s", path);
+    for (;;) {
+        struct stat st;
+        if (!stat(p, &st) && st.st_dev == root->st_dev && st.st_ino == root->st_ino) return true;
+        if (!strcmp(p, "/") || !*p) return false;
+        char *slash = strrchr(p, '/');
+        if (!slash) return false;
+        if (slash == p) strcpy(p, "/");
+        else *slash = 0;
+    }
+}
+
+/* Project root for PATH checks: the nearest ancestor of cwd with a .git entry,
+   else cwd. HOME or / as that ancestor means no repo, so cwd is used. */
+static bool project_root(char root[PATH_MAX], struct stat *rst) {
+    char dir[PATH_MAX], found[PATH_MAX] = "", home[PATH_MAX] = "";
+    if (!realpath(g_cfg.cwd, dir)) return false;
+    char cwd[PATH_MAX];
+    snprintf(cwd, sizeof cwd, "%s", dir);
+    const char *h = getenv("HOME");
+    if (!h || !realpath(h, home)) home[0] = 0;
+    for (;;) {
+        char g[PATH_MAX + 8];
+        struct stat st;
+        snprintf(g, sizeof g, "%s/.git", dir);
+        if (!stat(g, &st)) { snprintf(found, sizeof found, "%s", dir); break; }
+        if (!strcmp(dir, "/")) break;
+        char *slash = strrchr(dir, '/');
+        if (slash == dir) strcpy(dir, "/");
+        else *slash = 0;
+    }
+    bool use_repo = found[0] && strcmp(found, "/") && !(home[0] && !strcmp(found, home));
+    snprintf(root, PATH_MAX, "%s", use_repo ? found : cwd);
+    return !stat(root, rst);
 }
 
 /* First pbcopy on PATH that the project cannot have supplied: empty and
    relative entries are skipped, as is anything resolving inside the project. */
 static bool find_pbcopy(char out[PATH_MAX]) {
-    char proj[PATH_MAX];
+    char root[PATH_MAX];
+    struct stat rst;
     const char *p = getenv("PATH");
-    if (!p || !realpath(g_cfg.cwd, proj)) return false;
+    if (!p || !project_root(root, &rst)) return false;
     while (*p) {
         size_t n = strcspn(p, ":");
         char dir[PATH_MAX], file[PATH_MAX + 8], real_dir[PATH_MAX];
@@ -2265,8 +2302,8 @@ static bool find_pbcopy(char out[PATH_MAX]) {
             memcpy(dir, p, n);
             dir[n] = 0;
             snprintf(file, sizeof file, "%s/pbcopy", dir);
-            if (realpath(dir, real_dir) && !path_within(real_dir, proj) &&
-                realpath(file, out) && !path_within(out, proj) &&
+            if (realpath(dir, real_dir) && !path_within(real_dir, &rst) &&
+                realpath(file, out) && !path_within(out, &rst) &&
                 !stat(out, &st) && S_ISREG(st.st_mode) && !access(out, X_OK))
                 return true;
         }

@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <assert.h>
 #include <errno.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
@@ -293,6 +294,12 @@ static void handle_client(int cfd) {
 
     if (handle_probe(cfd, last_msg)) return;
     if (handle_security(cfd, last_msg)) return;
+
+    if (strstr(last_msg, "PERSIAN_REPLY")) {   /* ZWNJ kept, ZWSP removed */
+        reply(cfd, "content", "\xd8\xb3\xd9\x84\xd8\xa7\xd9\x85 \xd9\x85\xdb\x8c\xe2\x80\x8c\xe2\x80\x8b"
+              "\xd8\xae\xd9\x88\xd8\xa7\xd9\x87\xd9\x85", false);
+        return;
+    }
 
     if (strstr(last_msg, "SEG_REPLY")) {   /* answer split by reasoning, with hidden text */
         static const char *const part[][2] = {
@@ -1060,6 +1067,94 @@ static void copy_tests(const char *dir, const char *cmd) {
     keys(s, click);
     CHECK(s, "short menu: click uses the scroll offset", wait_for_exit(s, 3000));
     mica_session_destroy(s);
+
+    /* Persian with ZWNJ round-trips; ZWSP is still removed */
+    unlink(clip);
+    snprintf(full, sizeof full, "unset SSH_CONNECTION SSH_TTY SSH_CLIENT TMUX; "
+             "export PATH='%s':\"$PATH\"; %s", bin, cmd);
+    s = mica_session_create(dir, full, 24, 80);
+    assert(s != NULL);
+    CHECK(s, "persian: ready", wait_for_text(s, "ready", 3000));
+    pump(s, 150);
+    ask(s, "PERSIAN_REPLY");
+    keys(s, "/copy\r");
+    CHECK(s, "persian: reports pbcopy", wait_for_text(s, "copied the last reply", 3000));
+    slurp(clip, got, sizeof got);
+    CHECK(s, "persian: ZWNJ kept, ZWSP removed",
+          !strcmp(got, "\xd8\xb3\xd9\x84\xd8\xa7\xd9\x85 \xd9\x85\xdb\x8c\xe2\x80\x8c"
+                       "\xd8\xae\xd9\x88\xd8\xa7\xd9\x87\xd9\x85"));
+    mica_session_destroy(s);
+
+    /* a pbcopy reached through a firmlink alias of the project bin is not run,
+       and a repo/bin pbcopy is not run from a repo subdirectory */
+    char altbin[1200], alt_script[1300], alt_hit[1200], alt_path[1300];
+    char repo[1200], repo_sub[1300], repo_bin[1300], repo_script[1400], repo_hit[1300];
+    char real_dir[PATH_MAX], alias[PATH_MAX];
+    snprintf(altbin, sizeof altbin, "%s/altbin", dir);
+    snprintf(alt_script, sizeof alt_script, "%s/pbcopy", altbin);
+    snprintf(alt_hit, sizeof alt_hit, "%s/ALT_HIJACK", dir);
+    snprintf(repo, sizeof repo, "%s/repo", dir);
+    snprintf(repo_sub, sizeof repo_sub, "%s/sub", repo);
+    snprintf(repo_bin, sizeof repo_bin, "%s/bin", repo);
+    snprintf(repo_script, sizeof repo_script, "%s/pbcopy", repo_bin);
+    snprintf(repo_hit, sizeof repo_hit, "%s/REPO_HIJACK", dir);
+    assert(realpath(dir, real_dir) != NULL);
+    snprintf(alias, sizeof alias, "/System/Volumes/Data%s", real_dir);
+    snprintf(alt_path, sizeof alt_path, "%s/altbin", alias);
+    struct stat ast, dst;
+    assert(stat(alias, &ast) == 0 && stat(dir, &dst) == 0);
+    assert(ast.st_ino == dst.st_ino && ast.st_dev == dst.st_dev);
+    assert(mkdir(altbin, 0700) == 0 && mkdir(repo, 0700) == 0 && mkdir(repo_bin, 0700) == 0);
+    assert(mkdir(repo_sub, 0700) == 0);
+    char gitdir[1300];
+    snprintf(gitdir, sizeof gitdir, "%s/.git", repo);
+    assert(mkdir(gitdir, 0700) == 0);
+    const char *const scripts[] = {alt_script, repo_script};
+    const char *const hits[] = {alt_hit, repo_hit};
+    for (int i = 0; i < 2; i++) {
+        f = fopen(scripts[i], "w");
+        assert(f != NULL);
+        fprintf(f, "#!/bin/sh\nexec /bin/cat > '%s'\n", hits[i]);
+        fclose(f);
+        assert(chmod(scripts[i], 0700) == 0);
+    }
+
+    unlink(clip);
+    snprintf(full, sizeof full, "unset SSH_CONNECTION SSH_TTY SSH_CLIENT TMUX; "
+             "export PATH='%s':/bin; %s", alt_path, cmd);
+    s = mica_session_create(dir, full, 24, 80);
+    assert(s != NULL);
+    CHECK(s, "alias: ready", wait_for_text(s, "ready", 3000));
+    pump(s, 150);
+    ask(s, "SEC_ZWTEXT");
+    keys(s, "/copy\r");
+    CHECK(s, "alias: firmlink pbcopy not used", wait_for_text(s, "pbcopy failed. Sent", 3000));
+    pump(s, 200);
+    CHECK(s, "alias: pbcopy in project bin not run", access(alt_hit, F_OK) != 0);
+    mica_session_destroy(s);
+
+    snprintf(full, sizeof full, "unset SSH_CONNECTION SSH_TTY SSH_CLIENT TMUX; "
+             "export PATH='%s':%s:/bin; %s", repo_bin, bin, cmd);
+    s = mica_session_create(repo_sub, full, 24, 80);
+    assert(s != NULL);
+    CHECK(s, "repo: ready", wait_for_text(s, "ready", 3000));
+    pump(s, 150);
+    ask(s, "SEC_TEXT");
+    keys(s, "/copy\r");
+    CHECK(s, "repo: copy from subdirectory uses the safe pbcopy",
+          wait_for_text(s, "copied the last reply", 3000));
+    CHECK(s, "repo: repo/bin pbcopy not run", access(repo_hit, F_OK) != 0);
+    mica_session_destroy(s);
+
+    unlink(alt_script);
+    unlink(repo_script);
+    unlink(alt_hit);
+    unlink(repo_hit);
+    rmdir(altbin);
+    rmdir(gitdir);
+    rmdir(repo_sub);
+    rmdir(repo_bin);
+    rmdir(repo);
 
     unlink(evil);
     unlink(evil2);
