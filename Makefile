@@ -69,3 +69,51 @@ $(TESTDIR)/test_mica_tui: tests/test_mica_tui.c $(MICA_DIR)/src/session.c $(MICA
 sanitize:
 	mkdir -p $(SAN)
 	$(MAKE) -B BIN=$(SAN)/flywheel TESTDIR=$(SAN) CFLAGS='$(SAN_CFLAGS)' test-unit test-mica
+
+# HTTP limits (both transports, small caps) and fuzzing; both under ASan/UBSan.
+# Apple clang ships no libFuzzer, so tests/fuzz_driver.c mutates deterministically.
+HARDEN_CFLAGS = $(SAN_CFLAGS) -Isrc -Ithird_party/cjson
+HTTP_CAPS = -DFW_MAX_RESPONSE=262144 -DFW_MAX_EVENT=8192 -DFW_MAX_GET=4096
+LIMITS_SRC = tests/test_http_limits.c src/http.c src/util.c src/msgs.c src/tools.c \
+             src/args.c third_party/cjson/cJSON.c
+FUZZ_COMMON = tests/fuzz_driver.c src/util.c src/msgs.c src/tools.c src/args.c \
+              third_party/cjson/cJSON.c
+FUZZ_BINS = $(SAN)/fuzz_args $(SAN)/fuzz_sse $(SAN)/fuzz_deny
+FUZZ_RUNS ?= 20000
+FUZZ_SECONDS ?= 30
+FUZZ_SEED ?= 1
+
+$(SAN)/test_http_limits: $(LIMITS_SRC) src/flywheel.h
+	@mkdir -p $(SAN)
+	$(CC) $(HARDEN_CFLAGS) $(HTTP_CAPS) -o $@ $(LIMITS_SRC) -lcurl
+
+$(SAN)/test_http_limits_mini: $(LIMITS_SRC) src/minihttp.c src/flywheel.h
+	@mkdir -p $(SAN)
+	$(CC) $(HARDEN_CFLAGS) $(HTTP_CAPS) -DFW_MINI_HTTP -o $@ $(LIMITS_SRC) src/minihttp.c
+
+test-http: $(SAN)/test_http_limits $(SAN)/test_http_limits_mini
+	./$(SAN)/test_http_limits
+	./$(SAN)/test_http_limits_mini
+
+$(SAN)/fuzz_args: tests/fuzz_args.c $(FUZZ_COMMON) src/flywheel.h
+	@mkdir -p $(SAN)
+	$(CC) $(HARDEN_CFLAGS) -o $@ tests/fuzz_args.c $(FUZZ_COMMON)
+
+# fuzz_sse.c includes src/http.c to reach the parser
+$(SAN)/fuzz_sse: tests/fuzz_sse.c src/http.c $(FUZZ_COMMON) src/flywheel.h
+	@mkdir -p $(SAN)
+	$(CC) $(HARDEN_CFLAGS) -o $@ tests/fuzz_sse.c $(FUZZ_COMMON) -lcurl
+
+$(SAN)/fuzz_deny: tests/fuzz_deny.c $(FUZZ_COMMON) src/flywheel.h
+	@mkdir -p $(SAN)
+	$(CC) $(HARDEN_CFLAGS) -o $@ tests/fuzz_deny.c $(FUZZ_COMMON)
+
+# bounded: FUZZ_RUNS inputs or FUZZ_SECONDS per target, 5s per input
+fuzz: $(FUZZ_BINS)
+	@for t in $(FUZZ_BINS); do \
+	    FUZZ_RUNS=$(FUZZ_RUNS) FUZZ_SECONDS=$(FUZZ_SECONDS) FUZZ_SEED=$(FUZZ_SEED) \
+	    FUZZ_CRASH=$$t.crash UBSAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_stacktrace=1 \
+	    ASAN_OPTIONS=abort_on_error=1 ./$$t || exit 1; \
+	done
+
+.PHONY: test-http fuzz

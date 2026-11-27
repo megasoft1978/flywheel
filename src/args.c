@@ -24,6 +24,7 @@ static char *escape_ctrl_in_strings(const char *s, bool *changed) {
     char *w = out;
     bool instr = false, esc = false;
     *changed = false;
+    if (!out) return NULL;
     for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
         unsigned char c = *p;
         if (instr) {
@@ -71,6 +72,7 @@ static char *autoclose(const char *s) {
     /* refuse when unbalanced opens > 2 or inside escape */
     if (esc || depth > 2) return NULL;
     char *out = malloc(strlen(s) + 8);
+    if (!out) return NULL;
     strcpy(out, s);
     char *w = out + strlen(s);
     if (instr) *w++ = '"';
@@ -91,6 +93,7 @@ static char *scan_key(const char *s, const char *key) {
     q++; /* opening quote of value */
     size_t cap = strlen(q) + 1;
     char *out = malloc(cap);
+    if (!out) return NULL;
     char *w = out;
     for (const unsigned char *p = (const unsigned char *)q; *p; p++) {
         unsigned char c = *p;
@@ -126,6 +129,7 @@ cJSON *args_parse_strict(const char *raw) {
     if (!raw || !*raw) return NULL;
     bool changed;
     char *fixed = escape_ctrl_in_strings(raw, &changed);
+    if (!fixed) return NULL;
     cJSON *j = cJSON_ParseWithOpts(fixed, NULL, 1);
     free(fixed);
     if (!cJSON_IsObject(j)) { cJSON_Delete(j); return NULL; }
@@ -136,6 +140,7 @@ cJSON *args_parse_strict(const char *raw) {
 char *args_extract_key(const char *raw, const char *key) {
     if (!raw || !*raw) return str_dup("");
     char *fixed = escape_ctrl_in_strings(raw, &(bool){0});
+    if (!fixed) return str_dup("");
 
     cJSON *j = cJSON_Parse(fixed);
     if (!j) {
