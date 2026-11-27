@@ -1150,9 +1150,11 @@ static bool drain_pipe(int fd, char *buf, size_t *len, int max_reads) {
 
 /* ---------- sandbox for model-run commands ----------
    macOS Seatbelt through sandbox-exec, deny by default: writes only inside the
-   working directory and a private TMPDIR, no reads of credential stores, no
-   writes to project files that later run outside the sandbox, no network unless the user approved it for that one command. Elsewhere there is
-   no sandbox yet, which callers must treat as unavailable. */
+   working directory and a private TMPDIR, no reads under the home directory
+   but the project, git's files and the toolchain folders, no reads of
+   credential stores anywhere, no writes to project files that later run outside
+   the sandbox, no network unless the user approved it for that one command.
+   Elsewhere there is no sandbox yet, which callers must treat as unavailable. */
 
 #define SBX_EXEC "/usr/bin/sandbox-exec"
 #define SBX_CAP (256 * 1024)
@@ -1186,7 +1188,36 @@ static const char *const SBX_PROJ[] = {
     ".git/rebase-merge", ".git/rebase-apply", ".git/sequencer", NULL
 };
 
-typedef struct { char *s; size_t n; bool full; } Sb;
+/* what stays readable under home besides the project: where toolchains and
+   their downloaded dependencies live by default. The sandbox environment passes
+   none of the variables that move them. The secrets above stay closed inside
+   them. */
+static const char *const SBX_TOOLS[] = {
+    ".cargo/bin", ".cargo/registry", ".cargo/git", ".rustup",
+    "go/bin", "go/pkg/mod",
+    ".nvm/versions", ".bun/bin",
+    ".pyenv", "Library/Python", ".local/bin", ".local/lib",
+    ".local/share/uv/python", ".local/share/uv/tools", ".local/share/pipx/venvs",
+    ".rbenv",
+    ".sdkman/candidates", ".m2/repository", ".gradle/caches", ".gradle/wrapper/dists",
+    ".gradle/jdks",
+    ".config/git/ignore", ".config/git/attributes",   /* the configs: see cfg_global */
+    NULL
+};
+
+/* credentials those trees hold at names that vary: below a home, `dir`, then
+   `middle` (regex), `file`, `rest` (regex) */
+static const char *const SBX_TOOL_SECRETS[][4] = {
+    {".nvm/versions", "[^/]+(/[^/]+)?/", "etc/npmrc", ""},
+    {".nvm/versions", "[^/]+(/[^/]+)?/", "lib/node_modules/npm/npmrc", ""},
+    {".sdkman/candidates/maven", "[^/]+/", "conf/settings.xml", ""},
+    {".local/share/uv/tools", "[^/]+/", "uv-receipt.toml", ""},
+    {".local/share/pipx/venvs", "[^/]+/", "pipx_metadata.json", ""},
+    {".cargo/registry", "", "credentials", "[^/]*"},
+};
+
+/* pins are written once per section: `from` is where the current one starts */
+typedef struct { char *s; size_t n; bool full; size_t from; } Sb;
 
 static void sb_add(Sb *b, const char *s) {
     size_t n = strlen(s);
@@ -1216,7 +1247,7 @@ static void sb_path(Sb *b, const char *path) {
 static void sb_pin(Sb *b, const char *path) {
     size_t at = b->n;
     sb_filter(b, "literal", path);
-    if (!b->full && strstr(b->s, b->s + at) < b->s + at) b->s[b->n = at] = 0;
+    if (!b->full && strstr(b->s + b->from, b->s + at) < b->s + at) b->s[b->n = at] = 0;
 }
 
 /* a rule on a path means nothing once a directory above it can be moved */
@@ -1628,12 +1659,23 @@ static bool each_gitfile(const char *proj, NodeFn fn, void *arg) {
 #define CFG_FILES 64
 
 typedef struct { char *v[CFG_VALUES]; int n; } Values;
+/* what a command may write: the project, TMPDIR and a linked worktree's files */
+typedef struct { char dir[6][PATH_MAX]; int n; } Areas;
+
+/* the places left readable under a closed home, written in two passes: their
+   contents, then with `meta` the way to them, which may only be looked up.
+   With `guard` they are not granted: what of the way to them a command could
+   write is closed, in the two sections of the write rules (`pins`). */
+typedef struct { Sb *b; bool meta; const Areas *areas; bool guard, pins; } Reads;
+static void sb_read(const Reads *r, const char *path, bool keep);
+
 typedef struct {
     const char *proj;
     NodeFn fn;
     void *arg;
     Values hooks, tree;     /* core.hooksPath, core.worktree */
     int files;              /* read for the current repository */
+    const Reads *reads;     /* the files a global config sends git to, or NULL */
 } Hooks;
 
 static void values_cut(Values *v, int n) {
@@ -1675,6 +1717,16 @@ static bool cfg_key(Hooks *h, const char *path, const char *sec, bool sub, const
     bool hooks = core && !strcmp(key, "hookspath"), tree = core && !strcmp(key, "worktree");
     bool inc = !strcmp(key, "path")
         && (sub ? !strcmp(sec, "includeif") : !strcmp(sec, "include"));
+    if (h->reads && core && val
+        && (!strcmp(key, "excludesfile") || !strcmp(key, "attributesfile"))) {
+        char file[PATH_MAX];
+        struct stat st;
+        /* A file only: a directory named here stays closed. A relative value
+           is whatever the project puts there, a link included. */
+        if (cfg_expand(val, file) && *file == '/'
+            && (h->reads->guard || (!stat(file, &st) && S_ISREG(st.st_mode))))
+            sb_read(h->reads, file, false);
+    }
     if (!hooks && !tree && !inc) return true;
     if (!val) return cannot(path);
     if (!inc) return values_add(hooks ? &h->hooks : &h->tree, val) || cannot(path);
@@ -1768,6 +1820,7 @@ static bool cfg_file(Hooks *h, const char *path, int depth) {
     if (stat(at, &st)) return absent() || cannot(at);
     if (S_ISCHR(st.st_mode)) return true;   /* /dev/null */
     if (!S_ISREG(st.st_mode) || depth > 10 || ++h->files > CFG_FILES) return cannot(at);
+    if (h->reads) sb_read(h->reads, path, false);
     char *buf = malloc(CFG_MAX);
     ssize_t n = read_small(at, buf, CFG_MAX);
     bool ok = n >= 0 && n == (ssize_t)strlen(buf) ? cfg_parse(h, path, buf, depth) : cannot(at);
@@ -2028,13 +2081,17 @@ static bool linked_worktree(const char *proj, Linked *w) {
         && !in_secret_store(w->dir) && !in_secret_store(w->common);
 }
 
-/* its git directory, and objects, refs and logs of the repository */
-static void sb_linked_allow(Sb *b, const Linked *w) {
+/* the project, TMPDIR, and of a linked worktree its git directory and objects,
+   refs and logs of the repository */
+static void writable(Areas *a, const char *proj, const char *tmp, const Linked *w) {
     static const char *const shared[] = {"objects", "refs", "logs", NULL};
-    char p[PATH_MAX];
-    sb_path(b, w->dir);
+    a->n = 0;
+    snprintf(a->dir[a->n++], PATH_MAX, "%s", proj);
+    if (tmp) snprintf(a->dir[a->n++], PATH_MAX, "%s", tmp);
+    if (!w) return;
+    snprintf(a->dir[a->n++], PATH_MAX, "%s", w->dir);
     for (int i = 0; shared[i]; i++)
-        if (snprintf(p, sizeof p, "%s/%s", w->common, shared[i]) < (int)sizeof p) sb_path(b, p);
+        if (join(a->dir[a->n], w->common, shared[i])) a->n++;
 }
 
 static const char *const LINKED_CLOSED[] = {
@@ -2052,72 +2109,15 @@ static bool walk_linked(const Linked *w, NodeFn fn, void *arg) {
     return true;
 }
 
-typedef struct { Sb *b; bool pins; } Rules;
-
-static void sb_node(Node kind, const char *path, void *arg) {
-    const Rules *r = arg;
-    if (r->pins) {
-        if (kind == N_PIN) sb_pin(r->b, path);
-        return;
-    }
-    if (!strcasecmp(path, "/dev/null")) return;     /* links to it stay writable */
-    if (kind == N_CLOSED) sb_path(r->b, path);
-    else if (kind != N_PIN) sb_pin(r->b, path);
-}
-
-/* the protected files of the project: closed, along with every link and gitfile
-   on the way there, and every directory on the way pinned. Without a real .git
-   directory nothing may create or change .git, or a prepared one could be moved
-   into place. */
-static void sb_project(Sb *b, const char *proj, bool repo, const Linked *linked) {
-    char p[PATH_MAX];
-    Rules r = {b, false};
-    /* a root that is already a bare repository */
-    bool is_bare = root_bare(proj);
-    sb_add(b, "(deny file-write*");
-    if (snprintf(p, sizeof p, "%s/.git", proj) >= (int)sizeof p) b->full = true;
-    if (!repo) sb_path(b, p);
-    for (int i = 0; is_bare && GIT_CLOSED[i]; i++) {
-        if (snprintf(p, sizeof p, "%s/%s", proj, GIT_CLOSED[i]) >= (int)sizeof p) b->full = true;
-        sb_path(b, p);
-    }
-    for (int i = 0; SBX_PROJ[i]; i++) {
-        if (snprintf(p, sizeof p, "%s/%s", proj, SBX_PROJ[i]) >= (int)sizeof p) b->full = true;
-        sb_path(b, p);
-    }
-    if (!each_protected(proj, sb_node, &r) || (linked && !walk_linked(linked, sb_node, &r)))
-        b->full = true;
-    /* once .git is not valid, a HEAD (in any case) makes the root itself a
-       repository, and a command can make it so: never one in the root */
-    for (int m = 0; m < 16; m++) {
-        char head[5] = "head";
-        for (int i = 0; i < 4; i++) if (m >> i & 1) head[i] = (char)toupper((unsigned char)head[i]);
-        if (snprintf(p, sizeof p, "%s/%s", proj, head) >= (int)sizeof p) b->full = true;
-        sb_filter(b, "literal", p);
-    }
-    sb_add(b, ")(deny file-write-unlink");
-    sb_pin(b, proj);
-    r.pins = true;
-    if (!each_protected(proj, sb_node, &r) || (linked && !walk_linked(linked, sb_node, &r)))
-        b->full = true;
-    each_secret(sb_pin_secret, b);
-    sb_add(b, ")");
-}
-
-/* ----- rules by name -----
-   Not anchored, so they bind in every writable directory: nothing can be
-   prepared in TMPDIR and moved into place. Constant in size, always on, and
-   inherited by detached processes. The sandbox limits one regex string to 1023
-   characters. */
-
 #define SBX_RX 1000
 
 /* name as a regex matching every spelling the filesystem folds to it. Beyond
    case, APFS folds a few characters to ASCII: these are all that occur in the
-   names closed here (none contains "st", "ff", "fl" or "ss"). */
+   names closed here (none contains "ff", "fl" or "ss"). */
 static const char *fold(const char *name, char *out) {   /* out holds 256 */
     static const char *const also[][2] = {
-        {"fi", "[fF][iI]|\xef\xac\x81"}, {"s", "[sS]|\xc5\xbf"}, {"k", "[kK]|\xe2\x84\xaa"},
+        {"fi", "[fF][iI]|\xef\xac\x81"}, {"st", "[sS][tT]|\xef\xac\x85|\xef\xac\x86"},
+        {"s", "[sS]|\xc5\xbf"}, {"k", "[kK]|\xe2\x84\xaa"},
     };
     size_t n = 0;
     for (const char *p = name; *p && n < 200; ) {
@@ -2156,6 +2156,262 @@ static void sb_regex(Sb *b, const char *head, const char *tail) {
     sb_add(b, tail);
     sb_add(b, "\")");
 }
+
+/* ---------- reads under a home: closed unless listed ---------- */
+
+/* $HOME and the account's home, each as spelled and as resolved */
+static int homes(char out[4][PATH_MAX]) {
+    const struct passwd *pw = getpwuid(getuid());
+    const char *from[2] = {getenv("HOME"), pw ? pw->pw_dir : NULL};
+    int n = 0;
+    for (int i = 0; i < 2; i++) {
+        if (!from[i] || *from[i] != '/') continue;
+        /* a home reached by a second spelling would not match its rule */
+        char at[PATH_MAX];
+        if (!walk(from[i], true, at, no_node, NULL)) return -1;
+        if (!lex_normalize(from[i], out[n], PATH_MAX)) return -1;
+        n++;
+        if (strcmp(at, out[n - 1])) snprintf(out[n++], PATH_MAX, "%s", at);
+    }
+    return n;
+}
+
+static void sb_way(Node kind, const char *path, void *b) {
+    (void)kind;
+    if (strncmp(path, "/dev/", 5)) sb_pin(b, path);
+}
+
+typedef struct { Sb *b; bool pins; } Rules;
+
+static void sb_node(Node kind, const char *path, void *arg) {
+    const Rules *r = arg;
+    if (r->pins) {
+        if (kind == N_PIN) sb_pin(r->b, path);
+        return;
+    }
+    if (!strcasecmp(path, "/dev/null")) return;     /* links to it stay writable */
+    if (kind == N_CLOSED) sb_path(r->b, path);
+    else if (kind != N_PIN) sb_pin(r->b, path);
+}
+
+static bool in_areas(const Areas *a, const char *path) {
+    for (int i = 0; i < a->n; i++)
+        if (path_under(a->dir[i], path)) return true;
+    return false;
+}
+
+/* a step a command could change stays as it is, there or not */
+static void guard_open(Node kind, const char *path, void *arg) {
+    const Reads *r = arg;
+    if (!in_areas(r->areas, path)) return;
+    /* but what leads to a whole writable place does not close it */
+    for (int i = 0; kind == N_CLOSED && i < r->areas->n; i++)
+        if (covers(path, r->areas->dir[i])) return;
+    Rules rules = {r->b, r->pins};
+    sb_node(kind, path, &rules);
+}
+
+typedef struct { const Areas *areas; bool found; } Planted;
+
+/* a link a command can repoint */
+static void see_link(Node kind, const char *path, void *arg) {
+    Planted *p = arg;
+    if (kind == N_LINK && in_areas(p->areas, path)) p->found = true;
+}
+
+/* One place that stays readable. keep: the project and TMPDIR are what was
+   asked for; anything else that turns out to hold a home stays closed, and so
+   does what cannot be followed or is reached by a link a command can write. */
+static void sb_read(const Reads *r, const char *path, bool keep) {
+    char at[PATH_MAX], home[4][PATH_MAX];
+    if (r->guard) {
+        if (walk(path, true, at, guard_open, (void *)r)) return;
+        if (in_areas(r->areas, path) || in_areas(r->areas, sbx_blocked)) r->b->full = true;
+        else *sbx_blocked = 0;
+        return;
+    }
+    Planted planted = {r->areas, false};
+    if (!walk(path, true, at, see_link, &planted)) { *sbx_blocked = 0; return; }
+    if (!keep && planted.found) return;
+    if (r->meta) {
+        if (!walk(path, true, at, sb_way, r->b)) *sbx_blocked = 0;
+        return;
+    }
+    int n = keep ? 0 : homes(home);
+    for (int i = 0; i < n; i++)
+        if (covers(at, home[i])) return;
+    if (n >= 0) sb_path(r->b, at);
+}
+
+/* the toolchain folders of each home and the files git's global configs name */
+static bool each_home_read(const Reads *r, const char *proj, char home[4][PATH_MAX], int n) {
+    char p[PATH_MAX];
+    for (int i = 0; i < n; i++)
+        for (int t = 0; SBX_TOOLS[t]; t++)
+            if (snprintf(p, sizeof p, "%s/%s", home[i], SBX_TOOLS[t]) < (int)sizeof p)
+                sb_read(r, p, false);
+    Hooks h = {.proj = proj, .fn = no_node, .reads = r};
+    bool ok = cfg_global(&h);
+    values_cut(&h.hooks, 0);
+    values_cut(&h.tree, 0);
+    return ok;
+}
+
+/* ----- a project that is a submodule ----- */
+
+/* every core.worktree of the git directory names the project, and one does */
+static bool points_back(const char *gitdir, const char *proj) {
+    Hooks h = {.proj = proj, .fn = no_node};
+    bool ok = cfg_in(&h, gitdir, "config") && h.tree.n;
+    for (int i = 0; ok && i < h.tree.n; i++) {
+        char dir[PATH_MAX], full[PATH_MAX], at[PATH_MAX];
+        ok = cfg_expand(h.tree.v[i], dir) && join(full, gitdir, dir) && realpath(full, at)
+             && !strcmp(at, proj);
+    }
+    values_cut(&h.hooks, 0);
+    values_cut(&h.tree, 0);
+    *sbx_blocked = 0;
+    return ok;
+}
+
+/* The git directory a submodule's .git file names, if it lies under modules/ of
+   the nearest .git directory above and points back. Never one at a home or above
+   it. A subdirectory of a repository gets nothing: git there reads the work tree
+   root, which would list it. */
+static bool module_dir(const char *proj, char home[4][PATH_MAX], int n, char *mod) {
+    char git[PATH_MAX], line[PATH_MAX], up[PATH_MAX], mods[PATH_MAX];
+    struct stat st;
+    if (!join(git, proj, ".git") || lstat(git, &st) || !S_ISREG(st.st_mode)
+        || !first_line(git, line, sizeof line) || strncmp(line, "gitdir: ", 8)
+        || !resolve_from(proj, line + 8, mod)) return false;
+
+    snprintf(up, sizeof up, "%s", proj);
+    for (;;) {
+        char *s = strrchr(up, '/');
+        if (!s || s == up) return false;
+        *s = 0;
+        for (int i = 0; i < n; i++)
+            if (covers(up, home[i])) return false;
+        if (!join(git, up, ".git")) return false;
+        if (lstat(git, &st)) {
+            if (errno != ENOENT) return false;
+        } else if (S_ISDIR(st.st_mode)) break;     /* a submodule may be inside another */
+    }
+    if (st.st_uid != getuid() || !join(mods, git, "modules")) return false;
+    size_t len = strlen(mods);
+    return !strncmp(mod, mods, len) && mod[len] == '/' && !lstat(mod, &st) && S_ISDIR(st.st_mode)
+           && st.st_uid == getuid() && !in_secret_store(mod) && !covers(mod, proj)
+           && points_back(mod, proj);
+}
+
+static bool sb_home_reads(Sb *b, const Areas *areas, const char *proj, const char *tmp,
+                          const Linked *linked) {
+    char home[4][PATH_MAX];
+    int n = homes(home);
+    if (n < 0) return false;
+    if (n) {
+        sb_add(b, "(deny file-read*");
+        for (int i = 0; i < n; i++) sb_path(b, home[i]);
+        sb_add(b, ")");
+    }
+    char mod[PATH_MAX];
+    bool module = module_dir(proj, home, n, mod);
+    for (int meta = 0; meta < 2; meta++) {
+        Reads r = {.b = b, .meta = meta, .areas = areas};
+        sb_add(b, meta ? "(allow file-read-metadata" : "(allow file-read*");
+        b->from = b->n;
+        sb_read(&r, proj, true);
+        if (tmp) sb_read(&r, tmp, true);
+        if (linked) {
+            sb_read(&r, linked->dir, false);
+            sb_read(&r, linked->common, false);
+        }
+        if (module) sb_read(&r, mod, false);
+        for (int i = 0; i < n; i++)
+            sb_read(&r, home[i], false);        /* itself only ever looked up */
+        if (!each_home_read(&r, proj, home, n)) return false;
+        sb_add(b, ")");
+    }
+    b->from = b->n;
+    return true;
+}
+
+/* Nothing a command writes may become the way to something readable, for it or
+   a later one: where those ways run through a writable place they are closed. */
+static bool sb_guard_reads(Sb *b, const Areas *areas, bool pins) {
+    char home[4][PATH_MAX];
+    int n = homes(home);
+    Reads r = {.b = b, .areas = areas, .guard = true, .pins = pins};
+    return n >= 0 && each_home_read(&r, areas->dir[0], home, n);
+}
+
+/* SBX_TOOL_SECRETS under each home, and under where its folder leads */
+static void sb_tool_secrets(Sb *b) {
+    char home[4][PATH_MAX], dir[PATH_MAX], to[PATH_MAX];
+    int n = homes(home);
+    if (n < 0) b->full = true;
+    for (int i = 0; i < n; i++)
+        for (size_t k = 0; k < sizeof SBX_TOOL_SECRETS / sizeof *SBX_TOOL_SECRETS; k++) {
+            const char *const *c = SBX_TOOL_SECRETS[k];
+            if (!join(dir, home[i], c[0])) { b->full = true; continue; }
+            bool linked = sbx_resolve(dir, to, 0) && strcmp(dir, to);
+            for (int j = 0; j <= linked; j++) {
+                char at[SBX_RX], head[SBX_RX + 2], tail[SBX_RX], file[256];
+                re_path(j ? to : dir, at, sizeof at);
+                snprintf(head, sizeof head, "^%s", at);
+                snprintf(tail, sizeof tail, "/%s%s%s(/|$)", c[1], fold(c[2], file), c[3]);
+                sb_regex(b, head, tail);
+            }
+        }
+}
+
+/* the protected files of the project: closed, along with every link and gitfile
+   on the way there, and every directory on the way pinned. Without a real .git
+   directory nothing may create or change .git, or a prepared one could be moved
+   into place. */
+static void sb_project(Sb *b, const Areas *areas, bool repo, const Linked *linked) {
+    const char *proj = areas->dir[0];
+    char p[PATH_MAX];
+    Rules r = {b, false};
+    /* a root that is already a bare repository */
+    bool is_bare = root_bare(proj);
+    sb_add(b, "(deny file-write*");
+    if (snprintf(p, sizeof p, "%s/.git", proj) >= (int)sizeof p) b->full = true;
+    if (!repo) sb_path(b, p);
+    for (int i = 0; is_bare && GIT_CLOSED[i]; i++) {
+        if (snprintf(p, sizeof p, "%s/%s", proj, GIT_CLOSED[i]) >= (int)sizeof p) b->full = true;
+        sb_path(b, p);
+    }
+    for (int i = 0; SBX_PROJ[i]; i++) {
+        if (snprintf(p, sizeof p, "%s/%s", proj, SBX_PROJ[i]) >= (int)sizeof p) b->full = true;
+        sb_path(b, p);
+    }
+    if (!each_protected(proj, sb_node, &r) || (linked && !walk_linked(linked, sb_node, &r)))
+        b->full = true;
+    /* once .git is not valid, a HEAD (in any case) makes the root itself a
+       repository, and a command can make it so: never one in the root */
+    for (int m = 0; m < 16; m++) {
+        char head[5] = "head";
+        for (int i = 0; i < 4; i++) if (m >> i & 1) head[i] = (char)toupper((unsigned char)head[i]);
+        if (snprintf(p, sizeof p, "%s/%s", proj, head) >= (int)sizeof p) b->full = true;
+        sb_filter(b, "literal", p);
+    }
+    if (!b->full && !sbx_probing && !sb_guard_reads(b, areas, false)) b->full = true;
+    sb_add(b, ")(deny file-write-unlink");
+    sb_pin(b, proj);
+    r.pins = true;
+    if (!each_protected(proj, sb_node, &r) || (linked && !walk_linked(linked, sb_node, &r)))
+        b->full = true;
+    if (!b->full && !sbx_probing && !sb_guard_reads(b, areas, true)) b->full = true;
+    each_secret(sb_pin_secret, b);
+    sb_add(b, ")");
+}
+
+/* ----- rules by name -----
+   Not anchored, so they bind in every writable directory: nothing can be
+   prepared in TMPDIR and moved into place. Constant in size, always on, and
+   inherited by detached processes. The sandbox limits one regex string to 1023
+   characters. */
 
 /* every nested .git and .envrc (directory, file or link) and the files in a git
    directory that make git run something. repo: proj/.git is a real directory,
@@ -2258,18 +2514,25 @@ static char *sbx_profile(const char *cwd, const char *tmp, bool net, const char 
         "(allow file-write-data file-ioctl (literal \"/dev/null\") (literal \"/dev/zero\")"
         " (literal \"/dev/dtracehelper\") (literal \"/dev/stdout\") (literal \"/dev/stderr\")"
         " (subpath \"/dev/fd\"))");
-    sb_add(&b, "(allow file-write*");
-    sb_path(&b, proj);
-    if (tmp) sb_path(&b, rtmp);
     Linked w;
     bool linked = linked_worktree(proj, &w);
-    if (linked) sb_linked_allow(&b, &w);
+    Areas areas;
+    writable(&areas, proj, tmp ? rtmp : NULL, linked ? &w : NULL);
+    sb_add(&b, "(allow file-write*");
+    for (int i = 0; i < areas.n; i++) sb_path(&b, areas.dir[i]);
     sb_add(&b, ")");
+    /* the probe runs a system binary: a home that cannot be ruled on must stop
+       commands, not make the sandbox count as unavailable */
+    if (!sbx_probing && !sb_home_reads(&b, &areas, proj, tmp ? rtmp : NULL, linked ? &w : NULL)) {
+        free(b.s);
+        return NULL;
+    }
     /* the last matching rule wins: secrets stay closed even inside the project */
     sb_add(&b, "(deny file-read* file-write*");
     each_secret(sb_deny_secret, &b);
+    if (!sbx_probing) sb_tool_secrets(&b);
     sb_add(&b, ")");
-    sb_project(&b, proj, repo, linked ? &w : NULL);
+    sb_project(&b, &areas, repo, linked ? &w : NULL);
     sb_names(&b, proj, repo, other);
     /* names this command's processes, so that all of them can be found later */
     if (mark) {
@@ -2344,9 +2607,85 @@ static const char *sbx_tmpdir(void) {
 
 #define SBX_NENV 10
 
+static bool through_link(const char *path) {
+    char p[PATH_MAX];
+    if (snprintf(p, sizeof p, "%s", path) >= (int)sizeof p) return false;
+    for (char *s = p + 1;; s++) {
+        if (*s && *s != '/') continue;
+        char c = *s;
+        *s = 0;
+        struct stat st;
+        if (!lstat(p, &st) && S_ISLNK(st.st_mode)) return true;
+        if (!(*s = c)) return false;
+    }
+}
+
+/* any step of the way, or its end, in a place a command may write */
+static void see_open(Node kind, const char *path, void *arg) {
+    (void)kind;
+    Planted *p = arg;
+    if (in_areas(p->areas, path)) p->found = true;
+}
+
+/* False also for what cannot be followed. */
+static bool fixed_way(const char *path, const Areas *areas) {
+    char at[PATH_MAX];
+    Planted p = {.areas = areas};
+    if (!walk(path, true, at, see_open, &p)) {
+        *sbx_blocked = 0;
+        return false;
+    }
+    return !p.found;
+}
+
+/* "PATH=..." with each entry that passes through a link, and is or leads under a
+   home, replaced by where it leads: a link there cannot be read, and a PATH
+   search that fails on it gives up (libuv). An entry whose way touches a place
+   commands may write stays as it is: a command could repoint a link there to
+   learn where a link it cannot read leads. Closed entries stay: programs in
+   them run. */
+static char *sbx_path(const char *v, const char *cwd, const char *tmp) {
+    char home[4][PATH_MAX], one[PATH_MAX], to[PATH_MAX];
+    int n = homes(home);
+    char proj[PATH_MAX], rtmp[PATH_MAX];
+    Linked w;
+    Areas areas = {.n = 0};
+    bool known = realpath(cwd, proj) && realpath(tmp, rtmp);
+    if (known) writable(&areas, proj, rtmp, linked_worktree(proj, &w) ? &w : NULL);
+    *sbx_blocked = 0;
+    size_t entries = 1;
+    for (const char *p = v; *p; p++) entries += *p == ':';
+    size_t cap = strlen(v) + entries * PATH_MAX + 6, len = 5;
+    char *out = malloc(cap);
+    memcpy(out, "PATH=", 6);
+    for (;;) {
+        size_t k = strcspn(v, ":");
+        const char *use = v;
+        size_t used = k;
+        if (*v == '/' && k < sizeof one) {
+            memcpy(one, v, k);
+            one[k] = 0;
+            if (known && through_link(one) && fixed_way(one, &areas)
+                && realpath(one, to) && !strchr(to, ':')) {
+                bool under = false;
+                for (int i = 0; i < n; i++)
+                    under = under || path_under(home[i], one) || path_under(home[i], to);
+                if (under) { use = to; used = strlen(to); }
+            }
+        }
+        memcpy(out + len, use, used);
+        len += used;
+        if (!v[k]) break;
+        out[len++] = ':';
+        v += k + 1;
+    }
+    out[len] = 0;
+    return out;
+}
+
 /* the whole environment of a command: nothing else is inherited (tokens, agent
    sockets). The cache variables keep build tools out of the home directory. */
-static void sbx_env(char **env, const char *tmp) {
+static void sbx_env(char **env, const char *cwd, const char *tmp) {
     static const char *const keep[] = {"PATH", "HOME", "LANG", "TERM", NULL};
     static const char *const redirect[][2] = {{"TMPDIR", ""}, {"XDG_CACHE_HOME", "/cache"},
         {"GOCACHE", "/go-build"}, {"npm_config_cache", "/npm"}, {NULL, NULL}};
@@ -2354,6 +2693,7 @@ static void sbx_env(char **env, const char *tmp) {
     for (int i = 0; keep[i]; i++) {
         const char *v = getenv(keep[i]);
         if (!v) continue;
+        if (!strcmp(keep[i], "PATH")) { env[n++] = sbx_path(v, cwd, tmp); continue; }
         size_t len = strlen(keep[i]) + strlen(v) + 2;
         env[n] = malloc(len);
         snprintf(env[n++], len, "%s=%s", keep[i], v);
@@ -2439,7 +2779,7 @@ static char *run_command(const char *cmd, const char *cwd, int timeout_s, int *c
                 return str_dup(why);
             }
         }
-        sbx_env(env, tmp);
+        sbx_env(env, cwd, tmp);
     }
     int fds[2];
     pid_t pid = -1;

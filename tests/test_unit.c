@@ -2094,7 +2094,7 @@ static void test_sandbox(void) {
         T(reads[i], !strstr(o, "TOPSECRET"));
         free(o);
     }
-    T("other home files stay readable", out_has("cat ../home/plain", "readable"));
+    T("other home files are unreadable", !out_has("cat ../home/plain", "readable"));
 
     /* a project that contains the home directory still cannot touch the stores */
     free(g_cfg.cwd);
@@ -2567,6 +2567,359 @@ static void test_linked_worktree(void) {
       && gone(proj, ".git/worktrees/wt/planted"));
     free(config);
     free(common);
+    setenv("HOME", old, 1);
+    free(old);
+}
+
+static void shown(const char *cmd, const char *frag) {
+    char *o = run_bash(cmd, g_cfg.cwd, 60);
+    T(cmd, strstr(o, frag) != NULL);
+    free(o);
+}
+
+static void works(const char *cmd) {
+    int code = -1;
+    char *o = run_bash_status(cmd, g_cfg.cwd, 60, &code);
+    if (code) printf("%s\n", o);
+    T(cmd, !code);
+    free(o);
+}
+
+/* reads under home are closed but for the project and the toolchain folders */
+static void test_home_reads(void) {
+    char base[PATH_MAX], home[PATH_MAX], unused[PATH_MAX], proj[PATH_MAX + 16];
+    char *old = review_dirs(base, home, unused);
+    if (!old) { T("mkdtemp", false); return; }
+    snprintf(proj, sizeof proj, "%s/work/proj", home);
+    static const char *const secret[] = {"plain", "work/other/f", ".cargo/config.toml",
+        ".cargo/credentials.toml", ".cargo/registry/npmrc", ".ssh/key", "dots/other"};
+    for (int i = 0; i < (int)(sizeof secret / sizeof *secret); i++)
+        put(under(home, secret[i]), "TOPSECRET");
+    static const char *const tools[] = {".cargo/registry/lib", ".rustup/s", "dots/pyenv/v"};
+    for (int i = 0; i < 3; i++) put(under(home, tools[i]), "TOOLOK");
+    put(under(home, "work/proj/mine"), "PROJOK");
+    put(under(home, "dots/extra"), "[alias]\n\tfwx = status\n");
+    put(under(home, "dots/ignore"), "skipped\n");
+    put(under(home, ".gitconfig"), "[user]\n\tname = t\n\temail = t@t\n"
+        "[include]\n\tpath = ~/dots/extra\n[core]\n\texcludesfile = ~/dots/ignore\n");
+    /* a toolchain folder linked elsewhere, one linked to home, one to a store;
+       a store linked into a toolchain folder */
+    host(home, "ln -s dots/pyenv .pyenv && ln -s . .rbenv && mkdir .local"
+               " && ln -s ../.ssh .local/bin && ln -s .cargo/registry/npmrc .npmrc");
+    in_dir(proj);
+
+    shown("cat mine && ls && pwd -P", "PROJOK");
+    static const char *const no[] = {"cat ../../plain", "cat \"$HOME/plain\"", "cat ../../PLAIN",
+        "cat \"/System/Volumes/Data$HOME/plain\"", "cat \"/.nofollow$HOME/plain\"",
+        "ln -s ../../plain sl; cat sl", "ln ../../plain hl; cat hl", "cp -c ../../plain cl; cat cl",
+        "cat ../other/f", "cp -R ../other copy; cat copy/f", "cat ../../dots/other",
+        "cat \"$HOME/.rbenv/plain\"",
+        /* credentials, in and beside the folders left readable */
+        "cat \"$HOME/.cargo/config.toml\"", "cat \"$HOME/.cargo/credentials.toml\"",
+        "cat \"$HOME/.cargo/registry/npmrc\"", "cat \"$HOME/.npmrc\"",
+        "cat \"$HOME/.local/bin/key\"", "cat \"$HOME/.ssh/key\""};
+    for (int i = 0; i < (int)(sizeof no / sizeof *no); i++) hidden(no[i]);
+    shown("ls \"$HOME\"", "Operation not permitted");
+    shown("ls ..", "Operation not permitted");
+    shown("cat \"$HOME/.cargo/registry/lib\"", "TOOLOK");
+    shown("cat \"$HOME/.rustup/s\"", "TOOLOK");
+    shown("cat \"$HOME/.pyenv/v\"", "TOOLOK");
+
+    /* the tools real builds need */
+    host(proj, "git init -q . && git add mine && git commit -qm one");
+    put(under(proj, "skipped"), "x");
+    put(under(proj, "seen"), "x");
+    char *o = run_bash("git status --porcelain", proj, 60);
+    T("git status under home, global excludes honoured",
+      strstr(o, "?? seen") && !strstr(o, "skipped"));
+    free(o);
+    shown("git fwx --porcelain", "?? seen");
+    works("git add seen && git commit -qm two && git log --oneline");
+    host(proj, "git worktree add -q ../wt -b wt");
+    char wt[PATH_MAX + 16];
+    snprintf(wt, sizeof wt, "%s/work/wt", home);
+    in_dir(wt);
+    works("echo b > b && git status --porcelain && git add b && git commit -qm three");
+    hidden("cat ../other/f ../../plain");
+    in_dir(proj);
+    put(under(proj, "m.c"), "int main(void){return 0;}\n");
+    put(under(proj, "Makefile"), "all:\n\techo MADE\n");
+    if (!system("make --version >/dev/null 2>&1")) shown("make", "MADE");
+    else printf("unit: SKIP make under the sandbox (not installed)\n");
+    if (!system("clang --version >/dev/null 2>&1")) works("clang -o m m.c && ./m");
+    else printf("unit: SKIP clang under the sandbox (not installed)\n");
+    if (!system("python3 -c 1 >/dev/null 2>&1")) shown("python3 -c 'print(6*7)'", "42");
+    else printf("unit: SKIP python3 under the sandbox (not installed)\n");
+
+    /* the home directory as the project: asked for, so read, stores apart */
+    in_dir(home);
+    shown("cat plain", "TOPSECRET");
+    hidden("cat .ssh/key");
+    hidden("cat .cargo/credentials.toml");
+    hidden("cat .npmrc");
+
+    /* a home whose rules would not match: nothing runs */
+    char twice[PATH_MAX + 32];
+    snprintf(twice, sizeof twice, "/System/Volumes/Data%s", home);
+    if (!access(twice, F_OK)) {
+        setenv("HOME", twice, 1);
+        o = run_bash("echo ran > ran", proj, 30);
+        T("home by a second spelling: command refused",
+          !strncmp(o, "error:", 6) && gone(proj, "ran"));
+        free(o);
+    }
+    setenv("HOME", old, 1);
+    free(old);
+}
+
+/* the command fails and does not show the secret */
+static void closed_git(const char *cmd) {
+    int code = -1;
+    char *o = run_bash_status(cmd, g_cfg.cwd, 60, &code);
+    T(cmd, code && !strstr(o, "TOPSECRET"));
+    free(o);
+}
+
+static bool is_kind(const char *path, mode_t kind) {
+    struct stat st;
+    return !lstat(path, &st) && (st.st_mode & S_IFMT) == kind;
+}
+
+/* a command cannot plant a link that opens something for it, or for a later one */
+static void test_home_links(void) {
+    char base[PATH_MAX], home[PATH_MAX], unused[PATH_MAX], dots[PATH_MAX + 16], later[PATH_MAX + 16];
+    char *old = review_dirs(base, home, unused);
+    if (!old) { T("mkdtemp", false); return; }
+    snprintf(dots, sizeof dots, "%s/dots", home);
+    snprintf(later, sizeof later, "%s/work/later", home);
+    put(under(home, "plain"), "TOPSECRET");
+    put(under(home, "docs/d"), "TOPSECRET");
+    put(under(home, "work/later/f"), "x");
+    put(under(home, "dots/ig"), "x\n");
+    put(under(home, "dots/ig2"), "x\n");
+    put(under(home, "dots/bin/tool"), "TOOLOK");
+
+    /* a relative excludesfile: a link the repository ships, on the first command */
+    put(under(home, ".gitconfig"), "[core]\n\texcludesfile = .gi_global\n");
+    host(dots, "ln -s ../plain .gi_global");
+    in_dir(dots);
+    hidden("cat ../plain");
+    hidden("cat .gi_global");
+    host(dots, "rm .gi_global");
+    /* the same by way of TMPDIR */
+    quiet("ln -s \"$HOME/plain\" \"$TMPDIR/x\"; ln -s \"$TMPDIR/x\" .gi_global; cat .gi_global");
+    hidden("cat ../plain");
+    host(dots, "rm -f .gi_global");
+
+    /* global git files and toolchain folders that lead into the project */
+    put(under(home, ".gitconfig"), "[core]\n\texcludesfile = ~/dots/ig2\n"
+        "\tattributesfile = ~/dots/missing\n");
+    host(home, "mkdir -p .config/git .local .m2 && ln -s ../../dots/ig .config/git/ignore"
+               " && ln -s ../dots/bin .local/bin && ln -s ../dots/m2 .m2/repository");
+    shown("cat \"$HOME/.local/bin/tool\"", "TOOLOK");
+    quiet("rm -f ig ig2; ln -s ../plain ig; ln -s ../plain ig2; ln -s ../plain missing;"
+          " mv bin bin.old; ln -s ../docs bin; ln -s ../docs m2");
+    T("no link planted over what home leads to", is_kind(under(dots, "ig"), S_IFREG)
+      && is_kind(under(dots, "ig2"), S_IFREG) && is_kind(under(dots, "bin"), S_IFDIR));
+    T("no link planted where home leads", gone(dots, "missing") && gone(dots, "m2"));
+    hidden("cat ../plain");
+    hidden("cat ../docs/d");
+    in_dir(later);                 /* a later session elsewhere */
+    hidden("cat ../../plain");
+    hidden("cat ../../docs/d");
+    shown("cat \"$HOME/.local/bin/tool\"", "TOOLOK");
+
+    /* links that are there anyway open nothing while the project can repoint them */
+    static const char *const swapped[][2] = {
+        {"rm -f ig && ln -s ../plain ig", "cat ../plain"},
+        {"rm -f ig2 && ln -s ../plain ig2", "cat ../plain"},
+        {"mv bin bin.old && ln -s ../docs bin", "cat ../docs/d"},
+        {"ln -sfh ../docs m2", "cat ../docs/d"},
+    };
+    in_dir(dots);
+    for (int i = 0; i < (int)(sizeof swapped / sizeof *swapped); i++) {
+        host(dots, swapped[i][0]);
+        hidden(swapped[i][1]);
+    }
+
+    /* the home directory as the project: a toolchain folder stays what it is */
+    host(home, "rm .config/git/ignore .local/bin .m2/repository .gitconfig && mkdir .rustup");
+    in_dir(home);
+    quiet("mv .rustup r; ln -s docs .rustup; ln -s docs .pyenv");
+    T("toolchain folders not replaced", is_kind(under(home, ".rustup"), S_IFDIR)
+      && gone(home, ".pyenv"));
+
+    /* credentials at varying names inside the toolchain folders */
+    static const char *const creds[] = {".nvm/versions/node/v1/etc/npmrc",
+        ".sdkman/candidates/maven/3.9/conf/settings.xml", ".local/share/uv/tools/t/uv-receipt.toml",
+        ".local/share/pipx/venvs/t/pipx_metadata.json", ".cargo/registry/credentials",
+        ".cargo/registry/credentials.toml", ".nvm/versions/node/v1/lib/node_modules/npm/npmrc"};
+    static const char *const beside[] = {".nvm/versions/node/v1/etc/other",
+        ".sdkman/candidates/maven/3.9/conf/logging.xml", ".local/share/uv/tools/t/pyvenv.cfg",
+        ".local/share/pipx/venvs/t/pyvenv.cfg", ".cargo/registry/src/c/credentials.rs",
+        ".cargo/git/db/d", ".nvm/versions/node/v1/lib/node_modules/npm/package.json"};
+    for (int i = 0; i < 7; i++) {
+        put(under(home, creds[i]), "TOPSECRET");
+        put(under(home, beside[i]), "TOOLOK");
+    }
+    in_dir(later);
+    for (int i = 0; i < 7; i++) {
+        char cmd[256];
+        snprintf(cmd, sizeof cmd, "cat \"$HOME/%s\"", creds[i]);
+        hidden(cmd);
+        snprintf(cmd, sizeof cmd, "cat \"$HOME/%s\"", beside[i]);
+        shown(cmd, "TOOLOK");
+    }
+    hidden("cat \"$HOME/.NVM/versions/node/v1/etc/NPMRC\"");
+
+    setenv("HOME", old, 1);
+    free(old);
+}
+
+/* a link on PATH under a home is given to commands as where it leads: the link
+   itself cannot be read, and a PATH search by Node stops there */
+static void test_home_path(void) {
+    char base[PATH_MAX], home[PATH_MAX], unused[PATH_MAX], real[PATH_MAX], proj[PATH_MAX + 16];
+    char *old = review_dirs(base, home, unused);
+    if (!old) { T("mkdtemp", false); return; }
+    const char *had = getenv("PATH");
+    char *path = str_dup(had ? had : "/usr/bin:/bin");
+    snprintf(proj, sizeof proj, "%s/work/proj", home);
+    put(under(home, "work/proj/f"), "x");
+    put(under(home, ".closed/bin/secret"), "TOPSECRET");
+    put(under(home, "co:lon/f"), "x");
+    host(home, "mkdir .slot plaindir && ln -s ../.closed/bin .slot/bin && ln -s co:lon colon"
+               " && ln -s nowhere dangling");
+    T("home resolves", realpath(home, real) != NULL);
+    /* a link inside the project, and one outside home leading back into it */
+    host(proj, "ln -s ../../.closed/bin inlink");
+    host(base, "ln -s \"$HOME/.slot/bin\" outlink");
+
+    /* entries kept as they are: not under a home, relative, empty, unresolvable,
+       or leading to a name PATH cannot hold */
+    char set[12 * PATH_MAX], want[12 * PATH_MAX];
+    snprintf(set, sizeof set, "%s/.slot/bin::rel:%s/plaindir:%s/colon:%s/dangling:/tmp:/usr/bin:/bin:",
+             real, real, real, real);
+    snprintf(want, sizeof want, "[%s/.closed/bin::rel:%s/plaindir:%s/colon:%s/dangling:/tmp:/usr/bin:/bin:]",
+             real, real, real, real);
+    setenv("PATH", set, 1);
+    in_dir(proj);
+    shown("printf '[%s]' \"$PATH\"", want);
+    snprintf(set, sizeof set, "%s/work/proj/inlink:%s/outlink:/usr/bin:/bin", real, base);
+    snprintf(want, sizeof want, "[%s/work/proj/inlink:%s/.closed/bin:/usr/bin:/bin]", real, real);
+    setenv("PATH", set, 1);
+    shown("printf '[%s]' \"$PATH\"", want);
+    /* outside the project, but by way of a place commands may write: a link in
+       the project, or in TMPDIR */
+    host(proj, "ln -s ../../.closed/bin hop");
+    host(base, "ln -s \"$HOME/work/proj/hop\" viaproj");
+    snprintf(set, sizeof set, "%s/viaproj:/usr/bin:/bin", base);
+    snprintf(want, sizeof want, "[%s]", set);
+    setenv("PATH", set, 1);
+    shown("printf '[%s]' \"$PATH\"", want);
+    quiet("ln -s \"$HOME/.closed/bin\" \"$TMPDIR/hop\"");
+    char *t = run_bash("printf %s \"$TMPDIR\"", proj, 30);
+    snprintf(set, sizeof set, "ln -s '%s/hop' viatmp", t);
+    free(t);
+    setenv("PATH", path, 1);
+    host(base, set);
+    snprintf(set, sizeof set, "%s/viatmp:/usr/bin:/bin", base);
+    snprintf(want, sizeof want, "[%s]", set);
+    setenv("PATH", set, 1);
+    shown("printf '[%s]' \"$PATH\"", want);
+    /* and in a linked worktree, by way of the repository's refs */
+    setenv("PATH", path, 1);
+    host(proj, "git init -q . && git add f && git -c user.name=t -c user.email=t@t commit -qm one"
+               " && git worktree add -q ../wt -b wt && ln -s ../../../../.closed/bin .git/refs/hop");
+    host(base, "ln -s \"$HOME/work/proj/.git/refs/hop\" viarefs");
+    char wt[PATH_MAX + 16];
+    snprintf(wt, sizeof wt, "%s/work/wt", home);
+    in_dir(wt);
+    snprintf(set, sizeof set, "%s/viarefs:%s/outlink:/usr/bin:/bin", base, base);
+    snprintf(want, sizeof want, "[%s/viarefs:%s/.closed/bin:/usr/bin:/bin]", base, real);
+    setenv("PATH", set, 1);
+    shown("printf '[%s]' \"$PATH\"", want);
+    in_dir(proj);
+    setenv("PATH", path, 1);
+
+    if (!system("node -e 0 >/dev/null 2>&1")) {
+        snprintf(set, sizeof set, "%s/.slot/bin:%s", real, path);
+        setenv("PATH", set, 1);
+        shown("node -e 'const r = require(\"child_process\").spawnSync(\"sh\", [\"-c\", \"echo SPAWNED\"]);"
+              " console.log(String(r.stdout || r.error))'", "SPAWNED");
+    } else printf("unit: SKIP node PATH search under the sandbox (not installed)\n");
+    hidden("cat \"$HOME/.slot/bin/secret\"");
+    hidden("cat \"$HOME/.closed/bin/secret\"");
+
+    setenv("PATH", path, 1);
+    free(path);
+    setenv("HOME", old, 1);
+    free(old);
+}
+
+/* git in a submodule reads its git directory and no more */
+static void test_repo_above(void) {
+    char base[PATH_MAX], home[PATH_MAX], unused[PATH_MAX];
+    char repo[PATH_MAX + 16], sub[PATH_MAX + 32], mod[PATH_MAX + 32], dir[PATH_MAX + 32];
+    char *old = review_dirs(base, home, unused);
+    if (!old) { T("mkdtemp", false); return; }
+    snprintf(repo, sizeof repo, "%s/work/repo", home);
+    snprintf(sub, sizeof sub, "%s/sub", repo);
+    snprintf(mod, sizeof mod, "%s/mod", repo);
+    put(under(home, ".gitconfig"), "[user]\n\tname = t\n\temail = t@t\n");
+    put(under(home, "work/repo/sub/f"), "x\n");
+    put(under(home, "work/repo/other/o"), "TOPSECRET\n");
+    put(under(home, "work/lib/l"), "l\n");
+    put(under(home, "plain"), "TOPSECRET\n");
+    host(repo, "git -C ../lib init -q && git -C ../lib add l && git -C ../lib commit -qm l"
+               " && git init -q . && git add sub other && git commit -qm one"
+               " && git -c protocol.file.allow=always submodule --quiet add ../lib mod"
+               " && git commit -qm two");
+
+    /* a subdirectory gets nothing of the repository around it */
+    in_dir(sub);
+    closed_git("git log --oneline");
+    shown("cat ../.git/HEAD", "Operation not permitted");
+    shown("ls ..", "Operation not permitted");
+
+    in_dir(mod);
+    put(under(mod, "new"), "x");
+    shown("git status --porcelain", "?? new");
+    hidden("cat ../other/o ../../../plain");
+    shown("cat ../.git/HEAD", "Operation not permitted");
+    quiet("echo evil > ../.git/modules/mod/planted");
+    T("submodule git directory not written", gone(repo, ".git/modules/mod/planted"));
+
+    /* a gitdir the module does not point back from, or outside .git/modules */
+    put(under(repo, "forged/.git"), "gitdir: ../.git/modules/mod\n");
+    snprintf(dir, sizeof dir, "%s/forged", repo);
+    in_dir(dir);
+    shown("cat ../.git/modules/mod/HEAD", "Operation not permitted");
+    put(under(home, "work/repo/apart/a"), "x");
+    snprintf(dir, sizeof dir, "%s/apart", repo);
+    host(dir, "git init -q --separate-git-dir ../../sep .");
+    in_dir(dir);
+    closed_git("git status");
+
+    /* a .git link above is not followed */
+    put(under(home, "work/linked/in/.git"), "gitdir: ../.git/modules/mod\n");
+    snprintf(dir, sizeof dir, "%s/work/linked/in", home);
+    host(dir, "ln -s ../repo/.git ../.git");
+    in_dir(dir);
+    shown("cat \"$HOME/work/repo/.git/HEAD\"", "Operation not permitted");
+
+    /* a repository at home, or around it, stays closed */
+    put(under(home, "work/plain/.git"), "gitdir: ../../.git/modules/m\n");
+    snprintf(dir, sizeof dir, "%s/work/plain", home);
+    host(home, "git init -q . && git add plain && git commit -qm dots"
+               " && git init -q --bare .git/modules/m"
+               " && git --git-dir=.git/modules/m config core.bare false"
+               " && git --git-dir=.git/modules/m config core.worktree ../../../work/plain");
+    in_dir(dir);
+    closed_git("git log");
+    shown("cat \"$HOME/.git/modules/m/HEAD\"", "Operation not permitted");
+    shown("cat \"$HOME/.git/HEAD\"", "Operation not permitted");
+
     setenv("HOME", old, 1);
     free(old);
 }
@@ -3542,6 +3895,10 @@ int main(void) {
         test_sandbox_escapes();
         test_nested_git();
         test_linked_worktree();
+        test_home_reads();
+        test_home_links();
+        test_home_path();
+        test_repo_above();
     }
     else printf("unit: SKIP sandbox tests (no sandbox here)\n");
     test_fail_closed();
