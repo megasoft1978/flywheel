@@ -53,11 +53,62 @@ static void event(Ui *ui, const char *kind, const char *detail) {
     if (ui->emit_event) ui->emit_event(kind, detail, ui->ud);
 }
 
+#define MAXRESCUES 3
+
+/* Fresh-context diagnosis: the main conversation is polluted by a streak of
+   failures, so ask the model once, from a clean slate, what the root cause is.
+   Inputs are only the task, the graveyard and the latest failure. Returns a
+   malloc'd diagnosis or NULL. Adds its cost to *toks / *secs. */
+static char *spiral_diagnose(const Msgs *msgs, const Graveyard *gy, const char *lastfail,
+                             int *toks, double *secs) {
+    const char *task = "";
+    for (int i = 0; i < msgs->n; i++)
+        if (!strcmp(msgs->v[i].role, "user") && msgs->v[i].content) { task = msgs->v[i].content; break; }
+    char *gys = gy_format(gy);
+    size_t cap = strlen(task) + strlen(gys) + strlen(lastfail) + 1200;
+    char *u = malloc(cap);
+    snprintf(u, cap,
+        "TASK:\n%.2500s\n\n%s\nLATEST FAILURE OUTPUT:\n%.1200s\n\n"
+        "Reply in at most 8 short bullets: (1) the most likely root cause, (2) which assumption "
+        "behind the failed attempts is false, (3) the single next action, with the exact command "
+        "to run, and (4) how to verify it worked. Do not repeat any approach listed above.",
+        task, gys, lastfail);
+    Msgs d;
+    msgs_init(&d);
+    msgs_push(&d, "system",
+        "You are a principal debugging specialist reviewing an agent that is stuck in a failure "
+        "loop. You see only a clean summary of its task and failures. Be concrete and brief.");
+    msgs_push(&d, "user", u);
+    free(u); free(gys);
+
+    int s_maxtok = g_cfg.maxtok, s_think = g_cfg.think_budget;
+    double s_temp = g_cfg.temp, s_pp = g_cfg.pp;
+    g_cfg.maxtok = 1600;
+    if (g_cfg.think_budget > 384 || g_cfg.think_budget == 0) g_cfg.think_budget = 384;
+    g_cfg.temp = 0.3;
+    StreamCb cb = {.stream = false};
+    ChatResp *r = chat(&d, &cb);
+    g_cfg.maxtok = s_maxtok; g_cfg.think_budget = s_think; g_cfg.temp = s_temp; g_cfg.pp = s_pp;
+    msgs_free(&d);
+
+    char *out = NULL;
+    if (r && !r->error) {
+        *toks += r->completion_tokens;
+        *secs += r->secs;
+        if (r->content && *r->content) out = str_dup(r->content);
+    }
+    if (r) chat_resp_free(r);
+    return out;
+}
+
 const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
     const Profile *prof = profile_detect(g_cfg.cwd, g_cfg.profile);
     Recent rec = {0};
     int *starts = malloc((g_cfg.maxturns + 8) * sizeof(int));
-    int prunes = 0, gates = 0, resets = 0, toks = 0, ptoks = 0, calls = 0, turns = 0;
+    int prunes = 0, gates = 0, resets = 0, rescues = 0, toks = 0, ptoks = 0, calls = 0, turns = 0;
+    Graveyard gy = {0};
+    int fail_streak = 0;
+    char lastfail[1300] = "";
     double secs = 0;
     bool wrote = false;
     int escape_turns = 0;
@@ -94,7 +145,7 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
         turns++;
         if (ui->emit_stats) {
             AgentStats st = {
-                .turns = turns, .calls = calls, .prunes = prunes, .gates = gates, .resets = resets,
+                .turns = turns, .calls = calls, .prunes = prunes, .gates = gates, .resets = resets, .rescues = rescues,
                 .prompt_tokens = ptoks, .completion_tokens = toks, .secs = secs,
                 .tok_per_sec = (r->secs > 0.05 && r->completion_tokens > 0)
                                ? (r->completion_tokens / r->secs)
@@ -173,6 +224,8 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
             const char *rawargs = cJSON_IsString(ar) ? ar->valuestring : "";
             char *out = NULL;
             char reckey[1200] = "";
+            bool is_bash = false;
+            int bash_exit = 0;
 
             if (!strcmp(tname, "write_file") || !strcmp(tname, "edit_file")) {
                 bool iswrite = !strcmp(tname, "write_file");
@@ -203,7 +256,7 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
                 if (!*fixed) out = str_dup("error: bad arguments, need {\"command\": ...}");
                 else if (denied) out = str_dup(denied);
                 else if (unapproved) out = str_dup("error: user denied this command — adapt, explain why it is needed, or try another approach");
-                else out = run_bash(fixed, g_cfg.cwd, g_cfg.cmd_timeout);
+                else { out = run_bash(fixed, g_cfg.cwd, g_cfg.cmd_timeout); is_bash = true; bash_exit = g_last_exit; }
                 if (cmd_is_write(fixed)) wrote = true;
                 snprintf(reckey, sizeof reckey, "%.1100s", fixed);
                 free(fixed);
@@ -216,6 +269,13 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
             emit(ui, ui->emit_out, out);
             msgs_push_tool(msgs, cJSON_IsString(id) ? id->valuestring : "", out);
             rec_push(&rec, reckey);
+            if (spiral_is_failure(is_bash, bash_exit, out)) {
+                fail_streak++;
+                gy_add(&gy, reckey, out);
+                snprintf(lastfail, sizeof lastfail, "%.1250s", out);
+            } else if (strncmp(out, "error", 5)) {
+                fail_streak = 0;   /* a clean result breaks the streak */
+            }
             if (tr) {
                 cJSON *e = cJSON_CreateObject();
                 cJSON_AddStringToObject(e, "tool_out", out);
@@ -259,23 +319,46 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
                 "find . -maxdepth 3 -path ./node_modules -prune -o -type f \\( -name '*.ts' -o -name '*.tsx' -o -name '*.py' -o -name '*.go' -o -name '*.rs' -o -name '*.js' \\) -print | head -25",
                 g_cfg.cwd, 10);
             char pb[8192];
+            char *gys = gy_format(&gy);
+            fail_streak = 0;
             if (prunes % 2 == 0 && resets < MAXRESETS) {
                 resets++;
                 /* context reset: keep system+task, then a reset msg */
                 msgs_trunc(msgs, 2);
                 snprintf(pb, sizeof pb,
-                    "Context reset after repeated %s loop. Your saved files:\n%s\nCurrent type check:\n%.1000s\nRe-read the task prompt carefully. Inspect the existing files, find what is still missing or wrong versus the requirements, fix it with a different approach, verify the type check is clean, and reply DONE.",
-                    kind, files, go);
+                    "Context reset after repeated %s loop. Your saved files:\n%s\nCurrent type check:\n%.1000s\n%.1800s\nRe-read the task prompt carefully. Inspect the existing files, find what is still missing or wrong versus the requirements, fix it with a different approach, verify the type check is clean, and reply DONE.",
+                    kind, files, go, gys);
                 msgs_push(msgs, "user", pb);
                 event(ui, "reset", kind);
             } else {
                 snprintf(pb, sizeof pb,
-                    "Loop detected (%s): your last %d turns repeated the same actions without progress and were pruned. Last output:\n%s\nFiles:\n%s\nCurrent type check:\n%.1000s\nDo NOT repeat that command cycle. Step back, diagnose the root cause differently, fix cleanly, and if checks pass, reply DONE.",
-                    kind, clen, last600, files, go);
+                    "Loop detected (%s): your last %d turns repeated the same actions without progress and were pruned. Last output:\n%s\nFiles:\n%s\nCurrent type check:\n%.1000s\n%.1800s\nDo NOT repeat that command cycle. Step back, diagnose the root cause differently, fix cleanly, and if checks pass, reply DONE.",
+                    kind, clen, last600, files, go, gys);
                 msgs_push(msgs, "user", pb);
                 event(ui, "prune", kind);
             }
-            free(go); free(files);
+            free(go); free(files); free(gys);
+            continue;
+        }
+
+        /* failure spiral: N consecutive failing tool results -> fresh-context diagnosis */
+        if (g_cfg.spiral > 0 && fail_streak >= g_cfg.spiral && rescues < MAXRESCUES
+            && turn < g_cfg.maxturns - 3 && !g_abort) {
+            char detail[32];
+            snprintf(detail, sizeof detail, "%d failures", fail_streak);
+            event(ui, "rescue", detail);
+            char *dx = spiral_diagnose(msgs, &gy, lastfail, &toks, &secs);
+            rescues++;
+            fail_streak = 0;
+            if (dx) {
+                size_t n = strlen(dx) + 256;
+                char *note = malloc(n);
+                snprintf(note, n,
+                    "Automatic diagnosis from a fresh-context review of your last failures (they are no longer your only information, so step back from your previous patches):\n%.2000s\nFollow it unless you can show it is wrong.", dx);
+                msgs_push(msgs, "user", note);
+                free(note); free(dx);
+                if (tr) { fprintf(tr, "{\"event\":\"rescue\",\"turn\":%d}\n", turn); }
+            }
             continue;
         }
 
@@ -288,7 +371,7 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
 
     if (ui->emit_stats) {
         AgentStats st = {
-            .turns = turns, .calls = calls, .prunes = prunes, .gates = gates, .resets = resets,
+            .turns = turns, .calls = calls, .prunes = prunes, .gates = gates, .resets = resets, .rescues = rescues,
             .prompt_tokens = ptoks, .completion_tokens = toks, .secs = secs,
             .tok_per_sec = secs > 0.05 ? (toks / secs) : 0.0,
             .finish = finish
@@ -297,10 +380,11 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
     }
     if (sum)
         snprintf(sum, sumcap,
-                 "finish=%s turns=%d prunes=%d gates=%d resets=%d calls=%d tokens=%d secs=%.0f",
-                 finish, turns, prunes, gates, resets, calls, toks, secs);
+                 "finish=%s turns=%d prunes=%d gates=%d resets=%d rescues=%d calls=%d tokens=%d secs=%.0f",
+                 finish, turns, prunes, gates, resets, rescues, calls, toks, secs);
     if (tr) fclose(tr);
     rec_free(&rec);
+    gy_clear(&gy);
     free(starts);
     return finish;
 }

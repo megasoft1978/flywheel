@@ -276,6 +276,59 @@ static void test_filetools(void) {
     free(k);
 }
 
+static void test_spiral(void) {
+    /* classification */
+    T("exit0 ok", !spiral_is_failure(true, 0, "all good"));
+    T("nonzero+output fails", spiral_is_failure(true, 1, "Traceback (most recent call last)\nboom"));
+    T("grep-miss probe not failure", !spiral_is_failure(true, 1, "(no output)"));
+    T("empty nonzero probe not failure", !spiral_is_failure(true, 1, "  \n"));
+    T("timeout fails", spiral_is_failure(true, -1, "[timeout after 30s — hung]\nx"));
+    T("tool error fails", spiral_is_failure(false, 0, "error: old_string not found"));
+    T("deny rule fails", spiral_is_failure(true, 0, "error: blocked sudo"));
+    T("user denied is not a failed approach", !spiral_is_failure(true, 0, "error: user denied this command — adapt"));
+    T("ok file write", !spiral_is_failure(false, 0, "ok: wrote x"));
+    T("null safe", !spiral_is_failure(true, 1, NULL));
+
+    /* graveyard */
+    Graveyard g = {0};
+    char *f = gy_format(&g);
+    T("empty graveyard formats empty", f && !*f);
+    free(f);
+    gy_add(&g, "npm test", "FAIL src/a.test.ts\n  expected 3 got 4\nTests: 1 failed");
+    gy_add(&g, "npm test", "FAIL src/a.test.ts\n  expected 3 got 4\nTests: 1 failed");   /* dup */
+    T("near-duplicate collapsed", g.n == 1);
+    gy_add(&g, "tsc --noEmit", "src/a.ts(3,1): error TS2322: Type 'string' is not assignable");
+    T("distinct kept", g.n == 2);
+    f = gy_format(&g);
+    T("format lists entries", strstr(f, "1. $ npm test") && strstr(f, "2. $ tsc --noEmit") && strstr(f, "do NOT repeat"));
+    T("newlines flattened", !strchr(g.v[0], '\n'));
+    free(f);
+    for (int i = 0; i < 10; i++) {
+        char c[40], o[40];
+        snprintf(c, sizeof c, "cmd%d_unique_%d", i, i * 7919);
+        snprintf(o, sizeof o, "different output number %d zzz%d", i, i * 104729);
+        gy_add(&g, c, o);
+    }
+    T("bounded to GY_MAX", g.n == GY_MAX);
+    T("oldest evicted", !strstr(g.v[0], "npm test"));
+    gy_clear(&g);
+    T("clear", g.n == 0);
+
+    /* long, multibyte output must be cut on a character boundary */
+    char big[2000];
+    big[0] = 0;
+    for (int i = 0; i < 300; i++) strcat(big, "é€x");
+    gy_add(&g, big, big);
+    bool valid = true;
+    for (const unsigned char *p = (const unsigned char *)g.v[0]; *p; p++) {
+        if (*p >= 0xC0) { int n = *p >= 0xF0 ? 3 : *p >= 0xE0 ? 2 : 1; for (int k = 0; k < n; k++) if ((p[1 + k] & 0xC0) != 0x80) valid = false; p += n; }
+        else if (*p >= 0x80) valid = false;
+    }
+    T("utf8 intact after cut", valid);
+    T("entry bounded", strlen(g.v[0]) < 600);
+    gy_clear(&g);
+}
+
 int main(void) {
     memset(&g_cfg, 0, sizeof g_cfg);
     g_cfg.cwd = str_dup("/tmp");
@@ -287,6 +340,7 @@ int main(void) {
     test_utf8();
     test_msgs();
     test_filetools();
+    test_spiral();
     free(g_cfg.cwd);
     printf("unit: %d passed, %d failed\n", passed, failed);
     return failed ? 1 : 0;

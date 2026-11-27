@@ -25,6 +25,7 @@ typedef struct {
     int   maxtok;        /* default 12000 */
     int   gate_every;    /* default 8, 0=off */
     int   max_gates;     /* default 1 */
+    int   spiral;        /* consecutive failing tool results that trigger a fresh-context diagnosis; default 3, 0=off */
     double temp;         /* default 0.0 */
     double top_p;        /* default 0.95 */
     double pp;           /* presence penalty, default 0.0 */
@@ -83,6 +84,7 @@ char     *http_get_url(const char *url); /* GET absolute URL, malloc'd body or N
 
 /* tools.c */
 char *run_bash(const char *cmd, const char *cwd, int timeout_s); /* never NULL */
+extern int g_last_exit;   /* exit status of the last run_bash; -1 = timeout/killed */
 char *deny_check(const char *cmd, const char *cwd);              /* NULL=ok, else static reason */
 char *heredoc_fix(const char *cmd);                              /* returns new or copy */
 bool  cmd_is_write(const char *cmd);
@@ -105,6 +107,14 @@ void  args_note_repair(const char *kind);               /* bumps repair stats */
 /* sim.c */
 double sim_ratio(const char *a, const char *b);         /* 0..1, caps at 700 chars each */
 
+/* spiral.c — failure classification + graveyard of failed approaches */
+#define GY_MAX 6
+typedef struct { char *v[GY_MAX]; int n; } Graveyard;
+bool  spiral_is_failure(bool is_bash, int exit_code, const char *out);
+void  gy_add(Graveyard *, const char *what, const char *out);  /* dedupes near-repeats */
+char *gy_format(const Graveyard *);                             /* malloc'd; "" when empty */
+void  gy_clear(Graveyard *);
+
 /* profile.c */
 typedef struct {
     const char *name;
@@ -116,7 +126,7 @@ const Profile *profile_detect(const char *cwd, const char *force);
 
 /* agent.c — shared driver for --once and interactive tasks */
 typedef struct {
-    int turns, calls, prunes, gates, resets;
+    int turns, calls, prunes, gates, resets, rescues;
     int prompt_tokens;          /* latest request prompt tokens (context fill) */
     int completion_tokens;      /* cumulative completion tokens this task */
     double secs;                /* cumulative generation secs */

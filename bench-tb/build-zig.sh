@@ -29,6 +29,6 @@ zig cc -target aarch64-linux-musl -O2 -static -std=c17 -D_GNU_SOURCE \
   -Isrc -Ithird_party/cjson -I"$CURLP/include" \
   -o dist/flywheel-linux-arm64 \
   src/main.c src/util.c src/agent.c src/http.c src/msgs.c src/tools.c src/bench.c \
-  src/args.c src/sim.c src/profile.c src/tui.c third_party/cjson/cJSON.c \
+  src/args.c src/sim.c src/spiral.c src/profile.c src/tui.c third_party/cjson/cJSON.c \
   "$CURLP/lib/libcurl.a" 2>&1 | grep -iE "error|undefined" | head -8
 ls -la dist/flywheel-linux-arm64 2>/dev/null && echo BUILD-DONE

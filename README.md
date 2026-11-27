@@ -84,6 +84,16 @@ flywheel -f prompt.md -T 60 -W 900 --transcript run.jsonl
   before finish.
 - **deny rules**: sudo/rm-rf/outside-cwd writes blocked pre-exec.
 - **30s cmd timeout** w/ hang hint, wall clock, turn nudges.
+- **graveyard**: bounded list (6) of failed commands + output tails
+  (`src/spiral.c`), re-injected after every loop prune / context reset so the
+  model does not walk back into a dead end it already tried. Failure = non-zero
+  exit with real output, timeout, or tool error (silent probes like a `grep`
+  miss don't count).
+- **failure-spiral rescue** (`--spiral N`, def 3, 0=off): after N consecutive
+  failing tool results, one fresh-context call (task + graveyard + latest
+  failure only, ≤1600 tok) diagnoses the root cause and is injected as a user
+  message. Max 3 per task; counted as `rescues=` in the run summary. Idea from
+  Cortheon's graveyard backtracking / death-spiral rescue.
 
 ## Language profiles
 
@@ -124,6 +134,13 @@ skip_deliverables + `*.test.*`/`*.spec.*`), graded, appended to
 `<suite>/runs/<tag>/summary.json`. Scoring: `gated` counts passed/total only
 when tsc/typecheck is clean; `raw` ignores the gate. Output format matches the
 retired Python harness, so scores are directly comparable across runs.
+
+## Comparing two runs
+
+`bench-tb/paired_stats.py BASE CAND` compares two Harbor job dirs (or two flywheel
+`summary.json`) task-by-task: pass rate with 95% Wilson CIs, fixed/broken pairs,
+exact McNemar p. A 10-task slice rarely reaches significance; the tool says so
+instead of letting a +1 task swing read as a win. `make test-py` runs its tests.
 
 ## Interactive TUI (v2)
 

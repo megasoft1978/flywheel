@@ -194,6 +194,8 @@ void utf8_sanitize(char *s) {
     *w = 0;
 }
 
+int g_last_exit;
+
 char *run_bash(const char *cmd, const char *cwd, int timeout_s) {
     int fds[2];
     if (pipe(fds)) return str_dup("error: pipe failed");
@@ -253,6 +255,7 @@ char *run_bash(const char *cmd, const char *cwd, int timeout_s) {
     close(fds[0]);
     buf[len] = 0;
     utf8_sanitize(buf);
+    g_last_exit = (!timed && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
     char *out;
     if (timed) {
         out = malloc(len + 160);

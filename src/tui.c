@@ -1555,6 +1555,7 @@ static void ui_event(const char *kind, const char *detail, void *ud) {
     char b[512];
     if (!strcmp(kind, "prune")) snprintf(b, sizeof b, YELLOW "  ✂ loop pruned (%s)" RESET, detail);
     else if (!strcmp(kind, "reset")) snprintf(b, sizeof b, YELLOW "  ↺ context reset (%s)" RESET, detail);
+    else if (!strcmp(kind, "rescue")) snprintf(b, sizeof b, YELLOW "  ✚ failure spiral: fresh-context diagnosis (%s)" RESET, detail);
     else if (!strcmp(kind, "gate")) snprintf(b, sizeof b, BLUE "  ○ %s" RESET, detail);
     else snprintf(b, sizeof b, "  %s %s", kind, detail);
     TItem *r = item_new(T_RAW);

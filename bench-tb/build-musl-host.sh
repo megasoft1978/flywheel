@@ -35,6 +35,6 @@ mkdir -p dist
   -Isrc -Ithird_party/cjson -I"$CURLP/include" \
   -o dist/flywheel-linux-arm64 \
   src/main.c src/util.c src/agent.c src/http.c src/msgs.c src/tools.c src/bench.c \
-  src/args.c src/sim.c src/profile.c src/tui.c third_party/cjson/cJSON.c \
+  src/args.c src/sim.c src/spiral.c src/profile.c src/tui.c third_party/cjson/cJSON.c \
   "$CURLP/lib/libcurl.a" 2>&1 | grep -E "error|undefined" | head -8
 ls -la dist/flywheel-linux-arm64 && file dist/flywheel-linux-arm64 | head -1

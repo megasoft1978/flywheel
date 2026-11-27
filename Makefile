@@ -2,7 +2,7 @@ CC      = clang
 CFLAGS  = -O2 -Wall -Wextra -std=c17 -D_POSIX_C_SOURCE=200809L
 LDFLAGS = -lcurl
 SRC     = src/main.c src/util.c src/agent.c src/http.c src/msgs.c src/tools.c src/bench.c \
-          src/args.c src/sim.c src/profile.c src/tui.c \
+          src/args.c src/sim.c src/spiral.c src/profile.c src/tui.c \
           third_party/cjson/cJSON.c
 BIN     = flywheel
 
@@ -25,13 +25,16 @@ MICA_LIBS = $(MICA_DIR)/src/session.c $(MICA_DIR)/build/libvterm.a -framework Co
 clean:
 	rm -f $(BIN) tests/test_unit tests/test_mica_tui
 
-.PHONY: clean debug install test sanitize
+.PHONY: clean debug install test test-py sanitize
 
 test: $(BIN) tests/test_unit tests/test_mica_tui
 	./tests/test_unit
 	./tests/test_mica_tui ./$(BIN)
 
-tests/test_unit: tests/test_unit.c src/tools.c src/args.c src/sim.c src/util.c src/msgs.c third_party/cjson/cJSON.c
+test-py:
+	python3 tests/test_paired_stats.py
+
+tests/test_unit: tests/test_unit.c src/tools.c src/args.c src/sim.c src/spiral.c src/util.c src/msgs.c third_party/cjson/cJSON.c
 	$(CC) $(CFLAGS) -Isrc -Ithird_party/cjson -o $@ $^ -lcurl
 
 tests/test_mica_tui: tests/test_mica_tui.c $(MICA_DIR)/src/session.c $(MICA_DIR)/build/libvterm.a
