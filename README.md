@@ -6,6 +6,10 @@ The tested setup is Qwen3.8-27B served locally by Splash with a DFlash2 drafter.
 account and no API key. flywheel is about 7k lines of C (plus vendored cJSON): the macOS build
 links only `libcurl`, and the Linux build is static.
 
+![flywheel fixing a Python bug in the terminal, with approval dialogs](docs/demo.gif)
+
+15 s excerpt of one real run at original speed (approvals answered by the recording script): [full 56 s video](https://megasoft1978.github.io/flywheel/) · [transcript](demo/transcript.jsonl).
+
 [Website](https://megasoft1978.github.io/flywheel/) · [Results](#results) · [Safety](#safety) · [Limits](#limits) · MIT
 
 ## Results

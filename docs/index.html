@@ -26,6 +26,8 @@ h1{font-size:clamp(34px,5.2vw,52px);line-height:1.08;letter-spacing:-.025em;text
 .btn{padding:11px 20px;border-radius:8px;font-weight:600;font-size:15px;text-decoration:none;border:1px solid var(--line)}
 .btn.p{background:var(--fg);color:var(--bg);border-color:var(--fg)}
 pre{font:13px/1.7 var(--mono);overflow-x:auto}
+video{display:block;width:100%;height:auto;border:1px solid var(--line);border-radius:12px;background:#1e1e2e}
+figcaption{color:var(--dim);font-size:13.5px;margin-top:10px;overflow-wrap:anywhere}
 section{padding:60px 0;border-top:1px solid var(--line)}
 h2{font-size:28px;letter-spacing:-.015em;line-height:1.2;margin-bottom:12px}
 h3{font-size:19px;margin:34px 0 6px}
@@ -71,6 +73,13 @@ footer{border-top:1px solid var(--line);padding:30px 0 56px;color:var(--dim);fon
     <p class="lead">Tested with Qwen3.8-27B served locally by Splash with a DFlash2 drafter. No cloud account, no API key.</p>
     <div class="cta"><a class="btn p" href="#quickstart">Get started</a><a class="btn" href="https://github.com/megasoft1978/flywheel">View source</a></div>
   </div>
+  <figure>
+    <video controls muted loop playsinline preload="metadata" width="1280" height="800" poster="demo-poster.jpg" aria-label="Terminal recording: flywheel fixes two bugs in a small Python project and runs its tests">
+      <source src="demo.webm" type="video/webm">
+      <source src="demo.mp4" type="video/mp4">
+    </video>
+    <figcaption>One real run, 56 s, uncut and at original speed: flywheel fixes two bugs in a small Python project and the 4 tests pass. One edit by the model fails along the way. Approval dialogs, including the project check, were answered "Yes" by the recording script, and <code>ls</code> was set to show numeric user ids. Qwen3.8-27B 4-bit + DFlash2 drafter, Splash 1.7.2, Apple M5 Max 64 GB, <code>flywheel -T 20 -W 120 --transcript</code>. <a href="https://github.com/megasoft1978/flywheel/blob/main/demo/transcript.jsonl">Transcript</a></figcaption>
+  </figure>
 </header>
 
 <section id="benchmarks">
@@ -123,5 +132,12 @@ cd flywheel &amp;&amp; make
 
 <footer><span>MIT licensed · C17</span><a href="https://github.com/megasoft1978/flywheel">github.com/megasoft1978/flywheel</a></footer>
 </div>
+<script>
+if (!matchMedia("(prefers-reduced-motion: reduce)").matches) {
+  const v = document.querySelector("video");
+  v.muted = true;
+  v.play().catch(() => {});
+}
+</script>
 </body>
 </html>
