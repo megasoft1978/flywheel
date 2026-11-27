@@ -128,7 +128,19 @@ untrusted repository or task in a VM.
   a command starts have config, hooks, `commondir`, `.git` link files and `.envrc` closed. New ones
   are checked when the command ends; a config with anything beyond what `git init`, `clone`,
   `worktree` and `submodule` write, a hook, an `.envrc` or a redirecting link is renamed to
-  `*.fw-quarantined-N`.
+  `*.fw-quarantined-N`. Nothing that existed before the command or file tool call is renamed: if
+  old files would now make a repository, only its new `HEAD`, `commondir`, `objects` or `refs` is;
+  an old file moved to such a place is reported. This needs APFS; elsewhere nothing is renamed.
+- Every process a command leaves behind, detached ones included, is killed before that check, so
+  background servers do not survive their command.
+- With more than about 600 such nested files (many repositories, packages that ship `.envrc`),
+  they are closed by name instead of one by one: nothing can then create a nested `.git` or
+  `.envrc`, so `git init`, `clone` and `worktree add` inside the project, and installing such
+  packages, fail.
+- In a tree that cannot be checked completely (over 200,000 entries, or an unreadable directory)
+  nothing is renamed, and more is closed up front: creating `HEAD` outside `.git`, `config`,
+  `config.worktree` or `commondir` files below the root, and git hook names in any `hooks`
+  directory. The command gets an empty `$TMPDIR` of its own. The output says so.
 - In a linked git worktree, also its own git directory and the main repository's `objects`, `refs`
   and `logs`, so commits work. Config and hooks there stay closed.
 - Reads: everything you can read, except these credential stores in your home directory, which are
@@ -170,10 +182,11 @@ Where it does not protect you:
 - Other files inside the project can be changed, including build scripts, `Makefile`,
   `package.json` and hook directories named by `core.hooksPath` (such as `.husky`). You or your
   editor may later run them **outside** the sandbox.
-- The check on new nested git files runs when a command ends. A detached process can write them
-  afterwards. It is also incomplete in unreadable directories and, in trees over 200,000 entries,
-  skipped (the output says so). Whatever else creates such files in the project during a command
-  is treated the same way.
+- The check on new nested git files runs when a command ends. If flywheel is killed during a
+  command, there is no check and the command's processes keep running. A directory the command
+  made unreadable is reported, not checked. A file that existed before and was moved to a nested
+  `.envrc` is only reported. Whatever else creates such files in the project during a command
+  is treated the same way as the command.
 - Started in your home directory (or above it), the sandbox makes all of it writable, except the
   stores listed above.
 - A store reached through a chain of several symlinks is protected at both ends, but a link in the
@@ -182,8 +195,8 @@ Where it does not protect you:
   stores and the protected files.
 - **`bench` grading scripts run the code the model wrote, unsandboxed and with your environment.**
   Run untrusted suites or models in a VM.
-- A process that detaches itself from a command keeps running after it ends. flywheel does not
-  track it, so one started by an approved network command may keep its network access.
+- With `--unsafe` or without a sandbox, a process that detaches itself from a command keeps
+  running after it ends.
 
 **No sandbox** (Linux, or `sandbox-exec` unavailable, for example inside another sandbox):
 one-shot and `bench` refuse to run unless you pass `--unsafe`. Interactive mode says so and keeps
@@ -228,7 +241,7 @@ applies unless `--unsafe` is also given.
 - No API key support. The Linux build has no HTTPS.
 - No context compaction.
 - No sandbox on Linux yet.
-- Detached background processes are not found or killed.
+- Detached background processes are found and killed only for sandboxed commands.
 - Go and Rust gates are experimental.
 - The harness was tuned on the private suite below.
 - Not yet measured against OpenCode with the same model, or against Claude Haiku 5.5 run as an

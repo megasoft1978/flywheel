@@ -11,6 +11,11 @@
 #include <pwd.h>
 #include <sys/stat.h>
 #include <time.h>
+#ifdef __APPLE__
+#include <libproc.h>
+#include <sys/mount.h>
+extern int sandbox_check(pid_t pid, const char *operation, int type, ...);
+#endif
 
 static bool lex_normalize(const char *in, char *out, size_t cap);
 static bool is_within(const char *base, const char *path);
@@ -1363,7 +1368,43 @@ static bool gitdir_name(const char *n) {
    is denied) */
 enum { IT_CLOSED, IT_CONFIG, IT_COMMONDIR, IT_HOOK, IT_LINK, IT_ENVRC };
 typedef struct { char *path; int kind; bool present; } Item;
-typedef struct { Item *v; size_t n, cap; bool partial; } Items;
+/* APFS hands out ever larger inode numbers: what has a smaller one than a file
+   made just now existed before it, whatever it is called later */
+typedef struct { bool ok; dev_t dev; ino_t ino; } Mark;
+typedef struct {
+    Item *v; size_t n, cap;
+    char **was; size_t nwas, wascap;   /* paths that existed, under watched names */
+    Mark mark;
+    bool partial;
+} Items;
+
+static void mark_take(Items *it, const char *root) {
+#ifdef __APPLE__
+    char p[PATH_MAX];
+    struct statfs fs;
+    struct stat st;
+    if (snprintf(p, sizeof p, "%s/.fw-mark-XXXXXX", root) >= (int)sizeof p) return;
+    int fd = mkstemp(p);
+    if (fd < 0) return;
+    if (!fstat(fd, &st) && !fstatfs(fd, &fs) && !strcmp(fs.f_fstypename, "apfs"))
+        it->mark = (Mark){true, st.st_dev, st.st_ino};
+    close(fd);
+    unlink(p);
+#else
+    (void)it;
+    (void)root;
+#endif
+}
+
+static void was_add(Items *it, const char *dir, const char *name) {
+    char p[PATH_MAX];
+    struct stat st;
+    if (snprintf(p, sizeof p, "%s/%s", dir, name) >= (int)sizeof p) { it->partial = true; return; }
+    if (lstat(p, &st)) { if (errno != ENOENT && errno != ENOTDIR) it->partial = true; return; }
+    if (it->nwas == it->wascap)
+        it->was = realloc(it->was, (it->wascap = it->wascap ? 2 * it->wascap : 64) * sizeof *it->was);
+    it->was[it->nwas++] = str_dup(p);
+}
 
 static void item_add(Items *it, const char *dir, const char *name, int kind) {
     char p[PATH_MAX];
@@ -1376,11 +1417,22 @@ static void item_add(Items *it, const char *dir, const char *name, int kind) {
 
 static void items_free(Items *it) {
     for (size_t i = 0; i < it->n; i++) free(it->v[i].path);
+    for (size_t i = 0; i < it->nwas; i++) free(it->was[i]);
     free(it->v);
+    free(it->was);
     *it = (Items){0};
 }
 
+/* names whose files may have to be renamed later */
+static bool watched_name(const char *n) {
+    return gitdir_name(n) || !strcasecmp(n, "HEAD") || !strcasecmp(n, "objects")
+        || !strcasecmp(n, "refs") || !strcasecmp(n, ".envrc") || !strcasecmp(n, ".git");
+}
+
 static void scan_gitdir(Items *it, const char *g) {
+    static const char *const markers[] = {"config", "config.worktree", "commondir", "hooks",
+                                          "HEAD", "objects", "refs", NULL};
+    for (int i = 0; markers[i]; i++) was_add(it, g, markers[i]);
     item_add(it, g, "config", IT_CONFIG);
     item_add(it, g, "config.worktree", IT_CONFIG);
     item_add(it, g, "commondir", IT_COMMONDIR);
@@ -1390,42 +1442,50 @@ static void scan_gitdir(Items *it, const char *g) {
     if (snprintf(hooks, sizeof hooks, "%s/hooks", g) >= (int)sizeof hooks || lstat(hooks, &st)) return;
     if (!S_ISDIR(st.st_mode)) { item_add(it, g, "hooks", IT_HOOK); return; }
     DIR *d = opendir(hooks);
-    if (!d) return;
+    if (!d) { it->partial = true; return; }
     for (struct dirent *e; (e = readdir(d)); )
-        if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..")) item_add(it, hooks, e->d_name, IT_HOOK);
+        if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..")) {
+            item_add(it, hooks, e->d_name, IT_HOOK);
+            was_add(it, hooks, e->d_name);
+        }
     closedir(d);
 }
 
-#define SCAN_CAP 200000   /* directory entries; beyond it the check is partial */
+size_t fw_scan_cap = 200000;   /* directory entries; beyond it the check is partial */
 
 enum { IN_TREE, IN_MODULES, IN_WORKTREES };
 typedef struct { char *path; int in; } Dir;
 typedef struct { Dir *v; size_t n, cap; } Dirs;
 
-static void dir_push(Dirs *q, const char *dir, const char *name, int in) {
+static void dir_push(Dirs *q, Items *it, const char *dir, const char *name, int in) {
     char p[PATH_MAX];
     struct stat st;
-    if (snprintf(p, sizeof p, "%s%s%s", dir, name ? "/" : "", name ? name : "") >= (int)sizeof p) return;
-    if (lstat(p, &st) || !S_ISDIR(st.st_mode)) return;
+    if (snprintf(p, sizeof p, "%s%s%s", dir, name ? "/" : "", name ? name : "") >= (int)sizeof p) {
+        it->partial = true;
+        return;
+    }
+    if (lstat(p, &st)) { if (errno != ENOENT && errno != ENOTDIR) it->partial = true; return; }
+    if (!S_ISDIR(st.st_mode)) return;
     if (q->n == q->cap) q->v = realloc(q->v, (q->cap = q->cap ? 2 * q->cap : 64) * sizeof *q->v);
     q->v[q->n++] = (Dir){str_dup(p), in};
 }
 
 /* breadth first, so that what is near the root is seen even when partial. The
-   root's own .git files and .envrc are SBX_PROJ's business. */
-static void tree_scan(const char *proj, Items *it) {
+   root's own .git files and .envrc are SBX_PROJ's business. Anything that
+   cannot be looked at, or more than cap entries, leaves the result partial. */
+static void tree_scan(const char *proj, Items *it, size_t cap) {
     Dirs q = {0};
-    dir_push(&q, proj, NULL, IN_TREE);
+    dir_push(&q, it, proj, NULL, IN_TREE);
     size_t seen = 0;
-    for (size_t i = 0; i < q.n && !it->partial; i++) {
+    for (size_t i = 0; i < q.n && seen <= cap; i++) {
         char dir[PATH_MAX];
         snprintf(dir, sizeof dir, "%s", q.v[i].path);
         int in = q.v[i].in;
         bool root = !i;
         if (in == IN_MODULES && (bare_like(dir) || has_entry(dir, "HEAD"))) {
             scan_gitdir(it, dir);
-            dir_push(&q, dir, "modules", IN_MODULES);
-            dir_push(&q, dir, "worktrees", IN_WORKTREES);
+            dir_push(&q, it, dir, "modules", IN_MODULES);
+            dir_push(&q, it, dir, "worktrees", IN_WORKTREES);
             continue;
         }
         if (in == IN_TREE) {
@@ -1435,25 +1495,31 @@ static void tree_scan(const char *proj, Items *it) {
             if (snprintf(git, sizeof git, "%s/.git", dir) < (int)sizeof git && !lstat(git, &st)) {
                 if (S_ISDIR(st.st_mode)) {
                     if (!root) scan_gitdir(it, git);
-                    dir_push(&q, git, "modules", IN_MODULES);
-                    dir_push(&q, git, "worktrees", IN_WORKTREES);
+                    dir_push(&q, it, git, "modules", IN_MODULES);
+                    dir_push(&q, it, git, "worktrees", IN_WORKTREES);
                 } else if (!root) item_add(it, dir, ".git", IT_LINK);
             }
             if (bare_like(dir)) scan_gitdir(it, dir);
         }
         DIR *d = opendir(dir);
-        if (!d) continue;
+        if (!d) { if (errno != ENOENT) it->partial = true; continue; }
+        const char *base = strrchr(dir, '/');
+        bool hooks = base && !strcasecmp(base + 1, "hooks");
         for (struct dirent *e; (e = readdir(d)); ) {
             if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
-            if (++seen > SCAN_CAP) { it->partial = true; break; }
+            if (++seen > cap) { it->partial = true; break; }
+            if (hooks || watched_name(e->d_name)) was_add(it, dir, e->d_name);
             if ((e->d_type != DT_DIR && e->d_type != DT_UNKNOWN) || !strcasecmp(e->d_name, ".git"))
                 continue;
             if (in == IN_WORKTREES) {
                 char g[PATH_MAX];
-                if (snprintf(g, sizeof g, "%s/%s", dir, e->d_name) >= (int)sizeof g) continue;
+                if (snprintf(g, sizeof g, "%s/%s", dir, e->d_name) >= (int)sizeof g) {
+                    it->partial = true;
+                    continue;
+                }
                 scan_gitdir(it, g);
-                dir_push(&q, g, "modules", IN_MODULES);
-            } else dir_push(&q, dir, e->d_name, in);
+                dir_push(&q, it, g, "modules", IN_MODULES);
+            } else dir_push(&q, it, dir, e->d_name, in);
         }
         closedir(d);
     }
@@ -1599,17 +1665,69 @@ static void move_aside(const char *path, const char *proj, Note *note) {
     note_add(note, done ? "  %s\n" : "  %s — COULD NOT BE RENAMED, tell the user\n", shown);
 }
 
-/* what is there now, was not before, and could run code */
-static void quarantine_new(const Items *before, const Items *now, const char *proj, Note *note) {
+static int by_path(const void *a, const void *b) {
+    return strcasecmp(*(char *const *)a, *(char *const *)b);
+}
+
+/* something was at this path before */
+static bool was_here(const Items *before, const char *path) {
+    return before->nwas
+        && bsearch(&path, before->was, before->nwas, sizeof *before->was, by_path);
+}
+
+/* it was there before: at this path (rewritten since or not), or elsewhere */
+static bool existed(const Items *before, const char *path, const struct stat *st) {
+    return was_here(before, path) || !before->mark.ok || st->st_dev != before->mark.dev
+        || st->st_ino <= before->mark.ino;
+}
+
+/* what was already in dir would now be obeyed: take away one newly made entry
+   that git needs to see a repository there */
+static void disarm(const Items *before, const char *dir, const char *proj, Note *note) {
+    static const char *const markers[] = {"HEAD", "commondir", "objects", "refs", NULL};
+    if (!has_entry(dir, "HEAD")
+        || !(has_entry(dir, "commondir") || (has_entry(dir, "objects") && has_entry(dir, "refs"))))
+        return;
+    for (int i = 0; markers[i]; i++) {
+        char p[PATH_MAX];
+        struct stat st;
+        if (snprintf(p, sizeof p, "%s/%s", dir, markers[i]) >= (int)sizeof p || lstat(p, &st)
+            || existed(before, p, &st)) continue;
+        move_aside(p, proj, note);
+        return;
+    }
+}
+
+/* what could run code and was not there before is moved aside. Nothing that
+   existed before is ever renamed; if that cannot be told, nothing is. */
+static void quarantine_new(Items *before, const Items *now, const char *proj, Note *note) {
+    if (before->partial || !before->mark.ok) {
+        if (!strstr(note->s, "nothing was renamed"))
+            note_add(note, "%s", "[sandbox: new files cannot be told from old ones here: nothing was"
+                     " renamed]\n");
+        return;
+    }
+    if (before->nwas) qsort(before->was, before->nwas, sizeof *before->was, by_path);
     for (size_t i = 0; i < now->n; i++) {
         const Item *it = &now->v[i];
         if (!it->present || it->kind == IT_CLOSED) continue;
-        bool old = false;
-        for (size_t j = 0; !old && j < before->n; j++)
-            old = before->v[j].present && !strcmp(before->v[j].path, it->path);
         struct stat st;
-        /* gone: listed twice, and already moved */
-        if (!old && !lstat(it->path, &st) && item_dangerous(it, proj)) move_aside(it->path, proj, note);
+        /* gone: listed twice, and already moved. A directory runs nothing. */
+        if (lstat(it->path, &st) || S_ISDIR(st.st_mode) || !item_dangerous(it, proj)) continue;
+        if (!existed(before, it->path, &st)) {
+            move_aside(it->path, proj, note);
+            continue;
+        }
+        if (it->kind == IT_CONFIG || it->kind == IT_COMMONDIR || it->kind == IT_HOOK) {
+            char dir[PATH_MAX];
+            parent_of(it->path, dir);
+            const char *base = strrchr(dir, '/');
+            if (it->kind == IT_HOOK && base && !strcasecmp(base + 1, "hooks")) *strrchr(dir, '/') = 0;
+            disarm(before, dir, proj, note);
+        }
+        if (!was_here(before, it->path))
+            note_add(note, "[sandbox: %s was moved there from elsewhere; it existed before and was not"
+                     " renamed — tell the user]\n", it->path);
     }
 }
 
@@ -1707,8 +1825,188 @@ static void sb_project(Sb *b, const char *proj, const Items *found, const Linked
     sb_add(b, ")");
 }
 
-/* malloc'd profile, NULL if the paths cannot be resolved. tmp may be NULL. */
-static char *sbx_profile(const char *cwd, const char *tmp, bool net, const Items *found) {
+/* ----- rules by name, for trees too large or only partly seen -----
+   Constant in size whatever the tree holds, and binding on detached processes
+   too. The sandbox limits one regex string to 1023 characters. */
+
+#define SBX_RX 1000
+
+/* name as a regex matching every spelling the filesystem folds to it */
+static const char *fold(const char *name, char *out) {   /* out holds 256 */
+    size_t n = 0;
+    for (const char *p = name; *p && n < 230; p++) {
+        char one[5] = {'[', (char)tolower((unsigned char)*p), (char)toupper((unsigned char)*p), ']', 0};
+        const char *s = one;
+        if (p[0] == 'f' && p[1] == 'i') { s = "([fF][iI]|\xef\xac\x81)"; p++; }
+        else if (*p == 's') s = "([sS]|\xc5\xbf)";
+        else if (*p == 'k') s = "([kK]|\xe2\x84\xaa)";
+        else if (!isalpha((unsigned char)*p)) {
+            snprintf(one, sizeof one, *p == '.' ? "[.]" : "%c", *p);
+        }
+        n += (size_t)snprintf(out + n, 256 - n, "%s", s);
+    }
+    out[n] = 0;
+    return out;
+}
+
+/* path as regex text; what cannot be quoted matches any character */
+static void re_path(const char *path, char *out, size_t cap) {
+    size_t n = 0;
+    for (const char *p = path; *p && n + 4 < cap; p++) {
+        if (strchr("\"[]\\^", *p)) out[n++] = '.';
+        else if (strchr(".*+?()|{}$", *p)) { out[n++] = '['; out[n++] = *p; out[n++] = ']'; }
+        else out[n++] = *p;
+    }
+    out[n] = 0;
+}
+
+static void sb_regex(Sb *b, const char *head, const char *tail) {
+    if (strlen(head) + strlen(tail) > SBX_RX) b->full = true;
+    sb_add(b, " (regex #\"");
+    sb_add(b, head);
+    sb_add(b, tail);
+    sb_add(b, "\")");
+}
+
+typedef struct { char cfg[256], wt[256], cd[256], hooks[256], closed[1100], git[256]; } Names;
+
+static void names_fill(Names *x) {
+    fold("config", x->cfg);
+    fold("config.worktree", x->wt);
+    fold("commondir", x->cd);
+    fold("hooks", x->hooks);
+    fold(".git", x->git);
+    snprintf(x->closed, sizeof x->closed, "(%s|%s|%s|%s)(/|$)", x->cfg, x->wt, x->cd, x->hooks);
+}
+
+/* every nested git file and .envrc below root, by name. partial also closes
+   what would make a directory nobody has looked at into a repository. */
+static void sb_nested(Sb *b, const char *root, bool partial) {
+    Names x;
+    names_fill(&x);
+    char r[SBX_RX], head[SBX_RX + 8], tail[2000], a[256], c[256];
+    re_path(root, r, sizeof r);
+    snprintf(head, sizeof head, "^%s/", r);
+    sb_add(b, "(deny file-write*");
+    snprintf(tail, sizeof tail, "(.+/)?%s/%s", x.git, x.closed);
+    sb_regex(b, head, tail);
+    snprintf(tail, sizeof tail, "(.+/)?%s/(%s/.+|%s/[^/]+)/", x.git, fold("modules", a),
+             fold("worktrees", c));
+    snprintf(tail + strlen(tail), sizeof tail - strlen(tail), "%s", x.closed);
+    sb_regex(b, head, tail);
+    snprintf(tail, sizeof tail, ".+/%s$", x.git);
+    sb_regex(b, head, tail);
+    snprintf(tail, sizeof tail, ".+/%s(/|$)", fold(".envrc", a));
+    sb_regex(b, head, tail);
+    sb_add(b, ")(deny file-write-unlink (require-all");
+    snprintf(tail, sizeof tail, "(.+/)?%s/%s(/.+)?$", x.git, fold("modules", a));
+    sb_regex(b, head, tail);
+    sb_add(b, " (vnode-type DIRECTORY))");
+    snprintf(tail, sizeof tail, "(.+/)?%s/%s(/[^/]+)?$", x.git, fold("worktrees", a));
+    sb_regex(b, head, tail);
+    sb_add(b, ")");
+    if (!partial) return;
+
+    sb_add(b, "(deny file-write* (require-all");
+    snprintf(tail, sizeof tail, "(.+/)?%s$", fold("head", a));
+    sb_regex(b, head, tail);
+    snprintf(tail, sizeof tail, "/%s/", x.git);
+    sb_add(b, " (require-not");
+    sb_regex(b, "", tail);
+    sb_add(b, ")) (require-all");
+    snprintf(tail, sizeof tail, ".+/(%s|%s|%s)$", x.cfg, x.wt, x.cd);
+    sb_regex(b, head, tail);
+    sb_add(b, " (require-not (vnode-type DIRECTORY))) (require-all");
+    /* git's hook names */
+    static const char *const hook[] = {"pre", "post", "prepare", "commit", "applypatch", "update",
+                                       "proc", "reference", "push", "sendemail", "fsmonitor", "p4"};
+    for (int half = 0; half < 2; half++) {
+        size_t n = (size_t)snprintf(tail, sizeof tail, "(.+/)?%s/(", x.hooks);
+        for (int i = half * 6; i < half * 6 + 6 && n < sizeof tail; i++)
+            n += (size_t)snprintf(tail + n, sizeof tail - n, "%s%s", i % 6 ? "|" : "", fold(hook[i], a));
+        if (n < sizeof tail) snprintf(tail + n, sizeof tail - n, ")[^/]*$");
+        sb_regex(b, head, tail);
+        snprintf(tail, sizeof tail, "%s$", fold(".sample", a));
+        sb_add(b, " (require-not");
+        sb_regex(b, "", tail);
+        sb_add(b, half ? "))" : ")) (require-all");
+    }
+    snprintf(tail, sizeof tail, "(.+/)?%s$", x.hooks);
+    sb_add(b, " (require-all");
+    sb_regex(b, head, tail);
+    sb_add(b, " (vnode-type SYMLINK)))(deny file-write-unlink (require-all");
+    sb_regex(b, head, tail);
+    sb_add(b, " (vnode-type DIRECTORY)))");
+}
+
+/* many paths in as few regex strings as fit */
+typedef struct { char s[SBX_RX]; size_t n; const char *tail; } Alt;
+
+static void alt_flush(Sb *b, Alt *a) {
+    if (a->n) {
+        char t[1200];
+        snprintf(t, sizeof t, ")%s", a->tail);
+        sb_regex(b, a->s, t);
+    }
+    a->n = 0;
+}
+
+static void alt_add(Sb *b, Alt *a, const char *path) {
+    char r[SBX_RX];
+    re_path(path, r, sizeof r);
+    size_t len = strlen(r), room = SBX_RX - strlen(a->tail) - 2;
+    if (a->n && a->n + len + 1 >= room) alt_flush(b, a);
+    if (len + 3 >= room) { b->full = true; return; }
+    a->n += (size_t)snprintf(a->s + a->n, sizeof a->s - a->n, "%s%s", a->n ? "|" : "^(", r);
+}
+
+/* what the name rules miss among the items found: repositories not called
+   .git, and what a nested item links to */
+static void sb_odd_gitdirs(Sb *b, const char *proj, const Items *found) {
+    Names x;
+    names_fill(&x);
+    char closed[1200];
+    snprintf(closed, sizeof closed, "/%s", x.closed);
+    size_t skip = strlen(proj);
+    for (int pins = 0; pins < 2; pins++) {
+        Alt a = {.tail = pins ? "$" : closed};
+        char last[PATH_MAX] = "";
+        sb_add(b, pins ? "(deny file-write-unlink" : "(deny file-write*");
+        for (size_t i = 0; i < found->n && !b->full; i++) {
+            const Item *it = &found->v[i];
+            const char *leaf = strrchr(it->path, '/');
+            if (it->kind == IT_HOOK || !leaf || !gitdir_name(leaf + 1) || !is_within(proj, it->path)
+                || strstr(it->path + skip, "/.git/")) continue;
+            char dir[PATH_MAX];
+            parent_of(it->path, dir);
+            if (!strcmp(dir, last)) continue;
+            snprintf(last, sizeof last, "%s", dir);
+            if (!pins) { alt_add(b, &a, dir); continue; }
+            for (char *s; strlen(dir) > skip; ) {
+                alt_add(b, &a, dir);
+                if (!(s = strrchr(dir, '/'))) break;
+                *s = 0;
+            }
+        }
+        alt_flush(b, &a);
+        /* an empty deny would deny everything */
+        sb_add(b, " (literal \"/dev/null/-\"))");
+    }
+    sb_add(b, "(deny file-write*");
+    for (size_t i = 0; i < found->n && !b->full; i++) {
+        const Item *it = &found->v[i];
+        char target[PATH_MAX];
+        struct stat st;
+        if (it->kind != IT_HOOK && it->present && !lstat(it->path, &st) && S_ISLNK(st.st_mode)
+            && sbx_resolve(it->path, target, 0)) sb_path(b, target);
+    }
+    sb_add(b, " (literal \"/dev/null/-\"))");
+}
+
+/* malloc'd profile, NULL if the paths cannot be resolved. tmp and mark may be
+   NULL. */
+static char *sbx_build(const char *cwd, const char *tmp, bool net, const Items *found,
+                       const char *mark, bool wild) {
     char proj[PATH_MAX], rtmp[PATH_MAX];
     if (!cwd || !realpath(cwd, proj)) return NULL;
     if (tmp && !realpath(tmp, rtmp)) return NULL;
@@ -1737,7 +2035,28 @@ static char *sbx_profile(const char *cwd, const char *tmp, bool net, const Items
     sb_add(&b, "(deny file-read* file-write*");
     each_secret(sb_deny_secret, &b);
     sb_add(&b, ")");
-    sb_project(&b, proj, found, linked ? &w : NULL);
+    sb_project(&b, proj, wild ? NULL : found, linked ? &w : NULL);
+    if (wild) {
+        bool partial = found->partial;
+        sb_nested(&b, proj, partial);
+        if (tmp && partial) sb_nested(&b, rtmp, true);
+        if (linked && partial) {
+            sb_nested(&b, w.dir, partial);
+            static const char *const shared[] = {"objects", "refs", "logs", NULL};
+            for (int i = 0; shared[i]; i++) {
+                char p[PATH_MAX];
+                snprintf(p, sizeof p, "%s/%s", w.common, shared[i]);
+                sb_nested(&b, p, partial);
+            }
+        }
+        sb_odd_gitdirs(&b, proj, found);
+    }
+    /* names this command's processes, so that all of them can be found later */
+    if (mark) {
+        char rule[160];
+        snprintf(rule, sizeof rule, "(allow mach-lookup (global-name \"%s-a\"))", mark);
+        sb_add(&b, rule);
+    }
     /* IP and name lookup only: other unix sockets (Docker, ssh-agent) stay shut */
     if (net)
         sb_add(&b,
@@ -1752,13 +2071,30 @@ static char *sbx_profile(const char *cwd, const char *tmp, bool net, const Items
     return b.s;
 }
 
+#define SBX_EXACT 600   /* nested items; more are covered by name instead */
+
+static bool sbx_wild(const Items *found) {
+    if (!found) return false;
+    size_t n = 0;
+    for (size_t i = 0; i < found->n; i++) n += found->v[i].kind != IT_HOOK;
+    return found->partial || n > SBX_EXACT;
+}
+
+/* one rule per nested item while they fit, rules by name otherwise */
+static char *sbx_profile(const char *cwd, const char *tmp, bool net, const Items *found,
+                         const char *mark) {
+    bool wild = sbx_wild(found);
+    char *p = sbx_build(cwd, tmp, net, found, mark, wild);
+    return p || wild || !found ? p : sbx_build(cwd, tmp, net, found, mark, true);
+}
+
 bool sandbox_available(void) {
     if (sbx_state >= 0) return sbx_state;
     sbx_state = 0;
 #ifdef __APPLE__
     /* run something under a real profile: a nested sandbox or a policy that
        blocks sandbox-exec must count as unavailable */
-    char *prof = sbx_profile("/usr/share", NULL, false, NULL);
+    char *prof = sbx_profile("/usr/share", NULL, false, NULL, NULL);
     if (!prof) return false;
     pid_t pid = fork();
     if (pid == 0) {
@@ -1825,6 +2161,53 @@ static void sbx_env(char **env, const char *tmp) {
     env[n] = NULL;
 }
 
+#ifdef __APPLE__
+/* the profile of one command allows looking up "<mark>-a" and nothing else of
+   that name, which no other process matches */
+static bool sbx_ours(pid_t pid, const char *a, const char *b) {
+    const int global_name = 2, no_report = 0x40000000;
+    return sandbox_check(pid, "mach-lookup", global_name | no_report, a) == 0
+        && sandbox_check(pid, "mach-lookup", global_name | no_report, b) == 1;
+}
+#endif
+
+/* Kill every process of the command named by mark, detached ones included.
+   Returns how many were found; *left says some are still there. */
+static int sbx_sweep(const char *mark, bool grace, bool *left) {
+    int total = 0;
+    *left = false;
+#ifdef __APPLE__
+    char a[96], b[96];
+    snprintf(a, sizeof a, "%s-a", mark);
+    snprintf(b, sizeof b, "%s-b", mark);
+    for (int round = 0; round < 50; round++) {
+        int cap = proc_listallpids(NULL, 0) + 256;
+        pid_t *pids = malloc((size_t)cap * sizeof *pids);
+        int n = proc_listallpids(pids, cap * (int)sizeof *pids), found = 0;
+        for (int i = 0; i < n; i++)
+            if (pids[i] > 1 && pids[i] != getpid() && sbx_ours(pids[i], a, b)) pids[found++] = pids[i];
+        if (found && grace) {   /* let what is already finishing finish */
+            grace = false;
+            free(pids);
+            usleep(100000);
+            continue;
+        }
+        /* all stopped before any dies, so that none can start another */
+        for (int i = 0; i < found; i++) kill(pids[i], SIGSTOP);
+        for (int i = 0; i < found; i++) kill(pids[i], SIGKILL);
+        free(pids);
+        *left = found > 0;
+        if (!found) break;
+        total += found;
+        usleep(2000);
+    }
+#else
+    (void)mark;
+    (void)grace;
+#endif
+    return total;
+}
+
 static char *run_command(const char *cmd, const char *cwd, int timeout_s, int *code, bool net) {
     if (code) *code = -1;
     /* --unsafe: as is. Otherwise a clean environment always, and the sandbox when
@@ -1832,14 +2215,34 @@ static char *run_command(const char *cmd, const char *cwd, int timeout_s, int *c
     bool clean = !g_cfg.unsafe, boxed = sandbox_on();
     char *env[SBX_NENV] = {NULL}, *prof = NULL;
     Items before = {0};
-    char proj[PATH_MAX];
+    char proj[PATH_MAX], mark[64] = "", own_tmp[PATH_MAX] = "";
+    bool wild = false;
     if (clean) {
         const char *tmp = sbx_tmpdir();
         if (!tmp) return str_dup("error: cannot create a private TMPDIR — not executed");
         if (boxed) {
-            if (cwd && realpath(cwd, proj)) tree_scan(proj, &before);
-            if (!(prof = sbx_profile(cwd, tmp, net, &before))) {
+            if (cwd && realpath(cwd, proj)) {
+                mark_take(&before, proj);
+                tree_scan(proj, &before, fw_scan_cap);
+            }
+            wild = sbx_wild(&before);
+            /* an earlier command's TMPDIR may hold what this one must not move in */
+            if (before.partial) {
+                if (snprintf(own_tmp, sizeof own_tmp, "%s/p-XXXXXX", tmp) >= (int)sizeof own_tmp
+                    || !mkdtemp(own_tmp)) {
+                    items_free(&before);
+                    return str_dup("error: cannot create a private TMPDIR — not executed");
+                }
+                tmp = own_tmp;
+            }
+            static unsigned runs;
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            snprintf(mark, sizeof mark, "fw.mark.%ld.%ld.%09ld.%u", (long)getpid(),
+                     (long)ts.tv_sec, ts.tv_nsec, ++runs);
+            if (!(prof = sbx_profile(cwd, tmp, net, &before, mark))) {
                 items_free(&before);
+                if (*own_tmp) rmdir(own_tmp);
                 return str_dup("error: cannot set up the sandbox for this directory — not executed");
             }
         }
@@ -1905,6 +2308,10 @@ static char *run_command(const char *cmd, const char *cwd, int timeout_s, int *c
     }
     /* nothing started with network access outlives its approval */
     if (net && !timed) killpg(pid, SIGKILL);
+    /* nothing the command started may act after the check below */
+    int swept = 0;
+    bool left = false;
+    if (boxed) swept = sbx_sweep(mark, !timed && !g_abort, &left);
     /* drain what is left; bounded so a surviving background writer can't pin us */
     drain_pipe(fds[0], buf, &len, 1024);
     close(fds[0]);
@@ -1936,13 +2343,28 @@ static char *run_command(const char *cmd, const char *cwd, int timeout_s, int *c
         if (strstr(out, "could not lock config file") || strstr(out, "could not write config"))
             note_add(&note, "%s", "[sandbox: git config and hooks are read-only here — that setting was"
                      " NOT saved, whatever git reported]\n");
-        Items now = {0};
-        tree_scan(proj, &now);
-        /* a partial first look cannot tell new from old */
-        if (before.partial || now.partial)
-            note_add(&note, "%s", "[sandbox: tree too large to check every nested git file]\n");
-        if (!before.partial) quarantine_new(&before, &now, proj, &note);
-        items_free(&now);
+        if (left)
+            note_add(&note, "%s", "[sandbox: some processes of this command could NOT be stopped, tell"
+                     " the user]\n");
+        else if (swept && !timed)
+            note_add(&note, "%s", "[sandbox: background processes end with their command; they were"
+                     " stopped]\n");
+        if (before.partial)
+            note_add(&note, "%s", "[sandbox: tree too large or unreadable to check: nothing was renamed;"
+                     " nested .git, .envrc and new repositories were blocked up front]\n");
+        else {
+            if (wild && strstr(out, "Operation not permitted"))
+                note_add(&note, "%s", "[sandbox: too many nested git files to protect one by one, so"
+                         " creating nested .git or .envrc is blocked here]\n");
+            Items now = {0};
+            tree_scan(proj, &now, SIZE_MAX);
+            if (now.partial)
+                note_add(&note, "%s", "[sandbox: part of the tree can no longer be read and was not"
+                         " checked, tell the user]\n");
+            quarantine_new(&before, &now, proj, &note);
+            items_free(&now);
+        }
+        if (*own_tmp) rmdir(own_tmp);
         if (*note.s) {
             size_t cap = strlen(out) + strlen(note.s) + 2;
             char *t = malloc(cap);
@@ -2550,20 +2972,20 @@ static const char *protected_write(const char *cwd, const char *abs) {
     return NULL;
 }
 
-/* A file tool can assemble a bare repository one file at a time. `was` notes
-   which directories above abs already looked like one; those that do only now
-   lose what could run code. */
-static void bare_check(const char *cwd, const char *abs, bool *was, size_t cap,
-                       bool after, Note *note) {
+/* A file tool can assemble a bare repository one file at a time. Before the
+   write, `before` records what each directory above abs already holds; after
+   it, a repository that obeys something dangerous is disarmed. */
+static void bare_check(const char *cwd, const char *abs, Items *before, bool after, Note *note) {
     char root[PATH_MAX], dir[PATH_MAX];
     if (!realpath(cwd, root)) return;
+    if (!after) mark_take(before, root);
     parent_of(abs, dir);
-    for (size_t i = 0; i < cap && is_within(root, dir); i++) {
-        if (!after) was[i] = bare_like(dir);
-        else if (!was[i] && bare_like(dir)) {
-            Items none = {0}, now = {0};
+    for (int i = 0; i < 64 && is_within(root, dir); i++) {
+        if (!after) scan_gitdir(before, dir);
+        else if (bare_like(dir)) {
+            Items now = {0};
             scan_gitdir(&now, dir);
-            quarantine_new(&none, &now, root, note);
+            quarantine_new(before, &now, root, note);
             items_free(&now);
         }
         char *s = strrchr(dir, '/');
@@ -2662,15 +3084,17 @@ char *tool_write_file(const char *cwd, const char *path, const char *content) {
     size_t len = strlen(content);
     if (len > FILETOOL_MAX_CONTENT) return str_dup("error: content too large (4 MiB cap)");
 
-    bool was[64] = {0}, inplace = false;
+    Items before = {0};
+    bool inplace = false;
     Note note = {0};
-    bare_check(cwd, abs, was, 64, false, &note);
+    bare_check(cwd, abs, &before, false, &note);
     if (fw_file_hook) fw_file_hook();
     const char *leaf;
     int dfd = open_parent(abs, true, &leaf);
     int werr = dfd < 0 ? errno : write_atomic(dfd, leaf, content, len, &inplace);
     if (dfd >= 0) close(dfd);
-    if (!werr) bare_check(cwd, abs, was, 64, true, &note);
+    if (!werr) bare_check(cwd, abs, &before, true, &note);
+    items_free(&before);
     if (werr) {
         char buf[300];
         snprintf(buf, sizeof buf, "error: cannot write %s: %s — %s", path, write_why(werr),
@@ -2693,9 +3117,6 @@ char *tool_edit_file(const char *cwd, const char *path, const char *old_str, con
     const char *err = resolve_confined(cwd, path, abs, sizeof abs, false);
     if (!err) err = protected_write(cwd, abs);
     if (err) return str_dup(err);
-    bool was[64] = {0};
-    Note note = {0};
-    bare_check(cwd, abs, was, 64, false, &note);
     if (fw_file_hook) fw_file_hook();
 
     /* read and write relative to the same directory, reached without links */
@@ -2764,10 +3185,14 @@ char *tool_edit_file(const char *cwd, const char *path, const char *old_str, con
 
     size_t total = pre + nl + post;
     bool inplace;
+    Items before = {0};
+    Note note = {0};
+    bare_check(cwd, abs, &before, false, &note);
     int werr = write_atomic(dfd, leaf, out, total, &inplace);
     close(dfd);
     free(out);
-    if (!werr) bare_check(cwd, abs, was, 64, true, &note);
+    if (!werr) bare_check(cwd, abs, &before, true, &note);
+    items_free(&before);
     if (werr) {
         char buf[300];
         snprintf(buf, sizeof buf, "error: cannot write %s: %s — %s", path, write_why(werr),

@@ -135,6 +135,8 @@ char *tool_write_file(const char *cwd, const char *path, const char *content);  
 char *tool_edit_file(const char *cwd, const char *path, const char *old_str, const char *new_str);
 /* tests only: runs between the path checks of a file tool and its I/O */
 extern void (*fw_file_hook)(void);
+/* tests only: entries the sandbox check visits before it counts as partial */
+extern size_t fw_scan_cap;
 cJSON *args_parse_strict(const char *raw);  /* complete JSON object or NULL */
 void  args_note_repair(const char *kind);               /* bumps repair stats */
 

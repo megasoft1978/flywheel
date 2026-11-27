@@ -2434,7 +2434,8 @@ static void test_nested_git(void) {
     free(tool_write_file(proj, "t/objects/x", "x"));
     free(tool_write_file(proj, "t/refs/x", "x"));
     free(tool_write_file(proj, "t/HEAD", "ref: refs/heads/main\n"));
-    T("tool-made repository cannot keep its config", gone(proj, "t/config"));
+    /* the config was there before the last call: it stays, the repository does not */
+    T("tool-made repository is not usable", gone(proj, "t/HEAD") && !gone(proj, "t/config"));
     setenv("HOME", old, 1);
     free(old);
 }
@@ -2477,6 +2478,170 @@ static void test_linked_worktree(void) {
       && gone(proj, ".git/worktrees/wt/planted"));
     free(config);
     free(common);
+    setenv("HOME", old, 1);
+    free(old);
+}
+
+/* a project whose own names make a directory look like a repository */
+static void user_files(const char *proj, const char *sub) {
+    char script[600];
+    snprintf(script, sizeof script, "mkdir -p %srefs %sconfig %shooks && echo a: 1 > %sconfig/app.yml"
+             " && echo hook > %shooks/useX.js", sub, sub, sub, sub, sub);
+    host(proj, script);
+}
+
+static bool user_files_there(const char *proj, const char *sub) {
+    char a[256], b[256];
+    snprintf(a, sizeof a, "%sconfig/app.yml", sub);
+    snprintf(b, sizeof b, "%shooks/useX.js", sub);
+    return !gone(proj, a) && !gone(proj, b);
+}
+
+/* nothing that existed before a command or a tool call is renamed */
+static void test_keeps_user_files(void) {
+    char base[PATH_MAX], home[PATH_MAX], proj[PATH_MAX];
+    char *old = review_dirs(base, home, proj);
+    if (!old) { T("mkdtemp", false); return; }
+    static const char *const subs[] = {"", "sub/"};
+    for (int u = 0; u < 2; u++)
+        for (int i = 0; i < 2; i++) {
+            snprintf(proj, sizeof proj, "%s/tool%d%d", base, u, i);
+            mkdir(proj, 0700);
+            user_files(proj, subs[i]);
+            bool was = g_cfg.unsafe;
+            g_cfg.unsafe = u;
+            char path[64];
+            snprintf(path, sizeof path, "%sobjects/a.txt", subs[i]);
+            char *r = tool_write_file(proj, path, "x");
+            T("tool: write beside user files", !strncmp(r, "ok:", 3) && !strstr(r, "quarantined"));
+            free(r);
+            g_cfg.unsafe = was;
+            T("tool: user files not renamed", user_files_there(proj, subs[i]));
+        }
+    if (sandbox_available()) {
+        for (int i = 0; i < 2; i++) {
+            snprintf(proj, sizeof proj, "%s/sh%d", base, i);
+            mkdir(proj, 0700);
+            user_files(proj, subs[i]);
+            char cmd[64];
+            snprintf(cmd, sizeof cmd, "mkdir %sobjects", subs[i]);
+            char *o = run_bash(cmd, proj, 30);
+            T("shell: nothing renamed", !strstr(o, "quarantined") && user_files_there(proj, subs[i]));
+            free(o);
+        }
+        /* an old config completed into a repository: only the new HEAD moves */
+        snprintf(proj, sizeof proj, "%s/done", base);
+        mkdir(proj, 0700);
+        host(proj, "mkdir -p s/objects s/refs && printf '[core]\\n\\tfsmonitor = x\\n' > s/config");
+        char *o = run_bash("echo 'ref: refs/heads/main' > s/HEAD", proj, 30);
+        T("shell: only the new marker moves", strstr(o, "quarantined") && gone(proj, "s/HEAD")
+          && !gone(proj, "s/config"));
+        free(o);
+        /* an old file moved to where git obeys it is not renamed either */
+        host(proj, "printf '[core]\\n\\tfsmonitor = x\\n' > old.txt");
+        o = run_bash("git init -q n && mv old.txt n/.git/config", proj, 30);
+        T("shell: old file kept, its new repository disarmed", gone(proj, "n/.git/HEAD")
+          && !gone(proj, "n/.git/config") && strstr(o, "existed before"));
+        free(o);
+    }
+    setenv("HOME", old, 1);
+    free(old);
+}
+
+/* a process that left the command's group cannot write after the check */
+static void test_detached(void) {
+    char base[PATH_MAX], home[PATH_MAX], proj[PATH_MAX];
+    char *old = review_dirs(base, home, proj);
+    if (!old) { T("mkdtemp", false); return; }
+    char *o = run_bash("mkdir n; perl -MPOSIX -e 'exit if fork; setsid; close STDIN; close STDOUT;"
+                       " close STDERR; sleep 1; open F, q(>), q(n/.envrc); print F q(evil)'", proj, 30);
+    free(o);
+    sleep(2);
+    T("detached process wrote nothing later", gone(proj, "n/.envrc"));
+    setenv("HOME", old, 1);
+    free(old);
+}
+
+/* more nested items than one rule each can hold */
+static void test_many_items(void) {
+    char base[PATH_MAX], home[PATH_MAX], proj[PATH_MAX];
+    char *old = review_dirs(base, home, proj);
+    if (!old) { T("mkdtemp", false); return; }
+    host(proj, "git init -q . && i=0; while [ $i -lt 1100 ]; do mkdir -p r$i/.git node_modules/p$i;"
+               " echo safe > r$i/.git/config; echo safe > node_modules/p$i/.envrc; i=$((i+1)); done;"
+               " git init -q --bare bare.git; mkdir -p b/objects b/refs; echo safe > b/config");
+    int code = -1;
+    char *o = run_bash_status("echo hi", proj, 60, &code);
+    T("many nested items: commands still run", !code && strstr(o, "hi"));
+    free(o);
+    char *bare = slurp(under(proj, "bare.git/config"));
+    in_dir(proj);
+    quiet("echo evil > r7/.git/config; echo evil > r1099/.GIT/CONFIG; echo evil > node_modules/p9/.envrc;"
+          " mkdir r7/.git/hooks; echo evil > r7/.git/hooks/pre-commit; echo evil > r8/.git/commondir;"
+          " mv r7/.git g; mv r9 q; echo evil > q/.git/config; mkdir n; echo evil > n/.EnvRC;"
+          " echo evil > bare.git/config; echo evil > b/config; mv b b2");
+    quiet("mkdir 'r8/.git/hook\xc5\xbf'; echo evil > 'r8/.git/con\xef\xac\x81g'");
+    T("many: nested configs closed", holds(under(proj, "r7/.git/config"), "safe\n")
+      && holds(under(proj, "r1099/.git/config"), "safe\n") && holds(under(proj, "r8/.git/config"), "safe\n")
+      && (gone(proj, "q") || holds(under(proj, "q/.git/config"), "safe\n")));
+    T("many: nested .envrc closed", holds(under(proj, "node_modules/p9/.envrc"), "safe\n")
+      && gone(proj, "n/.envrc"));
+    T("many: nothing planted", gone(proj, "r7/.git/hooks") && gone(proj, "r8/.git/commondir")
+      && gone(proj, "r8/.git/hooks") && gone(proj, "g"));
+    T("many: bare repositories closed", bare && holds(under(proj, "bare.git/config"), bare)
+      && holds(under(proj, "b/config"), "safe\n") && gone(proj, "b2"));
+    free(bare);
+    o = run_bash_status("echo a > a && git add a && git -c user.name=t -c user.email=t@t commit -qm a",
+                        proj, 60, &code);
+    T("many: git in the root works", !code);
+    free(o);
+    setenv("HOME", old, 1);
+    free(old);
+}
+
+/* a tree the check cannot cover is closed up front, not skipped */
+static void test_partial_scan(void) {
+    char base[PATH_MAX], home[PATH_MAX], proj[PATH_MAX];
+    char *old = review_dirs(base, home, proj);
+    if (!old) { T("mkdtemp", false); return; }
+    host(proj, "git init -q . && mkdir pad && i=0; while [ $i -lt 60 ]; do : > pad/$i; i=$((i+1)); done;"
+               " mkdir -p deep/er/x.git deep/er/n/.git; echo safe > deep/er/x.git/config;"
+               " echo safe > deep/er/n/.git/config");
+    size_t cap = fw_scan_cap;
+    fw_scan_cap = 20;
+    int code = -1;
+    char *o = run_bash_status("echo hi > f", proj, 30, &code);
+    T("partial: ordinary writes work, and it says so", !code && strstr(o, "nothing was renamed"));
+    free(o);
+    in_dir(proj);
+    quiet("echo evil > deep/er/x.git/config; echo evil > deep/er/n/.git/config; git init -q z; mkdir -p m/.git;"
+          " mkdir d; mkdir d/objects d/refs; echo 'ref: refs/heads/main' > d/HEAD;"
+          " mkdir -p $TMPDIR/p/.git; echo evil > $TMPDIR/p/.git/config; mv $TMPDIR/p moved;"
+          " mkdir deep/er/y; echo evil > deep/er/y/.envrc");
+    T("partial: unseen repositories closed", holds(under(proj, "deep/er/x.git/config"), "safe\n")
+      && holds(under(proj, "deep/er/n/.git/config"), "safe\n"));
+    T("partial: no new repository", gone(proj, "z/.git") && gone(proj, "m/.git") && gone(proj, "d/HEAD")
+      && gone(proj, "moved/.git/config")
+      && gone(proj, "deep/er/y/.envrc"));
+
+    /* padding made by the command itself hides nothing */
+    snprintf(proj, sizeof proj, "%s/small", base);
+    mkdir(proj, 0700);
+    o = run_bash("mkdir a && cd a && i=0; while [ $i -lt 60 ]; do : > $i; i=$((i+1)); done; cd .. &&"
+                 " git init -q zz && " EVIL_CFG " >> zz/.git/config", proj, 30);
+    T("padding does not switch the check off", strstr(o, "quarantined") && gone(proj, "zz/.git/config"));
+    free(o);
+    fw_scan_cap = cap;
+
+    /* a directory that cannot be read makes the check partial */
+    snprintf(proj, sizeof proj, "%s/locked", base);
+    mkdir(proj, 0700);
+    host(proj, "mkdir shut && chmod 000 shut");
+    o = run_bash("git init -q z", proj, 30);
+    T("unreadable directory: fails closed and says so", strstr(o, "nothing was renamed")
+      && gone(proj, "z/.git"));
+    free(o);
+    chmod(under(proj, "shut"), 0700);
     setenv("HOME", old, 1);
     free(old);
 }
@@ -2574,7 +2739,11 @@ int main(void) {
     test_loopedit();
     test_file_race();
     test_unicode_stores();
+    test_keeps_user_files();
     if (sandbox_available()) {
+        test_detached();
+        test_many_items();
+        test_partial_scan();
         test_sandbox();
         test_sandbox_escapes();
         test_nested_git();
