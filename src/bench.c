@@ -167,8 +167,11 @@ static void collect_rec(const char *root, const char *rel, const char *dest, con
         char *slash = strchr(first, '/');
         if (slash) *slash = 0;
         if (in_list(m->skip, first)) continue;
-        if (is_dir(fp)) { collect_rec(root, cr, dest, m); continue; }
-        if (!is_file(fp)) continue;
+        /* model-made links point anywhere: neither followed nor collected */
+        struct stat st;
+        if (lstat(fp, &st)) continue;
+        if (S_ISDIR(st.st_mode)) { collect_rec(root, cr, dest, m); continue; }
+        if (!S_ISREG(st.st_mode)) continue;
         if (strstr(e->d_name, ".test.") || strstr(e->d_name, ".spec.")) continue;
         char dp[1400];
         snprintf(dp, sizeof dp, "%s/%s", dest, cr);

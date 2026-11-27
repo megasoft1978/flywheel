@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -482,6 +483,7 @@ static void test_copy_file(void) {
 /* ---------- canned HTTP server ---------- */
 
 static int nreq;   /* request number inside the server process */
+static const char *req_dump;   /* if set, the server appends every request there */
 
 /* serve reply(n) to the n-th request until killed */
 static pid_t serve(const char *(*reply)(int)) {
@@ -511,6 +513,8 @@ static pid_t serve(const char *(*reply)(int)) {
             char *body = strstr(req, "\r\n\r\n"), *cl = strstr(req, "Content-Length:");
             if (body && (!cl || strlen(body + 4) >= (size_t)atol(cl + 15))) break;
         }
+        FILE *dump = req_dump ? fopen(req_dump, "a") : NULL;
+        if (dump) { fwrite(req, 1, len, dump); fclose(dump); }
         const char *r = reply(nreq++);
         if (write(c, r, strlen(r)) < 0) _exit(1);
         close(c);
@@ -2058,6 +2062,206 @@ static void test_sandbox(void) {
     free(oldhome);
 }
 
+/* path under dir; parents are made */
+static const char *under(const char *dir, const char *rel) {
+    static char p[4][1024];
+    static int i;
+    char *o = p[i = (i + 1) % 4];
+    snprintf(o, sizeof p[0], "%s/%s", dir, rel);
+    for (char *s = o + strlen(dir) + 1; (s = strchr(s, '/')); s++) {
+        *s = 0;
+        mkdir(o, 0700);
+        *s = '/';
+    }
+    return o;
+}
+
+static void in_dir(const char *dir) {
+    free(g_cfg.cwd);
+    g_cfg.cwd = str_dup(dir);
+}
+
+/* the command's output does not carry the secret */
+static void hidden(const char *cmd) {
+    char *o = run_bash(cmd, g_cfg.cwd, 20);
+    T(cmd, !strstr(o, "TOPSECRET"));
+    free(o);
+}
+
+static void quiet(const char *cmd) { free(run_bash(cmd, g_cfg.cwd, 20)); }
+
+static void refused(const char *name, char *result) {
+    T(name, !strncmp(result, "error:", 6));
+    free(result);
+}
+
+static const char *bench_call;
+static const char *reply_bench(int n) {
+    const char *calls[] = {"bash", bench_call};
+    return n ? OK_HDR STOPPED "data: [DONE]\n\n" : tool_reply("tool_calls", 1, calls);
+}
+
+static void test_sandbox_escapes(void) {
+    char tmpl[] = "/tmp/fwescXXXXXX", base[PATH_MAX], home[PATH_MAX], proj[PATH_MAX], cmd[4000];
+    if (!mkdtemp(tmpl) || !realpath(tmpl, base)) { T("mkdtemp", false); return; }
+    snprintf(home, sizeof home, "%s/home", base);
+    snprintf(proj, sizeof proj, "%s/proj", base);
+    mkdir(home, 0700);
+    mkdir(proj, 0700);
+    char *oldhome = str_dup(getenv("HOME"));
+    setenv("HOME", home, 1);
+    int code = 0;
+
+    /* A: the project root cannot be swapped for a link to HOME */
+    in_dir(proj);
+    put(under(proj, "f"), "x");
+    quiet("p=$PWD; rm f; cd .. ; rmdir \"$p\" && ln -s \"$HOME\" \"$p\"; true");
+    struct stat st;
+    T("project root not replaced", !lstat(proj, &st) && S_ISDIR(st.st_mode));
+    quiet("mv \"$PWD\" \"$TMPDIR/gone\"");
+    T("project root not moved", !lstat(proj, &st) && S_ISDIR(st.st_mode));
+    quiet("echo x > \"$HOME/planted\"");
+    T("HOME still not writable", access(under(home, "planted"), F_OK) != 0);
+
+    /* A: renaming a directory above a secret does not free it */
+    mkdir(home, 0700);
+    put(under(home, ".ssh/key"), "TOPSECRET");
+    put(under(home, ".config/gh/key"), "TOPSECRET");
+    put(under(base, "dotfiles/pg/pgpass"), "TOPSECRET");
+    T("link pgpass", !symlink(under(base, "dotfiles/pg/pgpass"), under(home, ".pgpass")));
+    in_dir(base);
+    hidden("mv home h2; cat h2/.ssh/key home/.ssh/key");
+    hidden("mv home/.config c2; cat c2/gh/key home/.config/gh/key");
+    hidden("mv dotfiles d2; cat d2/pg/pgpass dotfiles/pg/pgpass");
+    hidden("mv dotfiles/pg p2; cat p2/pgpass dotfiles/pg/pgpass");
+    T("secrets stayed in place", holds(under(home, ".ssh/key"), "TOPSECRET")
+      && holds(under(base, "dotfiles/pg/pgpass"), "TOPSECRET"));
+    T("ordinary rename still works", out_has("mkdir r1 && mv r1 r2 && echo moved-ok", "moved-ok"));
+
+    /* B: a store that does not exist yet, under a link */
+    mkdir(under(base, "store"), 0700);
+    T("link cargo", !symlink(under(base, "store"), under(home, ".cargo")));
+    snprintf(cmd, sizeof cmd, "%s/vault/token", base);   /* dangling: no vault/ yet */
+    T("link vault", !symlink(cmd, under(home, ".vault-token")));
+    quiet("echo x > store/credentials");
+    T("unmade store under a link unwritable", access(under(base, "store/credentials"), F_OK) != 0);
+    quiet("mkdir -p vault; echo x > vault/token");
+    T("dangling store link target unwritable", access(under(base, "vault/token"), F_OK) != 0);
+
+    /* C: the file tools keep out of the stores */
+    T("link in project", !symlink("home/.ssh/key", under(base, "innocent")));
+    refused("write into .ssh", tool_write_file(base, "home/.ssh/authorized_keys", "k"));
+    refused("write, other case", tool_write_file(base, "HOME/.SSH/key", "k"));
+    refused("write through link", tool_write_file(base, "innocent", "k"));
+    refused("write secret link target", tool_write_file(base, "dotfiles/pg/pgpass", "k"));
+    refused("write unmade store", tool_write_file(base, "home/.m2/settings.xml", "k"));
+    T("no parents made for a refused write", access(under(home, ".m2"), F_OK) != 0);
+    refused("edit secret", tool_edit_file(base, "home/.ssh/key", "TOP", "BOT"));
+    T("secrets unchanged", holds(under(home, ".ssh/key"), "TOPSECRET")
+      && holds(under(base, "dotfiles/pg/pgpass"), "TOPSECRET"));
+    char *r = tool_write_file(base, "home/.sshx/ok", "k");
+    T("neighbour of a store writable", !strncmp(r, "ok:", 3));
+    free(r);
+
+    /* G: more credential files; a history file linked to /dev/null */
+    static const char *const creds[] = {".npmrc", ".pypirc", ".cargo/credentials.toml",
+        ".gem/credentials", ".zsh_history", ".python_history", ".m2/settings.xml",
+        ".gradle/gradle.properties"};
+    in_dir(proj);
+    for (int i = 0; i < (int)(sizeof creds / sizeof *creds); i++) {
+        put(under(home, creds[i]), "TOPSECRET");
+        snprintf(cmd, sizeof cmd, "cat \"$HOME/%s\"", creds[i]);
+        hidden(cmd);
+    }
+    T("link history", !symlink("/dev/null", under(home, ".bash_history")));
+    T("/dev/null survives a linked history file", out_has("echo a >/dev/null && echo null-ok", "null-ok"));
+
+    /* D: instruction files that lead to a secret are not sent anywhere */
+    const char *bin_cwd[] = {proj, base};
+    put(under(home, ".ssh/key"), "TOPSECRET");
+    char *dump = str_dup(under(base, "requests"));
+    bad_reply = OK_HDR STOPPED "data: [DONE]\n\n";
+    for (int i = 0; i < 2; i++) {
+        /* a target outside the project, then a secret inside it */
+        T("link AGENTS", !symlink(under(home, ".ssh/key"), under(bin_cwd[i], "AGENTS.md")));
+        put(under(bin_cwd[i], "CLAUDE.md"), "plain-instructions");
+        unlink(dump);
+        req_dump = dump;
+        pid_t srv = serve(reply_fixed);
+        char *av[] = {"flywheel", "-C", (char *)bin_cwd[i], "-e", g_cfg.endpoint, "-T", "1", "hi", NULL};
+        run_flywheel(false, av);
+        stop(srv);
+        req_dump = NULL;
+        char *sent = slurp(dump);
+        T("linked secret not sent", sent && !strstr(sent, "TOPSECRET"));
+        T("next instruction file used", sent && strstr(sent, "plain-instructions"));
+        free(sent);
+        unlink(under(bin_cwd[i], "AGENTS.md"));
+    }
+    free(dump);
+
+    /* E: bench collects no model-made links */
+    put(under(base, "suite/tasks/t1/prompt.md"), "hi\n");
+    snprintf(cmd, sizeof cmd, "{\"command\":\"ln -s '%s/.ssh/key' leak.txt; ln -s '%s' leakdir; "
+             "echo ok > real.txt\"}", home, home);
+    bench_call = cmd;
+    pid_t srv = serve(reply_bench);
+    char suite[PATH_MAX + 8];
+    snprintf(suite, sizeof suite, "%s/suite", base);
+    char *bv[] = {"flywheel", "-e", g_cfg.endpoint, "-T", "3", "bench", suite, "tg", "t1", NULL};
+    run_flywheel(false, bv);
+    stop(srv);
+    T("bench collected the real file", !access(under(suite, "runs/tg/t1/files/real.txt"), F_OK));
+    T("bench skipped a file link", lstat(under(suite, "runs/tg/t1/files/leak.txt"), &st) != 0);
+    T("bench skipped a directory link", lstat(under(suite, "runs/tg/t1/files/leakdir"), &st) != 0);
+
+    /* F: project files that run later outside the sandbox */
+    in_dir(proj);
+    unlink(under(proj, "CLAUDE.md"));
+    /* no repository: nothing may make one */
+    quiet("mkdir -p x/hooks; echo evil > x/hooks/pre-commit; mv x .git");
+    quiet("mkdir .GIT; ln -s x .git; echo 'gitdir: x' > .git");
+    T(".git cannot be planted", lstat(under(proj, ".git"), &st) != 0);
+    refused("file tool cannot start .git", tool_write_file(proj, ".git/hooks/pre-commit", "evil"));
+    T("no .git left behind", lstat(under(proj, ".git"), &st) != 0);
+    quiet("echo evil > .EnvRc; echo evil > e; mv e .envrc; ln e .envrc");
+    T(".envrc cannot be made", access(under(proj, ".envrc"), F_OK) != 0);
+
+    snprintf(cmd, sizeof cmd, "git init -q '%s'", proj);
+    T("git init outside the sandbox", !system(cmd));
+    char *config = slurp(under(proj, ".git/config"));
+    free(run_bash_status("echo a > a && git add a && git -c user.name=t -c user.email=t@t "
+                         "commit -qm one", proj, 20, &code));
+    T("git add and commit work", !code);
+    quiet("echo evil > .git/hooks/pre-commit; echo evil > .git/HOOKS/pre-push");
+    quiet("echo evil >> .git/config; echo evil >> .Git/Config; git config core.hooksPath x");
+    quiet("echo evil > .git/commondir; echo evil > .git/config.worktree");
+    T("hooks not planted", access(under(proj, ".git/hooks/pre-commit"), F_OK)
+      && access(under(proj, ".git/hooks/pre-push"), F_OK)
+      && access(under(proj, ".git/commondir"), F_OK)
+      && access(under(proj, ".git/config.worktree"), F_OK));
+    quiet("mv .git old && cp -R old .git; mv .GIT old2; mv .git/hooks h2");
+    T(".git not renamed", access(under(proj, "old"), F_OK) && access(under(proj, "old2"), F_OK)
+      && access(under(proj, "h2"), F_OK));
+    T("git config unchanged", config && holds(under(proj, ".git/config"), config));
+
+    refused("tool: hook", tool_write_file(proj, ".git/hooks/pre-commit", "evil"));
+    refused("tool: config, other case", tool_write_file(proj, ".GIT/Config", "evil"));
+    refused("tool: hook, odd spelling", tool_write_file(proj, ".git/hoo\xe2\x84\xaas/x", "evil"));
+    refused("tool: .envrc", tool_write_file(proj, ".envrc", "evil"));
+    refused("tool: edit config", tool_edit_file(proj, ".git/config", "core", "evil"));
+    T("link to config", !symlink(".git/config", under(proj, "cfg")));
+    refused("tool: config through a link", tool_write_file(proj, "cfg", "evil"));
+    T("config still unchanged", config && holds(under(proj, ".git/config"), config));
+    r = tool_write_file(proj, ".gitignore", "o\n");
+    T("tool: .gitignore writable", !strncmp(r, "ok:", 3));
+    free(r);
+    free(config);
+
+    setenv("HOME", oldhome, 1);
+    free(oldhome);
+}
+
 /* no sandbox: nothing may run unless someone approves or --unsafe says so */
 static void test_fail_closed(void) {
     char dir[] = "/tmp/fwfcXXXXXX", p[256];
@@ -2149,7 +2353,7 @@ int main(void) {
     test_truth();
     test_atomic();
     test_loopedit();
-    if (sandbox_available()) test_sandbox();
+    if (sandbox_available()) { test_sandbox(); test_sandbox_escapes(); }
     else printf("unit: SKIP sandbox tests (no sandbox here)\n");
     test_fail_closed();
 #ifdef FW_MINI_HTTP

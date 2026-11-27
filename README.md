@@ -80,7 +80,7 @@ flywheel bench <suite-dir> <tag>    # run a benchmark suite
 
 `flywheel --help` lists the rest. Settings can also live in `~/.config/flywheel/config`.
 Project instructions come from the first of `.flywheel.md`, `AGENTS.md` or `CLAUDE.md`
-(first 3,800 characters).
+(first 3,800 characters). A file that links outside the project or into a credential store is skipped.
 
 ## What the harness does
 
@@ -120,10 +120,18 @@ untrusted repository or task in a VM.
 **Sandbox (macOS)**
 
 - Writes: the working directory and a private `$TMPDIR` (plus `/dev/null` and similar). Not `/tmp`.
-- Reads: everything you can read, except `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.docker`,
-  `~/.azure`, `~/.netrc`, `~/.git-credentials`, `~/.config/{gh,flywheel,gcloud}`, keychains,
-  cookies and the common browser profiles. **Other files, including other tokens such as
-  `~/.npmrc`, stay readable** and their contents can reach the model.
+  Not the project's `.envrc`, `.git/hooks`, `.git/config`, `.git/config.worktree` or
+  `.git/commondir`, which run or redirect code later, outside the sandbox. Without a real `.git`
+  directory, nothing can create `.git`. The project directory itself and the directories above
+  these files and the stores below cannot be renamed or removed.
+- Reads: everything you can read, except these credential stores in your home directory, which are
+  neither readable nor writable, also through the file tools and where they are symlinks:
+  `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.docker`, `~/.azure`, `~/.netrc`,
+  `~/.git-credentials`, `~/.config/{gh,flywheel,gcloud}`, `~/.npmrc`, `~/.pypirc`,
+  `~/.cargo/credentials*`, `~/.gem/credentials`, `~/.pgpass`, `~/.vault-token`,
+  `~/.m2/settings.xml`, `~/.gradle/gradle.properties`, shell and REPL history files, keychains,
+  cookies and the common browser profiles. **Any file not on that list stays readable**, including
+  other tokens and `.env` files, and its contents can reach the model.
 - Network: none, not even localhost. In an interactive session the model can ask for it for one
   command; you are asked every time, whatever your "always allow" rules say. One-shot and `bench`
   cannot grant it. Allowed network is any IP address, not one host.
@@ -134,6 +142,11 @@ What stops working inside it:
 
 - Tools that write under `$HOME`: package caches and global installs (`cargo`, `pip --user`,
   Gradle and the like). Fetch dependencies yourself first.
+- `git init` in the project root, and anything that writes `.git/config` or hooks: `git config`,
+  `git remote add`, `git push -u`, `git branch -u`, `git submodule add`, hook installers such as
+  husky or `pre-commit install`. `add`, `commit`, branches and stash work.
+- Tools that need a denied file: private registry logins in `~/.npmrc`, `~/.m2/settings.xml`,
+  `~/.gradle/gradle.properties` and the like.
 - `git fetch`/`push` (offline; over SSH it also fails with network approved, as keys and
   `known_hosts` are unreadable), and Keychain or `gh` credentials.
 - A git worktree or submodule whose `.git` directory is outside the project: no commits.
@@ -142,13 +155,19 @@ What stops working inside it:
 
 Where it does not protect you:
 
-- Anything inside the project can be changed, including `.git` hooks and build scripts that you
-  or your editor may later run **outside** the sandbox.
+- Other files inside the project can be changed, including build scripts, `Makefile`,
+  `package.json`, hook directories named by `core.hooksPath` (such as `.husky`), nested
+  repositories and `.git/modules`. You or your editor may later run them **outside** the sandbox.
 - Started in your home directory (or above it), the sandbox makes all of it writable, except the
   stores listed above.
-- File tools do not go through the sandbox; they have their own project confinement. `bench` grade
-  scripts run unsandboxed.
-- A process that detaches itself from an approved network command may keep its network access.
+- A store reached through a chain of several symlinks is protected at both ends, but a link in the
+  middle of the chain can be renamed.
+- File tools do not go through the sandbox; they have their own project confinement and refuse the
+  stores and the protected files.
+- **`bench` grading scripts run the code the model wrote, unsandboxed and with your environment.**
+  Run untrusted suites or models in a VM.
+- A process that detaches itself from a command keeps running after it ends. flywheel does not
+  track it, so one started by an approved network command may keep its network access.
 
 **No sandbox** (Linux, or `sandbox-exec` unavailable, for example inside another sandbox):
 one-shot and `bench` refuse to run unless you pass `--unsafe`. Interactive mode says so and keeps
@@ -193,6 +212,7 @@ applies unless `--unsafe` is also given.
 - No API key support. The Linux build has no HTTPS.
 - No context compaction.
 - No sandbox on Linux yet.
+- Detached background processes are not found or killed.
 - Go and Rust gates are experimental.
 - The harness was tuned on the private suite below.
 - Not yet measured against OpenCode with the same model, or against Claude Haiku 5.5 run as an

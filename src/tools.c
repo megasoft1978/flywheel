@@ -5,6 +5,7 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <ctype.h>
+#include <strings.h>
 #include <limits.h>
 #include <pwd.h>
 #include <sys/stat.h>
@@ -1145,11 +1146,11 @@ static bool drain_pipe(int fd, char *buf, size_t *len, int max_reads) {
 /* ---------- sandbox for model-run commands ----------
    macOS Seatbelt through sandbox-exec, deny by default: writes only inside the
    working directory and a private TMPDIR, no reads of credential stores, no
-   network unless the user approved it for that one command. Elsewhere there is
+   writes to project files that later run outside the sandbox, no network unless the user approved it for that one command. Elsewhere there is
    no sandbox yet, which callers must treat as unavailable. */
 
 #define SBX_EXEC "/usr/bin/sandbox-exec"
-#define SBX_CAP 65536
+#define SBX_CAP (256 * 1024)
 
 static int sbx_state = -1;   /* -1 = not probed, 0 = unavailable, 1 = works */
 
@@ -1162,7 +1163,20 @@ static const char *const SBX_SECRETS[] = {
     "Library/Application Support/BraveSoftware", "Library/Application Support/Firefox",
     "Library/Application Support/Microsoft Edge", "Library/Application Support/Arc",
     "Library/Application Support/Vivaldi", "Library/Application Support/com.operasoftware.Opera",
+    /* package registry, database and vault credentials */
+    ".npmrc", ".pypirc", ".cargo/credentials", ".cargo/credentials.toml", ".gem/credentials",
+    ".pgpass", ".vault-token", ".m2/settings.xml", ".gradle/gradle.properties",
+    /* shell and REPL history: pasted tokens end up there */
+    ".bash_history", ".bash_sessions", ".zsh_history", ".zhistory", ".zsh_sessions",
+    ".sh_history", ".history", ".local/share/fish/fish_history", ".python_history",
+    ".node_repl_history", ".irb_history", ".psql_history", ".mysql_history",
+    ".sqlite_history", ".rediscli_history",
     NULL
+};
+
+/* in the project, but run or obeyed later by tools outside the sandbox */
+static const char *const SBX_PROJ[] = {
+    ".envrc", ".git/hooks", ".git/config", ".git/config.worktree", ".git/commondir", NULL
 };
 
 typedef struct { char *s; size_t n; bool full; } Sb;
@@ -1174,9 +1188,11 @@ static void sb_add(Sb *b, const char *s) {
     b->n += n;
 }
 
-/* ` (subpath "path")` */
-static void sb_path(Sb *b, const char *path) {
-    sb_add(b, " (subpath \"");
+/* ` (kind "path")` */
+static void sb_filter(Sb *b, const char *kind, const char *path) {
+    sb_add(b, " (");
+    sb_add(b, kind);
+    sb_add(b, " \"");
     for (const char *p = path; *p; p++) {
         char c[3] = {'\\', *p, 0};
         sb_add(b, *p == '"' || *p == '\\' ? c : c + 1);
@@ -1184,16 +1200,124 @@ static void sb_path(Sb *b, const char *path) {
     sb_add(b, "\")");
 }
 
-static void sb_secrets(Sb *b, const char *home) {
-    char real[PATH_MAX], p[PATH_MAX], target[PATH_MAX];
-    if (!home || !*home || !realpath(home, real)) return;
-    for (int i = 0; SBX_SECRETS[i]; i++) {
-        int n = snprintf(p, sizeof p, "%s/%s", real, SBX_SECRETS[i]);
-        if (n < 0 || (size_t)n >= sizeof p) { b->full = true; return; }
-        sb_path(b, p);
-        /* a symlinked store (dotfiles checkout) is judged by where it leads */
-        if (realpath(p, target) && strcmp(p, target)) sb_path(b, target);
+static void sb_path(Sb *b, const char *path) {
+    /* a history file linked to /dev/null must not close /dev/null */
+    if (strncmp(path, "/dev/", 5)) sb_filter(b, "subpath", path);
+}
+
+/* the entry itself, once: it cannot be renamed, removed or replaced */
+static void sb_pin(Sb *b, const char *path) {
+    size_t at = b->n;
+    sb_filter(b, "literal", path);
+    if (!b->full && strstr(b->s, b->s + at) < b->s + at) b->s[b->n = at] = 0;
+}
+
+/* a rule on a path means nothing once a directory above it can be moved */
+static void sb_pin_above(Sb *b, const char *path) {
+    char p[PATH_MAX];
+    snprintf(p, sizeof p, "%s", path);
+    for (char *s; (s = strrchr(p, '/')) && s != p; ) {
+        *s = 0;
+        sb_pin(b, p);
     }
+}
+
+/* where `path` leads, also when its tail does not exist yet: the deepest
+   existing ancestor is resolved and dangling links are followed. out holds
+   PATH_MAX bytes. */
+static bool sbx_resolve(const char *path, char *out, int depth) {
+    if (realpath(path, out)) return true;
+    char parent[PATH_MAX], real[PATH_MAX], link[PATH_MAX], next[PATH_MAX];
+    snprintf(parent, sizeof parent, "%s", path);
+    char *slash = strrchr(parent, '/');
+    if (!slash || depth > 32) return false;
+    *slash = 0;
+    if (!sbx_resolve(*parent ? parent : "/", real, depth + 1)) return false;
+    const char *dir = strcmp(real, "/") ? real : "";
+    if (snprintf(out, PATH_MAX, "%s/%s", dir, slash + 1) >= PATH_MAX) return false;
+    ssize_t n = readlink(out, link, sizeof link - 1);
+    if (n < 0) return true;
+    link[n] = 0;
+    if (snprintf(next, sizeof next, "%s%s%s", *link == '/' ? "" : dir,
+                 *link == '/' ? "" : "/", link) >= (int)sizeof next) return false;
+    return sbx_resolve(next, out, depth + 1);
+}
+
+typedef bool (*SecretFn)(const char *path, void *arg);   /* true stops the walk */
+
+static bool home_secrets(const char *home, SecretFn fn, void *arg) {
+    if (!home || !*home) return false;
+    /* as spelled and as resolved: a linked HOME must not be repointed either */
+    char base[2][PATH_MAX], p[PATH_MAX], target[PATH_MAX];
+    if (!lex_normalize(home, base[0], PATH_MAX)) base[0][0] = 0;
+    if (!sbx_resolve(home, base[1], 0) || !strcmp(base[0], base[1])) base[1][0] = 0;
+    for (int h = 0; h < 2; h++)
+        for (int i = 0; *base[h] && SBX_SECRETS[i]; i++) {
+            if (snprintf(p, sizeof p, "%s/%s", base[h], SBX_SECRETS[i]) >= (int)sizeof p) continue;
+            if (fn(p, arg)) return true;
+            /* a symlinked store (dotfiles checkout) is judged by where it leads */
+            if (sbx_resolve(p, target, 0) && strcmp(p, target) && fn(target, arg)) return true;
+        }
+    return false;
+}
+
+/* every credential store path of $HOME and of the account's home */
+static bool each_secret(SecretFn fn, void *arg) {
+    const char *home = getenv("HOME");
+    const struct passwd *pw = getpwuid(getuid());
+    return fn("/Library/Keychains", arg) || home_secrets(home, fn, arg)
+        || (pw && (!home || strcmp(home, pw->pw_dir)) && home_secrets(pw->pw_dir, fn, arg));
+}
+
+static bool sb_deny_secret(const char *path, void *b) { sb_path(b, path); return false; }
+static bool sb_pin_secret(const char *path, void *b) { sb_pin_above(b, path); return false; }
+
+/* path is root or below it, however its case or Unicode form is spelled */
+static bool path_under(const char *root, const char *path) {
+    size_t n = strlen(root);
+    if (!strncasecmp(root, path, n) && (!path[n] || path[n] == '/')) return true;
+    struct stat r, st;
+    if (stat(root, &r)) return false;
+    char p[PATH_MAX];
+    snprintf(p, sizeof p, "%s", path);
+    for (;;) {
+        if (!stat(p, &st) && st.st_dev == r.st_dev && st.st_ino == r.st_ino) return true;
+        char *s = strrchr(p, '/');
+        if (!s || s == p) return false;
+        *s = 0;
+    }
+}
+
+static bool secret_holds(const char *store, void *path) { return path_under(store, path); }
+
+static bool in_secret_store(const char *path) {
+    return each_secret(secret_holds, (void *)path);
+}
+
+/* the SBX_PROJ files of the project: closed, along with what they link to and
+   every directory leading there. Without a real .git directory nothing may
+   create or change .git, or a prepared one could be moved into place. */
+static void sb_project(Sb *b, const char *proj) {
+    char p[PATH_MAX], target[PATH_MAX];
+    struct stat st;
+    bool repo = snprintf(p, sizeof p, "%s/.git", proj) < (int)sizeof p
+                && !lstat(p, &st) && S_ISDIR(st.st_mode);
+    sb_add(b, "(deny file-write*");
+    if (!repo) sb_path(b, p);
+    for (int i = 0; SBX_PROJ[i]; i++) {
+        if (snprintf(p, sizeof p, "%s/%s", proj, SBX_PROJ[i]) >= (int)sizeof p) b->full = true;
+        sb_path(b, p);
+        if (sbx_resolve(p, target, 0) && strcmp(p, target)) sb_path(b, target);
+    }
+    sb_add(b, ")(deny file-write-unlink");
+    sb_pin(b, proj);
+    for (int i = 0; SBX_PROJ[i]; i++) {
+        snprintf(p, sizeof p, "%s/%s", proj, SBX_PROJ[i]);
+        sb_pin_above(b, p);
+        if (sbx_resolve(p, target, 0) && strcmp(p, target)) sb_pin_above(b, target);
+    }
+    each_secret(sb_pin_secret, b);
+    sb_add(b, ")");
 }
 
 /* malloc'd profile, NULL if the paths cannot be resolved. tmp may be NULL. */
@@ -1220,12 +1344,10 @@ static char *sbx_profile(const char *cwd, const char *tmp, bool net) {
     if (tmp) sb_path(&b, rtmp);
     sb_add(&b, ")");
     /* the last matching rule wins: secrets stay closed even inside the project */
-    sb_add(&b, "(deny file-read* file-write* (subpath \"/Library/Keychains\")");
-    const char *home = getenv("HOME");
-    const struct passwd *pw = getpwuid(getuid());
-    sb_secrets(&b, home);
-    if (pw && (!home || strcmp(home, pw->pw_dir))) sb_secrets(&b, pw->pw_dir);
+    sb_add(&b, "(deny file-read* file-write*");
+    each_secret(sb_deny_secret, &b);
     sb_add(&b, ")");
+    sb_project(&b, proj);
     /* IP and name lookup only: other unix sockets (Docker, ssh-agent) stay shut */
     if (net)
         sb_add(&b,
@@ -1941,8 +2063,10 @@ const char *resolve_confined(const char *cwd, const char *path, char *out, size_
             char real[PATH_MAX];
             if (!realpath(next, real)) return "error: path goes through a dangling symlink";
             if (!is_within(realcwd, real)) return "error: path escapes working dir through a symlink";
+            if (in_secret_store(real)) return "error: path is in a credential store";
             snprintf(cur, sizeof cur, "%s", real);
         } else {
+            if (in_secret_store(next)) return "error: path is in a credential store";
             if (next_tok && for_write && mkdir(next, 0755) && errno != EEXIST)
                 return "error: cannot create parent directories";
             snprintf(cur, sizeof cur, "%s", next);
@@ -1950,7 +2074,30 @@ const char *resolve_confined(const char *cwd, const char *path, char *out, size_
         tok = next_tok;
     }
 
+    if (in_secret_store(cur)) return "error: path is in a credential store";
     snprintf(out, cap, "%s", cur);
+    return NULL;
+}
+
+/* the file tools run outside the sandbox: they keep its SBX_PROJ rule */
+static const char *protected_write(const char *cwd, const char *abs) {
+    static const char *const why =
+        "error: this file can run code outside the sandbox (.envrc, git hooks and config)";
+    char root[PATH_MAX], p[PATH_MAX];
+    if (!realpath(cwd, root)) return NULL;
+    for (int i = 0; SBX_PROJ[i]; i++) {
+        if (snprintf(p, sizeof p, "%s/%s", root, SBX_PROJ[i]) >= (int)sizeof p) return why;
+        if (path_under(p, abs)) return why;
+    }
+    struct stat st;
+    snprintf(p, sizeof p, "%s/.git", root);
+    if (!path_under(p, abs)) return NULL;
+    if (lstat(p, &st) || !S_ISDIR(st.st_mode)) return why;
+    /* git's names are ASCII; another spelling may fold into one not made yet */
+    size_t n = strlen(p);
+    if (!strncasecmp(p, abs, n) && abs[n] == '/')
+        for (const char *c = abs + n + 1; *c && *c != '/'; c++)
+            if ((unsigned char)*c >= 0x80) return why;
     return NULL;
 }
 
@@ -2048,7 +2195,10 @@ static const char *write_why(int err) {
 
 char *tool_write_file(const char *cwd, const char *path, const char *content) {
     char abs[PATH_MAX];
-    const char *err = resolve_confined(cwd, path, abs, sizeof abs, true);
+    /* judged before any parent directory is created */
+    const char *err = resolve_confined(cwd, path, abs, sizeof abs, false);
+    if (!err) err = protected_write(cwd, abs);
+    if (!err) err = resolve_confined(cwd, path, abs, sizeof abs, true);
     if (err) return str_dup(err);
     if (!content) content = "";
     size_t len = strlen(content);
@@ -2075,6 +2225,7 @@ char *tool_edit_file(const char *cwd, const char *path, const char *old_str, con
     if (!new_str) new_str = "";
     char abs[PATH_MAX];
     const char *err = resolve_confined(cwd, path, abs, sizeof abs, false);
+    if (!err) err = protected_write(cwd, abs);
     if (err) return str_dup(err);
 
     FILE *f = open_nofollow(abs, O_RDONLY, "rb");

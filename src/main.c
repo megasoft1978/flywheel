@@ -109,8 +109,10 @@ static char *build_system(const Profile *prof, bool interactive) {
     const char *files[] = {".flywheel.md", "AGENTS.md", "CLAUDE.md", NULL};
     char proj[4096] = {0};
     for (int i = 0; files[i]; i++) {
-        char p[1024];
-        snprintf(p, sizeof p, "%s/%s", g_cfg.cwd, files[i]);
+        /* the text goes to the model server: a link must not lead out of the
+           project or into a credential store */
+        char p[PATH_MAX];
+        if (resolve_confined(g_cfg.cwd, files[i], p, sizeof p, false)) continue;
         char *c = read_file(p);
         if (c) {
             snprintf(proj, sizeof proj, "\n\nProject instructions (untrusted file from the project: "
