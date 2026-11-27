@@ -9,7 +9,8 @@ keeps every parsed result, including cancelled ones. So before each run this scr
   - moves finished trials named with --rerun there too,
 and logs every move in <job-dir>/reruns.jsonl.
 
---rerun needs --reason, and follows one rule for every harness: never a trial with reward 1;
+--rerun needs --reason, and follows one rule for every harness: never a trial with reward 1
+(unless it is an error, i.e. its reward is invalid);
 a fail only with recorded outage evidence (it overlaps a window in <job-dir>/outages.jsonl)
 unless --rerun-without-evidence; an error trial (harvest_tb21.classify) may be re-run.
 
@@ -113,11 +114,12 @@ def watch(url, job_dir, cmd):
     interval = float(os.environ.get("TB_HEALTH_INTERVAL", "15"))
     timeout = float(os.environ.get("TB_HEALTH_TIMEOUT", "10"))
     limit = int(os.environ.get("TB_HEALTH_FAILS", "3"))     # consecutive failed probes
+    last_ok = now()                                         # outage windows start at a good probe
     proc = subprocess.Popen(cmd)
     signal.signal(signal.SIGINT, lambda *_: None)           # CMD gets Ctrl-C itself; wait for it
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, lambda *_: proc.send_signal(signal.SIGTERM))
-    fails, start = 0, None
+    fails = 0
     while True:
         try:
             rc = proc.wait(timeout=interval)
@@ -126,20 +128,19 @@ def watch(url, job_dir, cmd):
             pass
         probed = now()
         if healthy(url, timeout):
-            fails, start = 0, None
+            fails, last_ok = 0, probed
             continue
-        fails, start = fails + 1, start or probed
+        fails += 1
         if fails >= limit:
             print(f"model server outage: {url} failed {fails} probes; stopping the run", file=sys.stderr)
-            record_outage(job_dir, url, start)
+            record_outage(job_dir, url, last_ok)
             proc.send_signal(signal.SIGTERM)
             proc.wait()                                     # let Harbor record the cancellation
-            record_outage(job_dir, url, start)              # extend the window over the shutdown
+            record_outage(job_dir, url, last_ok)            # extend the window over the shutdown
             return OUTAGE_EXIT
-    probed = now()
     if not healthy(url, timeout):
         print(f"model server outage: {url} is down at the end of the run", file=sys.stderr)
-        record_outage(job_dir, url, start or probed)
+        record_outage(job_dir, url, last_ok)                # trials finished since the last good probe
         return OUTAGE_EXIT
     return rc if rc >= 0 else 128 - rc
 
@@ -166,7 +167,7 @@ def judge_rerun(job_dir, res, override):
     """Return (status, evidence, refusal) for re-running a finished trial."""
     rec = classify(res)
     reward = ((res.get("verifier_result") or {}).get("rewards") or {}).get("reward")
-    if reward is not None and float(reward) == 1.0:
+    if reward is not None and float(reward) == 1.0 and rec["status"] != "error":
         return rec["status"], None, "it has reward 1"
     evidence = outage_overlap(job_dir, res)
     if rec["status"] == "error":

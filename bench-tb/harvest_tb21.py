@@ -6,7 +6,8 @@ stdlib only; run as: python3 -I harvest_tb21.py JOB_DIR [JOB_DIR ...] [--tasks F
 
 Reads every <job>/<trial>/result.json. Task names are compared without
 the "terminal-bench/" namespace. Per task:
-  error    Harbor marks the reward invalid for the exception (checked first, any reward ignored);
+  error    Harbor marks the reward invalid for the exception (checked first, any reward ignored),
+           or OpenCode reported an API or transport error (not a context overflow);
            or no reward after an infrastructure (or unknown) exception, after verification ran
            and failed itself, or with no exception at all
   pass     verifier reward == 1.0 (also when the trial raised, e.g. AgentTimeoutError)
@@ -41,6 +42,7 @@ import html
 import json
 import math
 import os
+import re
 import sys
 
 Z95 = 1.959963984540054
@@ -80,6 +82,16 @@ INVALID_REWARD_EXCEPTIONS = {
     "ServiceOperationsUnsupportedError", "VercelScopeError", "DspyImportError", "MissingExtraError",
     "RegradeError", "CancelledError",
 }
+# OpenCode reports its error events as NonZeroAgentExitCodeError. API or transport causes are infra
+# errors like flywheel's ApiError; a context-size rejection stays an agent fail.
+OPENCODE_EVENT = "OpenCode emitted error event"
+OPENCODE_API_ERROR = re.compile(
+    r"\b5\d\d\b|internal server error|connection ?(reset|refused|closed|error)|econnreset"
+    r"|econnrefused|socket hang up|transport|api ?(error|connection)", re.IGNORECASE)
+# same wording as bench-tb/flywheel_agent.py
+CONTEXT_OVERFLOW = re.compile(
+    r"context.{0,24}(length|window|size|limit)|maximum context|prompt is too long|exceeds? the context",
+    re.IGNORECASE)
 
 
 def wilson(k, n):
@@ -149,7 +161,10 @@ def classify(d):
            "timeout": False, "trial": d.get("trial_name")}
     info = d.get("exception_info") or {}
     exc = info.get("exception_type")
-    invalid = (exc in INVALID_REWARD_EXCEPTIONS
+    msg = str(info.get("exception_message") or "")
+    opencode_api = (exc == "NonZeroAgentExitCodeError" and OPENCODE_EVENT in msg
+                    and bool(OPENCODE_API_ERROR.search(msg)) and not CONTEXT_OVERFLOW.search(msg))
+    invalid = (exc in INVALID_REWARD_EXCEPTIONS or opencode_api
                or (info.get("policy") or {}).get("has_valid_reward") is False)
     verified = bool((d.get("verifier") or {}).get("started_at"))
     vr = d.get("verifier_result") or {}

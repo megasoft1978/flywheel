@@ -126,8 +126,8 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
         g_cfg.temp = base_t;
         g_cfg.pp = base_pp;
         if (!r || r->error) {
-            static char ferr[96];
-            snprintf(ferr, sizeof ferr, "error:%.80s", r && r->error ? r->error : "null");
+            static char ferr[224];
+            snprintf(ferr, sizeof ferr, "error:%.200s", r && r->error ? r->error : "null");
             finish = !g_abort && wall_over(wall0) ? "wall" : ferr;
             if (r) chat_resp_free(r);
             break;

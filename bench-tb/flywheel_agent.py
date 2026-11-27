@@ -25,6 +25,11 @@ from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
 DIST = Path(__file__).resolve().parent.parent / "dist"
+# context-size wording; also inside HTTP 500 and 200-body errors (harvest_tb21 uses the same)
+CONTEXT_OVERFLOW = re.compile(
+    r"context.{0,24}(length|window|size|limit)|maximum context|prompt is too long|exceeds? the context",
+    re.IGNORECASE,
+)
 
 
 class FlywheelAgent(BaseAgent):
@@ -123,6 +128,8 @@ class FlywheelAgent(BaseAgent):
             if not finish.startswith("error:"):
                 return
             if finish.startswith("error:status 4") and "context" in finish.lower():
+                raise ContextWindowExceededError(f"flywheel {finish}")
+            if CONTEXT_OVERFLOW.search(finish):
                 raise ContextWindowExceededError(f"flywheel {finish}")
             raise ApiError(f"flywheel engine failure: {finish}")
         raise NonZeroAgentExitCodeError(f"flywheel exit status {code}: {line or 'no summary line'}")
