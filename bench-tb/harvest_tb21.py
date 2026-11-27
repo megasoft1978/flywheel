@@ -90,6 +90,8 @@ INVALID_REWARD_EXCEPTIONS = {
 # Each event is one line, JSON.stringify({type, timestamp, sessionID, error: {name, data}}).
 OPENCODE_ERROR_PREFIX = '{"type":"error","timestamp":'
 OPENCODE_API_NAMES = {"APIError", "ProviderAuthError"}
+OPENCODE_RUN_EVENTS = {"step_start", "text", "tool_use"}
+MD_SPECIAL = re.compile(r"([\\`*_\[\]<>|#!~])")
 OPENCODE_API_ERROR = re.compile(
     r"cannot connect to api|\b5\d\d\b|internal server error|connection ?(reset|refused|closed|error)"
     r"|econnreset|econnrefused|socket hang up|transport|api ?(error|connection)", re.IGNORECASE)
@@ -162,40 +164,61 @@ def provenance(harness, d):
 
 
 def opencode_errors(trial_dir):
-    """The error objects of the error events in a trial's OpenCode log. The log is model-influenced:
-    only a whole line with the event envelope counts."""
+    """The error objects that end a trial's OpenCode run. The log is written by the agent under
+    test, so only a whole event line counts: its sessionID must be the run's first event's, and no
+    step_start, text or tool_use line may follow it (a fatal API error ends the run)."""
     path = os.path.join(trial_dir, "agent", "opencode.txt")
     found = []
     if os.path.islink(path) or not os.path.isfile(path):
         return found
+    events = []
     with open(path, "rb") as fh:
         for raw in fh:
             line = raw.decode("utf-8", "replace").strip()
-            if not line.startswith(OPENCODE_ERROR_PREFIX):
+            if not line.startswith("{"):
                 continue
             try:
                 event = json.loads(line)
             except (ValueError, RecursionError):
                 continue
-            error = event.get("error")
-            if (event.get("type") == "error" and str(event.get("sessionID", "")).startswith("ses")
-                    and isinstance(error, dict)):
-                found.append(error)
+            if isinstance(event, dict):
+                events.append((line, event))
+    if not events:
+        return found
+    session = events[0][1].get("sessionID")
+    last_run = max((i for i, (_, e) in enumerate(events) if e.get("type") in OPENCODE_RUN_EVENTS),
+                   default=-1)
+    for i, (line, event) in enumerate(events):
+        error = event.get("error")
+        if (line.startswith(OPENCODE_ERROR_PREFIX) and event.get("type") == "error" and session
+                and event.get("sessionID") == session and isinstance(error, dict) and i > last_run):
+            found.append(error)
     return found
 
 
 def opencode_api_failure(errors):
-    api = False
+    """The first error that is an API or transport failure, or None. A context-size rejection in
+    the log makes the run a scored fail, so it returns None."""
+    api = None
     for error in errors:
         name = str(error.get("name") or "")
         data = error.get("data") if isinstance(error.get("data"), dict) else {}
         message = str(data.get("message") or "")
         code = data.get("statusCode")
         if name == "ContextOverflowError" or CONTEXT_OVERFLOW.search(message):
-            return False
-        api = api or (name in OPENCODE_API_NAMES or bool(OPENCODE_API_ERROR.search(message))
-                      or (isinstance(code, int) and (code == 429 or 500 <= code < 600)))
+            return None
+        if api is None and (name in OPENCODE_API_NAMES or bool(OPENCODE_API_ERROR.search(message))
+                            or (isinstance(code, int) and (code == 429 or 500 <= code < 600))):
+            api = error
     return api
+
+
+def md_safe(text, limit=120):
+    """One line of text, truncated, with markdown syntax escaped."""
+    text = " ".join(str(text).split())
+    if len(text) > limit:
+        text = text[:limit - 3] + "..."
+    return MD_SPECIAL.sub(r"\\\1", text)
 
 
 def classify(d, trial_dir=None):
@@ -209,7 +232,12 @@ def classify(d, trial_dir=None):
         uri = urllib.parse.urlparse(str(d.get("trial_uri") or ""))
         if not trial_dir and uri.scheme == "file":
             trial_dir = urllib.request.url2pathname(uri.path)
-        opencode_api = bool(trial_dir) and opencode_api_failure(opencode_errors(trial_dir))
+        api_error = opencode_api_failure(opencode_errors(trial_dir)) if trial_dir else None
+        opencode_api = api_error is not None
+        if opencode_api:
+            data = api_error.get("data") if isinstance(api_error.get("data"), dict) else {}
+            rec["opencode_error"] = {"name": str(api_error.get("name") or "?"),
+                                     "message": str(data.get("message") or "(no message)")}
     invalid = (exc in INVALID_REWARD_EXCEPTIONS or opencode_api
                or (info.get("policy") or {}).get("has_valid_reward") is False)
     verified = bool((d.get("verifier") or {}).get("started_at"))
@@ -487,6 +515,16 @@ def report_md(summaries, label, stamps, url):
                     why = r.get("reason") or "no exception"
                     lines.append(f"- {t}{' (dev)' if t in s['dev'] else ''}: {r['status']} ({why})")
                 lines.append("")
+    lines += ["## OpenCode log errors (audit)", "",
+              "Classified `error` from an API or transport error event in the OpenCode log. The log is "
+              "written by the agent under test, so these are listed for audit, not as proof.", ""]
+    audited = [(s["harness"], t, r["opencode_error"]) for s in summaries for t, r in s["tasks"].items()
+               if r.get("opencode_error")]
+    for h, t, e in audited:
+        lines.append(f"- {h} {t}: {md_safe(e['name'], 40)}: {md_safe(e['message'])}")
+    if not audited:
+        lines.append("- none")
+    lines.append("")
     lines += ["## Reruns and first attempts", "",
               "First attempt: each re-run task is scored by its first finished trial.", "",
               f"| harness | reruns | without evidence | cancelled or partial | first-attempt {head} "

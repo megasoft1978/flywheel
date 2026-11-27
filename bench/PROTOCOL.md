@@ -98,6 +98,7 @@ Cannot match, and to be disclosed with the results:
   - any other trial without a reward is `error`
 
   Agent timeouts are also flagged and counted.
+  The OpenCode log is written by the agent under test, so the tasks classified `error` from it are listed by name in the report for audit, not as proof of an infrastructure failure.
 - flywheel failures: exit status 1 covers both a normal unfinished task (`finish=turns`, `wall`,
   `aborted`: scored by the verifier) and a failed model request (`finish=error:...`). The agent
   raises `ApiError` for the latter (`ContextWindowExceededError` for a context-size rejection,

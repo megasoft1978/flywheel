@@ -5,3 +5,5 @@ terminal-bench/iota-task
 terminal-bench/theta-task
 terminal-bench/kappa-task
 terminal-bench/lambda-task
+terminal-bench/mu-task
+terminal-bench/nu-task
