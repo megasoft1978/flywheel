@@ -89,7 +89,14 @@ Cannot match, and to be disclosed with the results:
   All 10 names are in the 2.1 list; 26 tasks changed from 2.0. The harvester requires that
   committed list (except with `--synthetic`), checks 89/10/79 and marks dev rows in the grid.
 - Classification, in this order:
-  - `error` if Harbor 0.27.0 marks the reward invalid for the trial's exception
+  - flywheel and OpenCode run inside the task container, so the tested agent can forge their
+    evidence of a model API or transport error (the OpenCode log, `/tmp/fw_out.log`, command output
+    that Harbor turns into an API exception). Such a trial is `error` only if the host recorded a
+    model server outage (`<job>/outages.jsonl`, outside the trial dirs mounted into the container)
+    that overlaps it. Without that it is a scored fail, whatever reward was written: short,
+    unrecorded outages count against the agent. Not covered: an error raised while installing the
+    agent, before it ran, and Terminus 2, which runs on the host.
+  - otherwise `error` if Harbor 0.27.0 marks the reward invalid for the trial's exception
     (`has_valid_reward=False`: API, network, environment and verifier failures), whatever reward
     was written
   - otherwise a verifier reward is pass (1.0) or fail, even if the trial also raised
@@ -98,7 +105,10 @@ Cannot match, and to be disclosed with the results:
   - any other trial without a reward is `error`
 
   Agent timeouts are also flagged and counted.
-  The OpenCode log is written by the agent under test, so the tasks classified `error` from it are listed by name in the report for audit, not as proof of an infrastructure failure.
+  The report marks each listed flywheel or OpenCode API error as without host proof (fail) or
+  with the outage window (`error`), and lists OpenCode log errors by name for audit. Harvest and
+  rerun use the same overlap check. Missing or invalid timestamps prove nothing; an unreadable
+  `outages.jsonl` proves nothing and stops the harvest.
 - flywheel failures: exit status 1 covers both a normal unfinished task (`finish=turns`, `wall`,
   `aborted`: scored by the verifier) and a failed model request (`finish=error:...`). The agent
   raises `ApiError` for the latter (`ContextWindowExceededError` for a context-size rejection,
