@@ -77,6 +77,7 @@ static double plast;
 static char *qmsg[QMAX];
 static char *qscan[QMAX];         /* the same, as typed: pastes still collapsed */
 static int qn;
+static bool qheld;                /* one was not sent: the rest wait for the user */
 static Images pending;            /* attached, waiting for the next message */
 static bool want_exit;
 
@@ -1686,6 +1687,7 @@ static void paste_tick(void) {
 static void queue_clear(void) {
     for (int i = 0; i < qn; i++) { free(qmsg[i]); free(qscan[i]); }
     qn = 0;
+    qheld = false;
 }
 
 /* a pasted block that starts with '/' is a message, not a command */
@@ -2530,6 +2532,7 @@ static bool attach_refs(char **refs, int n, char *why, size_t cap) {
         bool url = !strncasecmp(refs[i], "http://", 7) || !strncasecmp(refs[i], "https://", 8);
         ok = url ? image_from_url(refs[i], &p, err, sizeof err)
                  : image_from_file(g_cfg.cwd, refs[i], &p, err, sizeof err);
+        if (fw_tick_hook) fw_tick_hook();       /* a quick load never ticked */
         const char *no = ok && !g_abort ? images_add(&got, &p, g_msgs) : NULL;
         if (g_abort) snprintf(err, sizeof err, "cancelled");
         else if (no) snprintf(err, sizeof err, "%s", no);
@@ -2849,6 +2852,23 @@ static bool known_command(const char *s) {
     return false;
 }
 
+static bool history_has_images(void) {
+    for (int i = 0; i < g_msgs->n; i++)
+        if (g_msgs->v[i].images.n) return true;
+    return false;
+}
+
+/* a message that was not sent goes back to the input box, above anything typed
+   since */
+static void keep_unsent(const char *raw) {
+    if (!ilen) in_set(raw);
+    else {
+        icur = 0;
+        if (ins("\n", 1)) { icur = 0; ins(raw, (int)strlen(raw)); }
+        icur = ilen;
+    }
+}
+
 /* Send one message the user entered: cmd as the model gets it, raw as typed.
    A path starts with '/' too, so known commands are told apart first. */
 static void submit(const char *cmd, const char *raw) {
@@ -2858,11 +2878,16 @@ static void submit(const char *cmd, const char *raw) {
     int n = scan ? image_find_refs(g_cfg.cwd, scan, refs, IMG_MAX_COUNT + 1, &only) : 0;
     free(scan);
     if (!n && is_slash(cmd)) { run_slash(cmd); return; }
-    if (n || pending.n) {
+    bool old = history_has_images();    /* they are sent again every turn */
+    if (n || pending.n || old) {
         char why[600];
         load_begin();
         bool ok = !vision_off();
-        if (!ok) {
+        tui_pump();                     /* /models does not tick: read an Esc */
+        if (g_abort) {
+            ok = false;
+            snprintf(why, sizeof why, "cancelled");
+        } else if (!ok) {
             no_vision(why, sizeof why);
             images_free(&pending);      /* the model changed under them */
         } else ok = attach_refs(refs, n, why, sizeof why);
@@ -2870,10 +2895,19 @@ static void submit(const char *cmd, const char *raw) {
         for (int i = 0; i < n; i++) free(refs[i]);
         if (!ok) {
             char b[800];
-            snprintf(b, sizeof b, YELLOW "  not sent:" RESET " %s%s", why,
-                     n ? "\n  To mention an image without attaching it, put it in `backticks`." : "");
+            snprintf(b, sizeof b, YELLOW "  not sent:" RESET " %s%s%s", why,
+                     n ? "\n  To mention an image without attaching it, put it in `backticks`." : "",
+                     old ? "\n  This conversation holds images: /clear drops them." : "");
             push_raw(b);
-            if (!ilen) { in_set(raw); render_screen(); }
+            keep_unsent(raw);
+            qheld = !g_abort;           /* a cancel drops the queue instead */
+            if (qheld && qn) {
+                snprintf(b, sizeof b, YELLOW "  %d queued message%s held:" RESET
+                         " sent after your next one (^C drops %s)",
+                         qn, qn == 1 ? "" : "s", qn == 1 ? "it" : "them");
+                push_raw(b);
+            }
+            render_screen();
             return;
         }
         if (only) { say_attached(); return; }
@@ -2973,6 +3007,10 @@ if (busy) {
             images_free(&pending);
             set_notice("attached images dropped");
         }
+        if (qn) {                       /* held behind a message that failed */
+            queue_clear();
+            set_notice("queued messages dropped");
+        }
         render_screen(); return;
     }
     if (ch == 15) { toggle_tool(-1); return; }      /* ^O expand/collapse last command */
@@ -3056,6 +3094,7 @@ if (busy) {
         }
         if (isexit) { want_exit = true; free(cmd); free(raw); return; }
         render_screen();
+        qheld = false;
         submit(cmd, raw);
         free(cmd);
         free(raw);
@@ -3077,9 +3116,9 @@ if (busy) {
     }
 }
 
-/* Drain queued messages after a task completes. */
+/* Drain queued messages after a task completes, up to one that is not sent. */
 static void drain_queue(void) {
-    while (qn > 0 && !g_abort) {
+    while (qn > 0 && !g_abort && !qheld) {
         char *next = qmsg[0], *raw = qscan[0];
         qn--;
         memmove(qmsg, qmsg + 1, (size_t)qn * sizeof *qmsg);

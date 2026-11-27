@@ -265,6 +265,8 @@ static bool handle_images(int cfd, const char *body, const char *last_msg) {
                  "\xf3\xa0\x81\xa3\xf3\xa0\x81\xb4\xf3\xa0\x81\xbf"
 #define SEG_PLAIN "FIRSTPART\necho safe  x#; id\nflag " FLAG_SCT " not \xf0\x9f\x8f\xb4 ok!"
 
+static volatile int g_models_delay_ms;      /* hold /models, to press keys during it */
+
 static void handle_client(int cfd) {
     static char req[2 << 20];
     size_t got = 0;
@@ -295,6 +297,7 @@ static void handle_client(int cfd) {
         const char *resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
                            "{\"data\":[{\"id\":\"mock/qwen\",\"vision\":true},"
                            "{\"id\":\"mock/qwen-alt\",\"vision\":false}]}";
+        if (g_models_delay_ms) usleep((useconds_t)g_models_delay_ms * 1000);
         send_all(cfd, resp, strlen(resp));
         close(cfd);
         return;
@@ -1283,7 +1286,8 @@ static void image_tests(const char *cmd) {
           find_last_row(s, "IMGQ ./bad.png") > find_row(s, "not sent:"));
     keys(s, "\x03");
     keys(s, "/clear\r");
-    CHECK(s, "image: private URL refused", sends(s, "IMGQ http://127.0.0.1/a.png", "not sent:"));
+    CHECK(s, "image: private URL refused",
+          sends(s, "IMGQ http://127.0.0.1/a.png", "local or private address"));
     CHECK(s, "image: private URL not sent", find_row(s, "GOT ") < 0);
     keys(s, "\x03");
 
@@ -1324,6 +1328,66 @@ static void image_tests(const char *cmd) {
     unlink(hang);
     pump(s, 200);
     CHECK(s, "paste: nothing held after cancel", sends(s, "IMGQ", "GOT last=0 all=0"));
+
+    /* a queued message that fails comes back and holds what was queued behind it */
+    keys(s, "/clear\r");
+    put_file(slow, "", 0, 0600);
+    keys(s, "/paste\r");
+    keys(s, "IMGQ ./bad.png\r");
+    keys(s, "IMGQ follow\r");
+    type_str(s, "draft");
+    CHECK(s, "queue: failure is said", wait_for_text(s, "not sent:", 8000));
+    pump(s, 600);
+    CHECK(s, "queue: failed message kept above the draft",
+          find_last_row(s, "IMGQ ./bad.png") > find_row(s, "not sent:") &&
+          find_last_row(s, "draft") > find_last_row(s, "IMGQ ./bad.png"));
+    CHECK(s, "queue: later message held", find_row(s, "GOT ") < 0);
+    CHECK(s, "queue: hold is said", find_row(s, "1 queued message held") >= 0);
+    unlink(slow);
+    keys(s, "\x03");
+    CHECK(s, "queue: ^C drops what was held", find_row(s, "queued messages dropped") >= 0);
+
+    /* the same when the failure is drained from inside another message's turn */
+    keys(s, "/clear\r");
+    put_file(slow, "", 0, 0600);
+    keys(s, "/paste\r");
+    keys(s, "IMGQ first\r");
+    keys(s, "IMGQ ./bad.png\r");
+    keys(s, "IMGQ follow\r");
+    CHECK(s, "queue: nested failure holds the rest",
+          wait_for_text(s, "1 queued message held", 8000));
+    pump(s, 600);
+    CHECK(s, "queue: only the first was sent", find_row(s, "follow") < 0);
+    unlink(slow);
+    keys(s, "\x15IMGQ fixed\r");
+    CHECK(s, "queue: held goes after the next one",
+          wait_for_text(s, "follow", 8000));
+    pump(s, 600);
+
+    /* Esc while the model is being asked about vision, images already held */
+    keys(s, "/clear\r");
+    CHECK(s, "cancel: held", sends(s, "./shot.png", "1 image attached"));
+    g_models_delay_ms = 1500;
+    keys(s, "IMGQ stop\r");
+    keys(s, "\x1b");
+    CHECK(s, "cancel: Esc during the model check", wait_for_text(s, "cancelled", 6000));
+    g_models_delay_ms = 0;
+    pump(s, 600);
+    CHECK(s, "cancel: nothing sent", find_row(s, "GOT ") < 0);
+    keys(s, "\x15");                    /* ^U: clear the box, keep the image */
+    CHECK(s, "cancel: image still held", sends(s, "IMGQ", "GOT last=1 all=1"));
+
+    /* images already in the conversation need a model that sees */
+    keys(s, "/model mock/qwen-alt\r");
+    CHECK(s, "history: refused without vision", sends(s, "IMGQ later", "serving without vision"));
+    CHECK(s, "history: says how to go on", find_row(s, "/clear") >= 0);
+    keys(s, "\x03");
+    keys(s, "/model mock/qwen\r");
+    CHECK(s, "history: goes with a seeing model", sends(s, "IMGQ back", "GOT last=0 all=1"));
+    keys(s, "/model mock/qwen-alt\r");
+    keys(s, "/clear\r");
+    CHECK(s, "history: /clear frees the other model", sends(s, "IMGQ", "GOT last=0 all=0"));
+    keys(s, "/model mock/qwen\r");
     keys(s, "/exit\r");
     CHECK(s, "image: clean exit", wait_for_exit(s, 3000));
     mica_session_destroy(s);

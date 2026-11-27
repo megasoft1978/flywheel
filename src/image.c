@@ -440,6 +440,29 @@ static char *as_ref(const char *cwd, char *p, bool url) {
     return NULL;
 }
 
+/* blank out code spans and fences: what they quote is only mentioned. A run of
+   backticks is closed by the next run of the same length (a fence of three or
+   more also by a longer one); an unclosed or escaped one is plain text. True if
+   anything was blanked. */
+static bool blank_code(char *s) {
+    bool any = false;
+    while (*s) {
+        if (*s == '\\' && s[1]) { s += 2; continue; }
+        if (*s != '`') { s++; continue; }
+        size_t n = strspn(s, "`"), m = 0;
+        char *p = s + n;
+        for (; (p = strchr(p, '`')); p += m) {
+            m = strspn(p, "`");
+            if (m == n || (n >= 3 && m > n)) break;
+        }
+        if (!p) { s += n; continue; }
+        memset(s, ' ', (size_t)(p + m - s));
+        s = p + m;
+        any = true;
+    }
+    return any;
+}
+
 int image_find_refs(const char *cwd, const char *msg, char **refs, int max, bool *only) {
     *only = false;
     if (max <= 0) return 0;
@@ -457,9 +480,11 @@ int image_find_refs(const char *cwd, const char *msg, char **refs, int max, bool
     }
     free(t);
 
+    char *text = str_dup(msg);
+    if (!text) return 0;
     int n = 0;
-    bool other = false;
-    for (const char *s = msg; *s;) {
+    bool other = blank_code(text);
+    for (const char *s = text; *s;) {
         if (is_blank(*s)) { s++; continue; }
         const char *e = word_end(s);
         char *word = str_ndup(s, (size_t)(e - s));
@@ -477,6 +502,7 @@ int image_find_refs(const char *cwd, const char *msg, char **refs, int max, bool
         if (i < n || n == max) free(ref);
         else refs[n++] = ref;
     }
+    free(text);
     *only = n && !other;
     return n;
 }

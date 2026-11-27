@@ -133,14 +133,15 @@ In the interactive UI only (one-shot mode sends text only):
   in Finder may give its icon, so drag files instead.
 
 A message holding only images keeps them for your next one; `^C` or `/clear` drops them. If one cannot
-be loaded, nothing is sent and the message returns to the input box. Only what you type or paste is
-searched, never model output, tool output or project files. A pasted block of several lines is not
-searched, and a path in backticks is left alone. Naming an image file attaches it, even outside the
+be loaded, nothing is sent and the message returns to the input box; messages queued behind it wait
+for your next one (`^C` drops them). Only what you type or paste is searched, never model output, tool
+output or project files. A pasted block of several lines is not searched, and nothing in a backtick
+code span or fence is attached or fetched. Naming an image file attaches it, even outside the
 project.
 
 Limits: 10 MB per file, and 64 images or 32 MB (encoded) per conversation. On macOS, images over
 1568 px on a side are downscaled. Images stay in the conversation until `/clear`, also one the server
-rejected.
+rejected, and while they do, a model without vision gets nothing.
 
 The engine must serve the model with vision. `flywheel setup` starts it that way. A server started
 with `--language-only` (as earlier versions did) has to be stopped and started again; flywheel refuses

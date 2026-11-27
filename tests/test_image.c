@@ -118,6 +118,15 @@ static void test_refs(void) {
     finds("missing file is text", "write %s/new.png for me", NULL, NULL, false);
     finds("not an image name", "%s/t.txt", NULL, NULL, false);
     finds("directory is text", "%s/", NULL, NULL, false);
+    finds("inline code span", "run `cat ./c.JPG | wc` now", NULL, NULL, false);
+    finds("code fence", "```\nopen ./c.JPG\n```", NULL, NULL, false);
+    finds("url in a code span", "try `curl https://example.invalid/a.png -o x`", NULL, NULL, false);
+    finds("url in a fence", "```sh\ncurl https://example.invalid/a.png\n```\n", NULL, NULL, false);
+    finds("double backticks hold single ones", "``a ` ./c.JPG ` b``", NULL, NULL, false);
+    finds("longer run closes a fence", "```\n./c.JPG\n````", NULL, NULL, false);
+    finds("span beside a path", "`ls -l` %s/c.JPG", "%s/c.JPG", NULL, false);
+    finds("unmatched backtick", "a ` %s/c.JPG", "%s/c.JPG", NULL, false);
+    finds("escaped backticks", "\\` %s/c.JPG \\`", "%s/c.JPG", NULL, false);
     char *one[1];
     bool only;
     char msg[2000];
