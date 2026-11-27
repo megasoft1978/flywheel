@@ -12,6 +12,7 @@
 #include <signal.h>
 #include <wchar.h>
 #include <errno.h>
+#include <poll.h>
 #include <time.h>
 #ifdef __APPLE__
 #include <libproc.h>
@@ -347,6 +348,27 @@ static void term_raw(bool on) {
     }
 }
 
+/* CAN drops a half-written sequence; then sync, link, colors, mouse, paste,
+   alternate screen and hidden cursor (a command writing to /dev/tty can leave
+   those), scroll region, and the cursor to the last row. A pty nobody reads
+   must not keep us alive: never block, and give up after half a second. */
+static void modes_off(void) {
+    static const char off[] = "\030\033[?2026l\033]8;;\033\\\033[0m" MOUSE_OFF_SEQ
+                              "\033[?2004l\033[?1047l\033[?25h\033[r\033[999;1H\n";
+    int fl = fcntl(1, F_GETFL);
+    if (fl < 0) return;
+    fcntl(1, F_SETFL, fl | O_NONBLOCK);
+    size_t at = 0;
+    for (int stalls = 0; at < sizeof off - 1 && stalls < 10;) {
+        ssize_t w = write(1, off + at, sizeof off - 1 - at);
+        if (w > 0) { at += (size_t)w; continue; }
+        stalls++;
+        struct pollfd p = {.fd = 1, .events = POLLOUT};
+        poll(&p, 1, 50);
+    }
+    fcntl(1, F_SETFL, fl);   /* the shell shares this open file */
+}
+
 /* A fatal signal: turn every mode off, then die of the same signal. Only
    async-signal-safe calls (proc_listchildpids is a bare system call). */
 static void on_fatal(int sig) {
@@ -360,17 +382,16 @@ static void on_fatal(int sig) {
                 if (kid[i] > 1 && getpgid(kid[i]) == kid[i]) killpg(kid[i], SIGKILL);
         }
 #endif
-        if (raw_on) tcsetattr(0, TCSANOW, &saved_t);
-        if (tui_up) {
-            /* CAN drops a half-written sequence; then sync, link, colors,
-               mouse, paste, scroll region, and the cursor to the last row */
-            static const char off[] = "\030\033[?2026l\033]8;;\033\\\033[0m" MOUSE_OFF_SEQ
-                                      "\033[?2004l\033[r\033[999;1H\n";
-            ssize_t w = write(1, off, sizeof off - 1);
-            (void)w;
+        /* In the background the terminal is someone else's by now. An error
+           (a dead or foreign tty) restores anyway. */
+        pid_t fg = tcgetpgrp(0);
+        if (fg < 0 || fg == getpgrp()) {
+            if (raw_on) tcsetattr(0, TCSANOW, &saved_t);
+            if (tui_up) modes_off();
         }
     }
-    raise(sig);   /* SA_RESETHAND | SA_NODEFER: the default action, now */
+    signal(sig, SIG_DFL);   /* macOS ignores SA_RESETHAND for SIGILL */
+    raise(sig);             /* SA_NODEFER: the default action, now */
     _exit(128 + sig);
 }
 

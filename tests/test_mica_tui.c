@@ -4,8 +4,10 @@
 #include <arpa/inet.h>
 #include <assert.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -14,9 +16,11 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+#include <util.h>
 
 static int g_passed = 0, g_failed = 0;
 
@@ -1496,11 +1500,17 @@ static bool gone(pid_t p) {
     return false;
 }
 
+static double mono_s(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
+}
+
 enum sig_state { AT_IDLE, AT_DIALOG, AT_TOOL, AT_REQUEST };
 
 static void signal_case(const char *dir, int sig, const char *signame, enum sig_state st) {
     static const char *const where[] = {"idle", "dialog", "tool", "request"};
-    static const char *const stale[] = {"sig.pid", "sig.rc", "sig.before", "sig.after", "sig.child"};
+    static const char *const stale[] = {"sig.pid", "sig.rc", "sig.before", "sig.after", "sig.child", "sig.inject"};
     for (size_t i = 0; i < sizeof stale / sizeof *stale; i++) {
         char p[1400];
         snprintf(p, sizeof p, "%s/%s", dir, stale[i]);
@@ -1534,7 +1544,21 @@ static void signal_case(const char *dir, int sig, const char *signame, enum sig_
     }
 
     assert(fw > 1);
+    /* Frozen, so no frame of its own can undo what the terminal is told next: the
+       states a command writing to /dev/tty can leave behind. */
+    kill((pid_t)fw, SIGSTOP);
+    double t0 = mono_s();
+    write_file(dir, "sig.inject", "");
+#define MODES_SET (!mica_session_cursor_visible(s) && mica_session_alt_screen(s) && \
+                   mica_session_sync_output_active(s))
+    for (int i = 0; i < 50 && !MODES_SET; i++) pump(s, 10);
+    SCHECK("cursor hidden, alternate screen, sync open", MODES_SET);
+#undef MODES_SET
     kill((pid_t)fw, sig);
+    kill((pid_t)fw, SIGCONT);
+    for (int i = 0; i < 200 && mica_session_sync_output_active(s); i++) pump(s, 10);
+    /* mica gives up on an open frame after 1 s, so only an earlier end counts */
+    SCHECK("sync output off", !mica_session_sync_output_active(s) && mono_s() - t0 < 0.9);
     SCHECK("process ended", wait_for_text(s, "SIG_DONE", 4000));
     pump(s, 100);
     SCHECK("died by that signal", read_num(dir, "sig.rc") == 128 + sig);
@@ -1546,7 +1570,6 @@ static void signal_case(const char *dir, int sig, const char *signame, enum sig_
     SCHECK("termios restored", before[0] && !strcmp(before, after));
     SCHECK("mouse reporting off", !mica_session_reports_mouse(s));
     SCHECK("bracketed paste off", !mica_session_bracketed_paste(s));
-    SCHECK("sync output off", !mica_session_sync_output_active(s));
     SCHECK("cursor visible, main screen", mica_session_cursor_visible(s) && !mica_session_alt_screen(s));
     int hi = find_row(s, "FILL39"), lo = find_row(s, "FILL18");
     SCHECK("scroll region reset", lo >= 0 && hi - lo == 21);
@@ -1558,14 +1581,185 @@ static void signal_case(const char *dir, int sig, const char *signame, enum sig_
 #undef SCHECK
 }
 
+/* A pty of our own, for what mica does not show: the raw bytes, a reader that
+   stops, job control. A stand-in shell leads the session and runs flywheel. */
+typedef struct {
+    int master, slave, to, from;
+    char name[128];
+    pid_t leader, fw;
+    char out[1 << 16];
+    size_t len;
+} RawTty;
+
+static void raw_drain(RawTty *r, int ms) {
+    struct pollfd p = {r->master, POLLIN, 0};
+    for (double end = mono_s() + ms / 1000.0; mono_s() < end;) {
+        if (poll(&p, 1, 10) <= 0) continue;
+        if (r->len > sizeof r->out - 4097) {
+            r->len /= 2;
+            memmove(r->out, r->out + r->len, r->len);
+        }
+        ssize_t n = read(r->master, r->out + r->len, 4096);
+        if (n <= 0) break;
+        r->len += (size_t)n;
+        r->out[r->len] = 0;
+    }
+}
+
+static int raw_count(const RawTty *r, const char *needle) {
+    int n = 0;
+    size_t k = strlen(needle);
+    for (size_t i = 0; i + k <= r->len; i++)
+        if (!memcmp(r->out + i, needle, k)) n++;
+    return n;
+}
+
+static bool raw_start(RawTty *r, const char *dir) {
+    memset(r, 0, sizeof *r);
+    char pidfile[1400];
+    snprintf(pidfile, sizeof pidfile, "%s/sig.pid", dir);
+    unlink(pidfile);
+    struct winsize ws = {.ws_row = 24, .ws_col = 80};
+    int to[2], from[2];
+    assert(openpty(&r->master, &r->slave, r->name, NULL, &ws) == 0);
+    assert(pipe(to) == 0 && pipe(from) == 0);
+    r->leader = fork();
+    assert(r->leader >= 0);
+    if (r->leader == 0) {
+        close(r->master); close(to[1]); close(from[0]);
+        if (login_tty(r->slave) != 0 || chdir(dir) != 0) _exit(126);
+        signal(SIGTTOU, SIG_IGN);
+        pid_t job = fork();
+        if (job == 0) {
+            setpgid(0, 0);
+            tcsetpgrp(0, getpid());
+            signal(SIGTTOU, SIG_DFL);
+            execl("/bin/sh", "sh", "./sig.run", (char *)NULL);
+            _exit(127);
+        }
+        setpgid(job, job);
+        tcsetpgrp(0, job);
+        char c;
+        while (read(to[0], &c, 1) == 1 && c == 'b') {   /* take the terminal back */
+            tcsetpgrp(0, getpgrp());
+            if (write(from[1], "k", 1) != 1) break;
+        }
+        int st = -1;
+        waitpid(job, &st, 0);
+        if (write(from[1], &st, sizeof st) == (ssize_t)sizeof st) pause();
+        _exit(0);
+    }
+    close(to[0]); close(from[1]);
+    r->to = to[1];
+    r->from = from[0];
+    for (int i = 0; i < 300 && !strstr(r->out, "ready"); i++) raw_drain(r, 10);
+    bool ready = strstr(r->out, "ready") != NULL;
+    raw_drain(r, 150);
+    r->fw = (pid_t)read_num(dir, "sig.pid");
+    return ready && r->fw > 1;
+}
+
+/* The job's wait status, or -1 if it has not ended in time. */
+static int raw_wait(RawTty *r, bool drain) {
+    if (write(r->to, "w", 1) != 1) return -1;
+    struct pollfd p = {r->from, POLLIN, 0};
+    for (double end = mono_s() + 4; mono_s() < end;) {
+        if (drain) raw_drain(r, 10);
+        if (poll(&p, 1, 10) > 0) {
+            int st = -1;
+            if (read(r->from, &st, sizeof st) != (ssize_t)sizeof st) return -1;
+            if (drain) raw_drain(r, 100);
+            return st;
+        }
+    }
+    return -1;
+}
+
+static void raw_end(RawTty *r, int st) {
+    if (st == -1 && r->fw > 1) kill(r->fw, SIGKILL);
+    close(r->master);
+    close(r->slave);
+    kill(r->leader, SIGKILL);
+    waitpid(r->leader, NULL, 0);
+    close(r->to);
+    close(r->from);
+}
+
+static bool died_by(int st, int sig) { return st != -1 && WIFSIGNALED(st) && WTERMSIG(st) == sig; }
+
+static bool cooked(int fd) {
+    struct termios t;
+    return tcgetattr(fd, &t) == 0 && (t.c_lflag & ICANON) && (t.c_lflag & ECHO);
+}
+
+#define RESTORE_START "\030\033[?2026l"
+
+static void raw_check(bool ok, const char *signame, const char *what) {
+    char label[128];
+    snprintf(label, sizeof label, "%s raw: %s", signame, what);
+    CHECK((MicaSession *)NULL, label, ok);
+}
+
+static void once_case(const char *dir, int sig, const char *signame) {
+    static RawTty r;
+    raw_check(raw_start(&r, dir), signame, "ready");
+    r.len = 0;
+    kill(r.fw, sig);
+    int st = raw_wait(&r, true);
+    raw_check(died_by(st, sig), signame, "really died of the signal");
+    raw_check(raw_count(&r, RESTORE_START) == 1, signame, "restore sequence written exactly once");
+    raw_end(&r, st);
+}
+
+/* Nobody reads the pty and its queue is full: one SIGTERM must still end it. */
+static void stuck_case(const char *dir) {
+    static RawTty r;
+    raw_check(raw_start(&r, dir), "SIGTERM", "unread: ready");
+    int fill = open(r.name, O_WRONLY | O_NONBLOCK | O_NOCTTY);
+    assert(fill >= 0);
+    char junk[1024];
+    memset(junk, 'x', sizeof junk);
+    while (write(fill, junk, sizeof junk) > 0) {}
+    while (write(fill, junk, 1) > 0) {}
+    close(fill);
+    kill(r.fw, SIGTERM);
+    int st = raw_wait(&r, false);
+    raw_check(died_by(st, SIGTERM), "SIGTERM", "unread: process ended");
+    raw_check(cooked(r.slave), "SIGTERM", "unread: termios restored");
+    int fl = fcntl(r.slave, F_GETFL);   /* the same open file as its stdout */
+    raw_check(fl >= 0 && !(fl & O_NONBLOCK), "SIGTERM", "unread: stdout left blocking");
+    raw_end(&r, st);
+}
+
+/* In the background the terminal belongs to someone else: leave it alone. */
+static void background_case(const char *dir) {
+    static RawTty r;
+    raw_check(raw_start(&r, dir), "SIGTERM", "background: ready");
+    char c = 0;
+    raw_check(write(r.to, "b", 1) == 1 && read(r.from, &c, 1) == 1, "SIGTERM", "background: moved");
+    raw_drain(&r, 100);
+    r.len = 0;
+    kill(r.fw, SIGTERM);
+    kill(r.fw, SIGCONT);   /* a read from the background may have stopped it */
+    int st = raw_wait(&r, true);
+    raw_check(died_by(st, SIGTERM), "SIGTERM", "background: process ended");
+    raw_check(raw_count(&r, RESTORE_START) == 0, "SIGTERM", "background: no escapes written");
+    raw_check(!cooked(r.slave), "SIGTERM", "background: termios untouched");
+    raw_end(&r, st);
+}
+
 static void signal_tests(const char *dir, const char *cmd) {
     char run[2200];
     snprintf(run, sizeof run, "echo $$ > sig.pid\n%s\n", cmd);
     write_file(dir, "sig.run", run);
     write_file(dir, "sig.sh",
                "stty -g > sig.before\n"
+               "( while [ ! -f sig.inject ]; do sleep 0.02; done\n"
+               "  printf '\\030\\033[?1049h\\033[?25l\\033[?2026h' > /dev/tty ) &\n"
+               "inj=$!\n"
                "/bin/sh ./sig.run\n"
                "echo $? > sig.rc\n"
+               "kill $inj 2>/dev/null\n"
                "stty -g > sig.after\n"
                "i=0; while [ $i -lt 40 ]; do echo FILL$i; i=$((i+1)); done\n"
                "echo SIG_DONE\n"
@@ -1586,6 +1780,16 @@ static void signal_tests(const char *dir, const char *cmd) {
     signal_case(dir, SIG(SIGHUP), AT_REQUEST);
     signal_case(dir, SIG(SIGTERM), AT_TOOL);
     signal_case(dir, SIG(SIGHUP), AT_TOOL);
+    once_case(dir, SIG(SIGTERM));
+    once_case(dir, SIG(SIGHUP));
+    once_case(dir, SIG(SIGQUIT));
+    once_case(dir, SIG(SIGSEGV));
+    once_case(dir, SIG(SIGBUS));
+    once_case(dir, SIG(SIGABRT));
+    once_case(dir, SIG(SIGFPE));
+    once_case(dir, SIG(SIGILL));
+    stuck_case(dir);
+    background_case(dir);
 #undef SIG
 }
 
