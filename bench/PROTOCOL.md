@@ -6,16 +6,17 @@ compared with two other harnesses on the same model. The result is published wha
 Status: Terminal-Bench 2.1 preparation only. No scored run has started. Nothing here is a result.
 
 ## Open blockers (resolve before freeze)
-- flywheel time limit (code fixed in FW-TBTIME, not yet smoke-tested, not fully fixed):
+- flywheel time limit (fixed in code by FW-TBTIME and FW-TBCLAMP, not yet
+  smoke-tested):
   flywheel gets the task's Harbor agent timeout (task.toml `agent.timeout_sec` x
   `--timeout-multiplier`, read from `bench-tb/tb21-timeouts.tsv` by task name). Harbor does not
   pass it to custom agents; only its `asyncio.wait_for` around `run()` enforces it
   (`harbor/trial/trial.py:784`, `:1724`). flywheel `-W` = budget - 60 s (refused if <= 0),
   `-T` 20000 (never binds), `-t` 180 s.
-  - Overrun: `-W` is checked only at the start of each turn and inside model requests
-    (`src/agent.c:106,123`). A command started late can run up to `-t` more, further tool calls
-    in that turn still start, and gate runs get 2x `-t` (`src/agent.c:39`). Harbor's kill is the
-    only hard cap. Fix needs a change in `src/`; not done in FW-TBTIME.
+  - With `-W`, command and gate timeouts are cut to the time left, and no further tool call or
+    gate starts once it has expired; the run ends as `finish=wall` with its summary and
+    transcript written. The limit counts whole seconds from the start of the task. Not covered:
+    background processes a command leaves behind. Harbor's kill is still the hard cap.
   - Before a scored run: one smoke task must show flywheel exiting before Harbor's kill
     (`FW_EXIT`, `finish=wall`), and whether the kill stops the flywheel process in the container
     before the verifier runs (not checked in the Docker exec path).
@@ -71,10 +72,9 @@ Cannot match, and to be disclosed with the results:
 - flywheel raises temperature to 0.5 (top_p 0.95) to escape loops. At temperature 0 it sends no
   top_p.
 - OpenCode's title agent keeps its own temperature (0.5).
-- Time limits: all three harnesses are cut by the same Harbor per-task agent timeout. flywheel's
-  `-W` is a soft stop, checked only at the start of each turn and inside model requests. A
-  command started late can run `-t` (180 s) more, further calls in that turn still start, and gates
-  get 2x `-t`. Harbor's kill is the hard cap. This is an open blocker, not a matched limit. Terminus 2
+- Time limits: all three harnesses are cut by the same Harbor per-task agent timeout. flywheel
+  also stops itself at `-W`, 60 s earlier: it cuts the running model request, command or gate and
+  ends the run, so it has up to 60 s less working time than the budget. Terminus 2
   sends commands non-blocking and waits min(duration, 60) s without killing them
   (`harbor/agents/terminus_2/terminus_2.py:1400`, `:1434`); its 180 s blocking cap
   (`tmux_session.py:792`) is not on that path. It has no turn limit by default. flywheel's
@@ -191,7 +191,7 @@ Cannot match, and to be disclosed with the results:
 
 ## Order of work
 1. Check: dataset digest and per-task timeouts against the downloaded dataset, Docker resources,
-   flywheel time limit (Open blockers), host engine reachable from containers and from the host.
+   flywheel time limit smoke check (Open blockers), host engine reachable from containers and from the host.
 2. Smoke: one task per harness, sequential, only when Docker and the host are not loaded.
    Not yet run (host load average was 67 when this was prepared).
 3. Fix what would waste runs on the development set.

@@ -1535,6 +1535,94 @@ static void test_loopedit(void) {
     g_cfg.profile = prof;
 }
 
+/* ---------- -W bounds commands and gates ---------- */
+
+static bool slow_ask(const char *cmd, bool gate, void *ud) {
+    (void)ud;
+    if (gate || strstr(cmd, "slow-approval")) sleep(3);
+    return true;
+}
+
+static const char *wall_run(Msgs *m, Ui *ui, int ncalls, const char *const *calls,
+                            char *sum, size_t cap, double *secs) {
+    agent_finish_reason = "tool_calls"; agent_calls = calls; agent_ncalls = ncalls; agent_tool_turns = 1;
+    pid_t p = serve(reply_agent);
+    new_task(m);
+    time_t t0 = time(NULL);
+    const char *fin = agent_run(m, ui, sum, cap);
+    *secs = difftime(time(NULL), t0);
+    stop(p);
+    return fin;
+}
+
+static void test_wall_limit(void) {
+    char dir[] = "/tmp/fwwallXXXXXX";
+    if (!mkdtemp(dir)) { T("mkdtemp", false); return; }
+    char *oldpath = str_dup(getenv("PATH")), *prof = g_cfg.profile;
+    char path[4096], ran[600], second[600], third[600], tr[600], body[700], sum[256];
+    snprintf(path, sizeof path, "%s:%s", dir, oldpath);
+    setenv("PATH", path, 1);
+    snprintf(ran, sizeof ran, "%s/ran", dir);
+    snprintf(second, sizeof second, "%s/second", dir);
+    snprintf(third, sizeof third, "%s/third", dir);
+    snprintf(tr, sizeof tr, "%s/run.jsonl", dir);
+    free(g_cfg.cwd);
+    g_cfg.cwd = str_dup(dir);
+    perm_free();
+    int gates = g_cfg.max_gates, every = g_cfg.gate_every, turns = g_cfg.maxturns,
+        limit = g_cfg.cmd_timeout;
+    g_cfg.max_gates = 0; g_cfg.gate_every = 0; g_cfg.maxturns = 20; g_cfg.cmd_timeout = 30;
+    g_cfg.wall = 2;
+    g_cfg.transcript = tr;
+    Msgs m;
+    double secs;
+    Ui u = {.interactive = true};
+
+    static const char *const batch[] = {
+        "bash", "{\"command\":\"sleep 15\"}",
+        "bash", "{\"command\":\"echo x > second\"}",
+        "write_file", "{\"path\":\"third\",\"content\":\"x\"}"};
+    g_cfg.profile = (char *)"generic";
+    const char *fin = wall_run(&m, &u, 3, batch, sum, sizeof sum, &secs);
+    T("-W cuts a running command", secs <= 5);
+    T("-W: the cut command says why", has_msg(&m, "tool", "wall clock limit"));
+    T("-W: later command not started", access(second, F_OK) != 0);
+    T("-W: later file write not started", access(third, F_OK) != 0);
+    T("-W: finish and summary say wall", !strcmp(fin, "wall") && strstr(sum, "finish=wall "));
+    char *log = read_file(tr);
+    T("-W: transcript is completed", log && strstr(log, "\"run_finish\":\"wall\""));
+    free(log);
+    msgs_free(&m);
+
+    Ui slow = {.interactive = true, .approve_cmd = slow_ask};
+    static const char *const late[] = {"bash", "{\"command\":\"touch second # slow-approval\"}"};
+    fin = wall_run(&m, &slow, 1, late, sum, sizeof sum, &secs);
+    T("-W: command approved too late is not run", access(second, F_OK) != 0 && !strcmp(fin, "wall"));
+    msgs_free(&m);
+
+    g_cfg.profile = (char *)"go";
+    snprintf(body, sizeof body, "echo x >> '%s'; sleep 15; exit 0", ran);
+    fake_tool(dir, "go", body);
+    static const char *const wr[] = {"write_file", "{\"path\":\"a.go\",\"content\":\"x\"}"};
+    fin = wall_run(&m, &u, 1, wr, sum, sizeof sum, &secs);
+    T("-W cuts a running gate", access(ran, F_OK) == 0 && secs <= 5);
+    T("-W: a cut gate is not done", !strcmp(fin, "wall") && strstr(sum, "finish=wall "));
+    msgs_free(&m);
+    unlink(ran);
+
+    fin = wall_run(&m, &slow, 1, wr, sum, sizeof sum, &secs);
+    T("-W: gate not started after the limit", access(ran, F_OK) != 0);
+    T("-W: a skipped gate is not done", !strcmp(fin, "wall") && strstr(sum, "finish=wall "));
+    msgs_free(&m);
+
+    g_cfg.wall = 0;
+    g_cfg.transcript = NULL;
+    g_cfg.profile = prof;
+    g_cfg.max_gates = gates; g_cfg.gate_every = every; g_cfg.maxturns = turns; g_cfg.cmd_timeout = limit;
+    setenv("PATH", oldpath, 1);
+    free(oldpath);
+}
+
 #ifdef FW_MINI_HTTP
 int fw_mini_post_stream(const char *url, const char *payload, int streaming,
                         size_t (*cb)(char *, size_t, size_t, void *), void *ud,
@@ -3409,6 +3497,7 @@ int main(void) {
     test_review3();
     test_review4();
     test_gate_approval();
+    test_wall_limit();
     test_truth();
     test_atomic();
     test_loopedit();
