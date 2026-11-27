@@ -79,20 +79,39 @@ Cannot match, and to be disclosed with the results:
 - Never run two jobs on the same engine or the same Docker host at once.
 
 ## Reporting
-- Harvest: `python3 -I harvest_tb21.py JOB_DIR...` (from `bench-tb/`). Three rows per harness:
-  - all-89 (primary)
-  - held-out-79, the tasks not used in development
+- Harvest: `python3 -I harvest_tb21.py JOB_DIR...` (from `bench-tb/`). Per harness:
+  - held-out-79, the tasks not used in development: the headline
+  - all-89, secondary. The 10 development tasks were used to develop flywheel only, so this
+    number is not neutral between harnesses; that note is printed under the tables and on the
+    charts
   - dev-10, shown only as development tasks, never as the held-out score
 - Development set: the 10 tasks in the README pilot table, in `bench-tb/tb21-dev-tasks.txt`.
-  All 10 names are in the 2.1 list; 26 tasks changed from 2.0. The harvester checks 89/10/79.
-- Classification: a verifier reward is pass (1.0) or fail, even if the trial also raised. No
-  reward after an agent timeout or other agent-side exception is fail. `error` is only an
-  infrastructure or unknown failure without a reward. Agent timeouts are also flagged and counted.
-  Note: `NonZeroAgentExitCodeError` counts as agent-side, even if the cause was the model server
-  being down; check those trials and re-run with `--rerun` if so.
+  All 10 names are in the 2.1 list; 26 tasks changed from 2.0. The harvester requires that
+  committed list (except with `--synthetic`), checks 89/10/79 and marks dev rows in the grid.
+- Classification, in this order:
+  - `error` if Harbor 0.27.0 marks the reward invalid for the trial's exception
+    (`has_valid_reward=False`: API, network, environment and verifier failures), whatever reward
+    was written
+  - otherwise a verifier reward is pass (1.0) or fail, even if the trial also raised
+  - no reward after an agent timeout or other agent-side exception is fail if verification never
+    started, `error` if verification ran and failed itself
+  - any other trial without a reward is `error`
+
+  Agent timeouts are also flagged and counted.
+- flywheel failures: exit status 1 covers both a normal unfinished task (`finish=turns`, `wall`,
+  `aborted`: scored by the verifier) and a failed model request (`finish=error:...`). The agent
+  raises `ApiError` for the latter (`ContextWindowExceededError` for a context-size rejection,
+  which stays a scored result) and `NonZeroAgentExitCodeError` for any other nonzero exit.
+- Model server outages: the runner probes `$TB_HOST_ENDPOINT/models` before the run and every
+  15 s during it. After 3 failed probes it records the window in `<job>/outages.jsonl` and stops
+  Harbor. A harness that records an outage only as a generic exit error still scores fail until
+  the trial is re-run under the rule below.
 - Pass rate with a 95% Wilson interval. Missing and error trials count as not passed in the
   primary rate; the scored-only rate is shown next to it with its own interval. Every missing or
-  errored task is listed by name, and so is every archived or re-run trial.
+  errored task is listed by name, every failed trial with its exception, and every archived or
+  re-run trial with its reason and evidence. Rerun counts per harness and first-attempt rates
+  (each re-run task scored by its first finished trial; cancelled and partial trials are counted
+  separately) are shown.
 - Time per task is the whole trial time (`started_at` to `finished_at`: environment setup, agent
   and verifier), plus the three charts from the harvester.
 - The harvester writes nothing and exits nonzero on: no trials, unexpected or duplicate trials,
@@ -116,15 +135,20 @@ Cannot match, and to be disclosed with the results:
 - No tuning on scored tasks. Harness work uses the development set, one task at a time:
   run, read the trajectory, fix the general cause in the harness, add a test, re-run.
 - A fix must be general. Nothing task-specific goes into the harness or its prompts.
-- Every attempt counts. Re-run only infrastructure failures (agent never started), with
-  `run-tb21.sh --harness <name> --rerun <task>`: the old trial is archived and logged in the job's
-  `reruns.jsonl`, which the report includes.
+- Every attempt counts. One rerun rule for all three harnesses, applied by
+  `run-tb21.sh --harness <name> --rerun <task> --reason "<why>"`:
+  - never a trial with reward 1
+  - an `error` trial (see Classification) may be re-run
+  - a fail may be re-run only if it overlaps a recorded model server outage;
+    `--rerun-without-evidence` overrides this, and the report counts and marks every such rerun
+
+  The old trial is archived and logged in the job's `reruns.jsonl`, which the report includes.
 - Resume: run the same command again. It passes Harbor the same dataset digest and full task list
   (Harbor refuses a job whose config differs); Harbor skips finished trials. Before that, trial
   dirs with no usable result (which Harbor would delete) and cancelled trials are moved to
   `jobs/tb21-archive/<job>/`. Existing job dirs are never deleted.
-- Subsets (`--include`, `--tasks`) need their own `--job-name`. `--smoke` runs the first task in
-  `jobs/tb21-smoke/`, apart from the scored jobs.
+- Subsets (`--include`, `--tasks`) need their own `--job-name`. `--smoke` runs one development
+  task (never a held-out one) in `jobs/tb21-smoke/`, apart from the scored jobs.
 - One runner at a time (lock `jobs/tb21.lock`; after a killed run, remove it by hand).
 - No paid model calls anywhere in the benchmark or its tests.
 

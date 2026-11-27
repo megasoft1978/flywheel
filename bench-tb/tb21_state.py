@@ -9,14 +9,31 @@ keeps every parsed result, including cancelled ones. So before each run this scr
   - moves finished trials named with --rerun there too,
 and logs every move in <job-dir>/reruns.jsonl.
 
+--rerun needs --reason, and follows one rule for every harness: never a trial with reward 1;
+a fail only with recorded outage evidence (it overlaps a window in <job-dir>/outages.jsonl)
+unless --rerun-without-evidence; an error trial (harvest_tb21.classify) may be re-run.
+
 Prints "DONE_COUNT TODO_COUNT" on stdout; messages go to stderr.
+
+Two more modes, for the model server (URL is the OpenAI base URL, probed at URL/models):
+  tb21_state.py health URL                  exit 1 if it does not answer
+  tb21_state.py watch URL JOB_DIR -- CMD    run CMD; on an outage record it in outages.jsonl,
+                                            stop CMD (SIGTERM) and exit 75
 """
 
 import argparse
 import datetime
 import json
 import os
+import signal
+import subprocess
 import sys
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # -I leaves it out
+from harvest_tb21 import classify, parse_iso  # noqa: E402
+
+OUTAGE_EXIT = 75
 
 
 def bare(name):
@@ -72,16 +89,114 @@ def archive(job_dir, archive_dir, name, entry, dry):
         fh.write(json.dumps(entry) + "\n")
 
 
+def now():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def healthy(url, timeout):
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(url.rstrip("/") + "/models", timeout=timeout) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def record_outage(job_dir, url, start):
+    os.makedirs(job_dir, exist_ok=True)
+    entry = {"start": start.isoformat(), "end": now().isoformat(), "url": url}
+    with open(os.path.join(job_dir, "outages.jsonl"), "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry) + "\n")
+
+
+def watch(url, job_dir, cmd):
+    interval = float(os.environ.get("TB_HEALTH_INTERVAL", "15"))
+    timeout = float(os.environ.get("TB_HEALTH_TIMEOUT", "10"))
+    limit = int(os.environ.get("TB_HEALTH_FAILS", "3"))     # consecutive failed probes
+    proc = subprocess.Popen(cmd)
+    signal.signal(signal.SIGINT, lambda *_: None)           # CMD gets Ctrl-C itself; wait for it
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda *_: proc.send_signal(signal.SIGTERM))
+    fails, start = 0, None
+    while True:
+        try:
+            rc = proc.wait(timeout=interval)
+            break
+        except subprocess.TimeoutExpired:
+            pass
+        probed = now()
+        if healthy(url, timeout):
+            fails, start = 0, None
+            continue
+        fails, start = fails + 1, start or probed
+        if fails >= limit:
+            print(f"model server outage: {url} failed {fails} probes; stopping the run", file=sys.stderr)
+            record_outage(job_dir, url, start)
+            proc.send_signal(signal.SIGTERM)
+            proc.wait()                                     # let Harbor record the cancellation
+            record_outage(job_dir, url, start)              # extend the window over the shutdown
+            return OUTAGE_EXIT
+    probed = now()
+    if not healthy(url, timeout):
+        print(f"model server outage: {url} is down at the end of the run", file=sys.stderr)
+        record_outage(job_dir, url, start or probed)
+        return OUTAGE_EXIT
+    return rc if rc >= 0 else 128 - rc
+
+
+def outage_overlap(job_dir, res):
+    """The recorded outage window that overlaps the trial, as text, or None."""
+    path = os.path.join(job_dir, "outages.jsonl")
+    began, ended = parse_iso(res.get("started_at")), parse_iso(res.get("finished_at"))
+    if not (began and ended and os.path.exists(path)):
+        return None
+    with open(path, encoding="utf-8") as fh:
+        for line in filter(str.strip, fh):
+            o = json.loads(line)
+            a, b = parse_iso(o.get("start")), parse_iso(o.get("end"))
+            # Harbor writes UTC; a timestamp without a zone is taken as UTC
+            a, b, c, d = (t.replace(tzinfo=t.tzinfo or datetime.timezone.utc) if t else None
+                          for t in (a, b, began, ended))
+            if a and b and a <= d and c <= b:
+                return f"model server outage {o['start']} to {o['end']}"
+    return None
+
+
+def judge_rerun(job_dir, res, override):
+    """Return (status, evidence, refusal) for re-running a finished trial."""
+    rec = classify(res)
+    reward = ((res.get("verifier_result") or {}).get("rewards") or {}).get("reward")
+    if reward is not None and float(reward) == 1.0:
+        return rec["status"], None, "it has reward 1"
+    evidence = outage_overlap(job_dir, res)
+    if rec["status"] == "error":
+        evidence = evidence or f"no valid reward: {rec['reason']}"
+    if not evidence and not override:
+        return rec["status"], None, (f"it is a scored fail (reward {reward}) with no recorded outage "
+                                     "evidence; --rerun-without-evidence overrides and is reported")
+    return rec["status"], evidence, None
+
+
 def main():
+    if sys.argv[1:2] == ["health"] and len(sys.argv) == 3:
+        if not healthy(sys.argv[2], float(os.environ.get("TB_HEALTH_TIMEOUT", "10"))):
+            sys.exit(f"model server does not answer at {sys.argv[2]}/models")
+        return
+    if sys.argv[1:2] == ["watch"] and len(sys.argv) > 5 and sys.argv[4] == "--":
+        sys.exit(watch(sys.argv[2], sys.argv[3], sys.argv[5:]))
     ap = argparse.ArgumentParser()
     ap.add_argument("--job-dir", required=True)
     ap.add_argument("--archive-dir", required=True)
     ap.add_argument("--dataset", required=True)
     ap.add_argument("--digest", required=True)
     ap.add_argument("--rerun", action="append", default=[])
+    ap.add_argument("--reason", help="why the --rerun trials are re-run")
+    ap.add_argument("--rerun-without-evidence", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("tasks", nargs="+", help="the full namespaced task list of the job")
     a = ap.parse_args()
+    if a.rerun and not (a.reason or "").strip():
+        ap.error("--rerun requires --reason")
 
     check_config(a.job_dir, a.dataset, a.digest, a.tasks)
     wanted = {bare(t) for t in a.tasks}
@@ -90,6 +205,7 @@ def main():
 
     finished = {}
     moves = []
+    refused = []
     for name, res in trials:
         exc = ((res or {}).get("exception_info") or {}).get("exception_type")
         if res is None:
@@ -102,7 +218,11 @@ def main():
         if exc == "CancelledError" and reward is None:
             moves.append((name, dict(entry, kind="cancelled")))
         elif task in rerun:
-            moves.append((name, dict(entry, kind="rerun")))
+            status, evidence, refusal = judge_rerun(a.job_dir, res, a.rerun_without_evidence)
+            if refusal:
+                refused.append(f"--rerun {task} refused: {refusal}")
+            moves.append((name, dict(entry, kind="rerun", status=status, reason=a.reason.strip(),
+                                     evidence=evidence)))
         else:
             finished[task] = name
 
@@ -110,6 +230,9 @@ def main():
     moved = {e["task"] for _, e in moves if e["kind"] == "rerun"}
     if rerun - moved:
         sys.exit("--rerun: no finished trial in " + a.job_dir + " for " + ", ".join(sorted(rerun - moved)))
+
+    if refused:
+        sys.exit("\n".join(refused))
 
     for name, entry in moves:
         archive(a.job_dir, a.archive_dir, name, entry, a.dry_run)

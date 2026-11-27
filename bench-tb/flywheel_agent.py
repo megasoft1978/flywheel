@@ -11,10 +11,16 @@ usage:
     --include-task-name <task>
 """
 
+import re
 import shlex
 from pathlib import Path
 
 from harbor.agents.base import BaseAgent
+from harbor.agents.installed.base import (
+    ApiError,
+    ContextWindowExceededError,
+    NonZeroAgentExitCodeError,
+)
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
@@ -93,3 +99,30 @@ class FlywheelAgent(BaseAgent):
                 await environment.download_file(f"/tmp/{name}", self.logs_dir / name)
             except Exception as e:
                 self.logger.warning("log capture %s failed: %s", name, e)
+        await self._raise_on_failure(environment, out)
+
+    async def _raise_on_failure(self, environment: BaseEnvironment, out: str) -> None:
+        """Turn flywheel's exit status into the exception Harbor records.
+
+        src/main.c exits 0 on finish=done and 1 on every other finish, so a normal task end
+        (turns, wall, aborted) and a failed model request (error:...) differ only in the
+        summary line.
+        """
+        m = re.search(r"FW_EXIT_(\d+)", out)
+        code = int(m.group(1)) if m else None
+        if code == 0:
+            return
+        res = await environment.exec(
+            "grep -o 'flywheel: finish=.*' /tmp/fw_out.log | tail -n 1", timeout_sec=15
+        )
+        line = (res.stdout or "").strip()
+        # no " turns=": a multi-line server error cut the summary line short
+        m = re.match(r"flywheel: finish=(.*?)(?: turns=\d+|$)", line)
+        finish = m.group(1) if m else None
+        if code == 1 and finish is not None:
+            if not finish.startswith("error:"):
+                return
+            if finish.startswith("error:status 4") and "context" in finish.lower():
+                raise ContextWindowExceededError(f"flywheel {finish}")
+            raise ApiError(f"flywheel engine failure: {finish}")
+        raise NonZeroAgentExitCodeError(f"flywheel exit status {code}: {line or 'no summary line'}")
