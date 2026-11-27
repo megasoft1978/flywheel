@@ -3,6 +3,8 @@
 #include "../src/flywheel.h"
 #include <signal.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
+#include <dirent.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -1227,6 +1229,104 @@ static void test_gate_approval(void) {
     free(oldpath);
 }
 
+/* ---------- file tools: atomic writes, overlapping matches, empty files ---------- */
+
+static int dir_entries(const char *dir) {
+    DIR *d = opendir(dir);
+    int n = 0;
+    for (struct dirent *e; d && (e = readdir(d)); )
+        if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..")) n++;
+    if (d) closedir(d);
+    return n;
+}
+
+static bool holds(const char *path, const char *want) {
+    char *c = slurp(path);
+    bool ok = c && !strcmp(c, want);
+    free(c);
+    return ok;
+}
+
+static void test_atomic(void) {
+    char dir[] = "/tmp/fwatomXXXXXX", p[256], l[256];
+    if (!mkdtemp(dir)) { T("mkdtemp", false); return; }
+    snprintf(p, sizeof p, "%s/run.sh", dir);
+    put(p, "aaa");
+    chmod(p, 0755);
+
+    char *r = tool_edit_file(dir, "run.sh", "aa", "b");
+    T("overlapping matches are ambiguous", strstr(r, "2 places") && holds(p, "aaa"));
+    free(r);
+
+    struct stat a, b;
+    stat(p, &a);
+    r = tool_write_file(dir, "run.sh", "new body\n");
+    stat(p, &b);
+    T("write replaces by rename", !strncmp(r, "ok:", 3) && a.st_ino != b.st_ino && holds(p, "new body\n"));
+    T("write keeps the mode", (b.st_mode & 07777) == 0755);
+    free(r);
+    r = tool_edit_file(dir, "run.sh", "new", "old");
+    stat(p, &a);
+    T("edit replaces by rename", !strncmp(r, "ok:", 3) && a.st_ino != b.st_ino && holds(p, "old body\n"));
+    T("edit keeps the mode", (a.st_mode & 07777) == 0755);
+    free(r);
+
+    /* a write that cannot complete leaves the old file and no temp file */
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        signal(SIGXFSZ, SIG_IGN);
+        struct rlimit lim = {4, 4};
+        setrlimit(RLIMIT_FSIZE, &lim);
+        char *w = tool_write_file(dir, "run.sh", "much longer than the limit\n");
+        char *e = tool_edit_file(dir, "run.sh", "old", "newer");
+        _exit((strncmp(w, "error:", 6) ? 1 : 0) | (strncmp(e, "error:", 6) ? 2 : 0));
+    }
+    int st = 0;
+    waitpid(pid, &st, 0);
+    T("failed write is reported", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    T("failed write keeps the old file", holds(p, "old body\n"));
+    T("failed write leaves no temp file", dir_entries(dir) == 1);
+
+    if (geteuid() != 0) {
+        chmod(p, 0444);
+        r = tool_write_file(dir, "run.sh", "x");
+        T("read-only file stays", !strncmp(r, "error:", 6) && holds(p, "old body\n"));
+        free(r);
+        chmod(p, 0755);
+    }
+
+    snprintf(l, sizeof l, "%s/link.sh", dir);
+    T("symlink made", !symlink("run.sh", l));
+    r = tool_write_file(dir, "link.sh", "via link\n");
+    T("in-project symlink updates its target", holds(p, "via link\n") && !lstat(l, &a) && S_ISLNK(a.st_mode));
+    free(r);
+
+    r = tool_write_file(dir, "fresh.txt", "");
+    snprintf(l, sizeof l, "%s/fresh.txt", dir);
+    mode_t um = umask(0);
+    umask(um);
+    T("new file follows umask", !stat(l, &a) && a.st_size == 0 && (a.st_mode & 07777) == (0666 & ~um));
+    free(r);
+
+    free(g_cfg.cwd);
+    g_cfg.cwd = str_dup(dir);
+    Ui u = {.interactive = true};
+    Msgs m;
+    static const char *const empty[] = {
+        "write_file", "{\"path\":\"run.sh\",\"content\":\"\"",     /* truncated */
+        "write_file", "{\"path\":\"run.sh\"}"};                    /* no content */
+    new_task(&m);
+    run_agent(&m, "tool_calls", 2, empty, 1, &u);
+    T("truncated or missing content never empties a file", holds(p, "via link\n"));
+    msgs_free(&m);
+    static const char *const none[] = {"write_file", "{\"path\":\"run.sh\",\"content\":\"\"}"};
+    new_task(&m);
+    run_agent(&m, "tool_calls", 1, none, 1, &u);
+    T("an empty file can be written", holds(p, ""));
+    msgs_free(&m);
+}
+
 /* ---------- exit status and check outcome reach the model and the user ---------- */
 
 static void test_truth(void) {
@@ -1698,6 +1798,7 @@ int main(void) {
     test_review4();
     test_gate_approval();
     test_truth();
+    test_atomic();
 #ifdef FW_MINI_HTTP
     test_connect_timeout();
 #endif

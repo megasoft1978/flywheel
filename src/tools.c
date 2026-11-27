@@ -1753,6 +1753,43 @@ static FILE *open_nofollow(const char *path, int flags, const char *mode) {
 
 #define FILETOOL_MAX_CONTENT (4 * 1024 * 1024)
 
+/* Replace `path` through a temp file in the same directory and rename, so a
+   failed write leaves the old file. Returns 0, or the errno of the failure. */
+static int write_atomic(const char *path, const char *data, size_t len) {
+    struct stat st;
+    bool had = !lstat(path, &st);
+    if (had) {
+        /* rename would replace what open() refuses: a link, a directory,
+           a read-only file */
+        if (S_ISLNK(st.st_mode)) return ELOOP;
+        if (S_ISDIR(st.st_mode)) return EISDIR;
+        if (!S_ISREG(st.st_mode)) return EINVAL;
+        if (access(path, W_OK)) return errno;
+    }
+    char tmp[PATH_MAX];
+    const char *slash = strrchr(path, '/');
+    int dl = slash ? (int)(slash - path) + 1 : 0;
+    int fd = -1;
+    for (int i = 0; fd < 0 && i < 100; i++) {
+        if (snprintf(tmp, sizeof tmp, "%.*s.fw-tmp-%ld-%d", dl, path, (long)getpid(), i) >= (int)sizeof tmp)
+            return ENAMETOOLONG;
+        fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, had ? 0600 : 0666);
+        if (fd < 0 && errno != EEXIST) return errno;
+    }
+    if (fd < 0) return EEXIST;
+    int err = 0;
+    for (size_t off = 0; !err && off < len; ) {
+        ssize_t w = write(fd, data + off, len - off);
+        if (w > 0) off += (size_t)w;
+        else if (w == 0 || errno != EINTR) err = w ? errno : EIO;
+    }
+    if (!err && had && fchmod(fd, st.st_mode & 07777)) err = errno;
+    if (close(fd) && !err) err = errno;
+    if (!err && rename(tmp, path)) err = errno;
+    if (err) unlink(tmp);
+    return err;
+}
+
 char *tool_write_file(const char *cwd, const char *path, const char *content) {
     char abs[PATH_MAX];
     const char *err = resolve_confined(cwd, path, abs, sizeof abs, true);
@@ -1761,16 +1798,12 @@ char *tool_write_file(const char *cwd, const char *path, const char *content) {
     size_t len = strlen(content);
     if (len > FILETOOL_MAX_CONTENT) return str_dup("error: content too large (4 MiB cap)");
 
-    FILE *f = open_nofollow(abs, O_WRONLY | O_CREAT | O_TRUNC, "w");
-    if (!f) {
+    int werr = write_atomic(abs, content, len);
+    if (werr) {
         char buf[300];
-        snprintf(buf, sizeof buf, "error: cannot open %s: %s", path, strerror(errno));
+        snprintf(buf, sizeof buf, "error: cannot write %s: %s — nothing was changed", path, strerror(werr));
         return str_dup(buf);
     }
-    size_t wr = fwrite(content, 1, len, f);
-    int bad = ferror(f);
-    fclose(f);
-    if (bad || wr != len) return str_dup("error: write failed (disk full?)");
 
     int lines = len ? 1 : 0;
     for (size_t i = 0; i < len; i++) if (content[i] == '\n') lines++;
@@ -1805,7 +1838,7 @@ char *tool_edit_file(const char *cwd, const char *path, const char *old_str, con
     size_t ol = strlen(old_str);
     int occ = 0;
     const char *hit = NULL;
-    for (const char *p = data; (p = strstr(p, old_str)); p += ol) {
+    for (const char *p = data; (p = strstr(p, old_str)); p++) {   /* overlaps count */
         if (!hit) hit = p;
         occ++;
     }
@@ -1837,17 +1870,14 @@ char *tool_edit_file(const char *cwd, const char *path, const char *old_str, con
     for (size_t i = 0; i < pre; i++) if (data[i] == '\n') line++;
     free(data);
 
-    f = open_nofollow(abs, O_WRONLY | O_CREAT | O_TRUNC, "w");
-    if (!f) {
-        free(out);
-        return str_dup("error: cannot open file for writing");
-    }
     size_t total = pre + nl + post;
-    size_t wr = fwrite(out, 1, total, f);
-    int bad = ferror(f);
-    fclose(f);
+    int werr = write_atomic(abs, out, total);
     free(out);
-    if (bad || wr != total) return str_dup("error: write failed (disk full?)");
+    if (werr) {
+        char buf[300];
+        snprintf(buf, sizeof buf, "error: cannot write %s: %s — nothing was changed", path, strerror(werr));
+        return str_dup(buf);
+    }
 
     char buf[300];
     snprintf(buf, sizeof buf, "ok: edited %s at line %d (%zu bytes)", path, line, total);

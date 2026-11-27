@@ -238,7 +238,7 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
                 snprintf(permstr, permlen, "%s %s", tname, path);
                 if (!args) out = str_dup("error: bad arguments: not complete valid JSON (truncated?) — nothing was changed; resend the whole call");
                 else if (!*path) out = str_dup("error: bad arguments, need \"path\"");
-                else if (!*a) out = str_dup(iswrite
+                else if (iswrite ? !cJSON_IsString(ja) : !*a) out = str_dup(iswrite
                     ? "error: bad arguments, need \"content\" — write the complete file content"
                     : "error: bad arguments, need \"old_string\"");
                 else if (!iswrite && !cJSON_IsString(jb)) out = str_dup("error: bad arguments, need \"new_string\"");

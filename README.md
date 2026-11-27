@@ -84,7 +84,7 @@ Project instructions come from the first of `.flywheel.md`, `AGENTS.md` or `CLAU
   context from the task, the file list and the check output.
 - **Tool-call repair.** Recovers shell commands from JSON containing raw control characters.
   Truncated or auto-closed arguments are rejected, never executed.
-- **File tools.** `write_file` and `edit_file` with unique-match edits, confined to the project.
+- **File tools.** `write_file` and `edit_file` with unique-match edits and atomic replacement, confined to the project.
 - **Verification gate.** A per-language check (`tsc --noEmit`, `python3 -I -m compileall`,
   `go vet`, `cargo check`) and one requirement-by-requirement pass before finishing. A passing
   check means the code type-checks or compiles, not that it is correct. A run whose last check
