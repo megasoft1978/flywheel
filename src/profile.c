@@ -11,7 +11,7 @@ static const Profile PROFILES[] = {
      "Python engineer",
      "py"},
     {"go",
-     "go vet ./...",
+     "go vet -atomic ./...",
      "Go engineer",
      "go"},
     {"rust",
@@ -55,6 +55,7 @@ char *gate_run(const Profile *prof, const char *cwd, int timeout_s, bool *failed
     char *out = run_bash_status(prof->gate_cmd, cwd, timeout_s, &code);
     *failed = code > 0 && code != 126 && code != 127;
     if (!strcmp(prof->name, "ts")) *failed = *failed && strstr(out, "error TS");
+    if (!strcmp(prof->name, "go")) *failed = *failed && !strstr(out, "no packages to vet");
     /* keep both ends: the messages quote about 1800 chars */
     size_t len = strlen(out);
     if (len > 1700) {

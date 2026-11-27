@@ -47,7 +47,9 @@ static void usage(FILE *f) {
 "  --gates N  verify passes     (def 1)\n"
 "  --transcript FILE            JSONL log\n"
 "  --sys TEXT  extra system-prompt text\n"
-"  -q         quiet (non-interactive)\n");
+"  -q         quiet (non-interactive)\n"
+"  --allow-outside-writes       throwaway containers only: commands may write\n"
+"                               outside the working dir\n");
 }
 
 static char *build_system(const Profile *prof, bool interactive) {
@@ -427,6 +429,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--sys")) g_cfg.sys_extra = str_dup(REQ);
         else if (!strcmp(a, "--no-color")) g_cfg.color = false;
         else if (!strcmp(a, "-q")) g_cfg.quiet = true;
+        /* command line only: no config key, env var or project file sets it */
+        else if (!strcmp(a, "--allow-outside-writes")) g_cfg.outside_writes = true;
         else if (!strcmp(a, "-y") || !strcmp(a, "--yes")) g_cfg.yes = true;
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(stdout); return 0; }
         else if (!strcmp(a, "init") || !strcmp(a, "setup")) subcmd = a;

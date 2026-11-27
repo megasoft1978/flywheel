@@ -35,6 +35,7 @@ typedef struct {
     bool  quiet;         /* once-mode: minimal output */
     bool  yes;           /* auto-confirm setup prompts */
     char *sys_extra;     /* appended to system prompt */
+    bool  outside_writes;/* --allow-outside-writes only: throwaway containers */
 } Cfg;
 
 extern Cfg g_cfg;

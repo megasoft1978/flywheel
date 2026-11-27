@@ -920,10 +920,10 @@ static void test_remember_inline(void) {
         "npx -c x", "npm exec x", "make --eval=x", NULL};
     for (int i = 0; no[i]; i++) { char *p = perm_prefix(no[i]); T(no[i], p && !*p); free(p); }
     char *p = perm_prefix("nodemon app.js");
-    T("nodemon is not node", p && !strcmp(p, "nodemon"));
+    T("unlisted tool: nothing offered", p && !*p);
     free(p);
     p = perm_prefix("python3 manage.py test");
-    T("script rule still offered", p && !strcmp(p, "python3 manage.py"));
+    T("script path is not a fixed subcommand", p && !*p);
     free(p);
 }
 
@@ -1008,6 +1008,10 @@ static void test_gate(void) {
 
     fake_tool(dir, "go", "echo 'vet: ./a.go:3:2: undefined: x' >&2; exit 1");
     T("go: compile error without the word fails", gate("go", dir, "undefined: x"));
+    fake_tool(dir, "go", "case \" $* \" in *' -atomic '*) exit 0;; esac; echo './a.go:5:2: Printf format %d has wrong type'; exit 1");
+    T("go: style finding passes", !gate("go", dir, NULL));
+    fake_tool(dir, "go", "echo 'go: warning: \"./...\" matched no packages' >&2; echo 'no packages to vet' >&2; exit 1");
+    T("go: nothing to vet passes", !gate("go", dir, NULL));
     fake_tool(dir, "go", "exit 0");
     T("go: clean passes", !gate("go", dir, NULL));
     fake_tool(dir, "cargo", "echo 'src/a.rs:1: warning: unused `Error`: error type'; exit 0");
@@ -1134,6 +1138,91 @@ static void test_cli_values(void) {
     stop(srv);
 }
 
+/* ---------- second review round ---------- */
+
+static void test_review2_deny(void) {
+    const char *cwd = "/tmp/sb";
+    static const char *no[] = {
+        "ln -st /usr/local/bin a b", "ln -sfvt /etc a b", "ln -t/etc a", "ln -st/etc a",
+        "install -t/etc a", "install -vt /etc a", "ln --target-directory /etc a",
+        "ln --target-directory=/etc a", "install --target-directory /etc a", "cp -rt /etc a",
+        "cp -t/etc a", "mv -ft /etc a", "cp --target-directory /etc a", "mv --target-directory /etc a",
+        "rsync -a ./ /etc/ --exclude .git", "rsync -a src/ /etc/ --include x --exclude-from f",
+        "rsync -a src/ /etc/ --filter '- x' --rsh ssh", "rsync -a src/ /etc/ -e ssh",
+        "find -O3 /etc -delete", "find -D tree /etc -delete", "find -f /etc -delete", "find -- /etc -delete",
+        "find /etc -exec cp x {} \\;", "find /etc -exec cp -t {} x \\;", "find -files0-from list -delete",
+        "sed -n 'w /etc/x' f", "sed 's/a/b/w /etc/x' f", "sed -e p -e 'W /etc/x' f",
+        "sed '/q/{s|a|b|gw /etc/x\n}' f", "sed --expression='1w /etc/x' f", "sed 's/a/b/e' f",
+        "sed -I '' s/a/b/ /etc/x",
+        "rsync -a --log-file /etc/x a b", "rsync -a --log-file=/etc/x a b", "rsync -a --backup-dir /etc a b",
+        "rsync -a --temp-dir=/etc a b", "rsync -a -T /etc a b", "rsync -a --write-batch /etc/x a b",
+        "rsync --no-such-option a b", "cp --target-dir=/etc a", "touch --frob a", "sed --frob p f",
+        "flywheel --allow-outside-writes 'x'", "./flywheel -q --allow-outside-writes x", NULL};
+    for (int i = 0; no[i]; i++) T(no[i], deny_check(no[i], cwd) != NULL);
+    static const char *yes[] = {
+        "ln -st build a b", "cp -rt build a b", "rsync -a ./ /tmp/out/ --exclude .git",
+        "rsync -a --exclude node_modules --delete src/ dist/", "rsync -a src/ build/ --log-file rsync.log",
+        "find /usr/share -name x -exec cp {} ./out/ ;", "find /usr/share -name x -exec cp -t out {} +",
+        "find -O3 . -name '*.tmp' -delete", "find -- build -delete", "sed -n 's/a/b/w out.txt' f",
+        "sed 's/w \\/etc/x/g' f", "sed '/w /d' f", "sed 's/[/]w/x/' f", "sed -n '1,5p;/x/{p;q}' /etc/hosts",
+        "sed 'a w /etc/x' f", "touch --date=now a", "mkdir --parents out", "rm --recursive --force build",
+        "chmod --reference=/etc/hosts a", "cp --preserve=mode a b", NULL};
+    for (int i = 0; yes[i]; i++) T(yes[i], deny_check(yes[i], cwd) == NULL);
+}
+
+static void test_review2_optout(void) {
+    const char *cwd = "/tmp/sb";
+    static const char *outside[] = {"echo x > /etc/motd", "cp a /usr/local/bin/b", "mkdir -p /opt/app",
+        "rm -rf /opt/app", "sed -i s/a/b/ /etc/hosts", "find /etc -delete", "ln -st /usr/local/bin a b",
+        "rsync --no-such-option a /srv/", "sed -n 'w /etc/x' f", "tee /etc/x", NULL};
+    static const char *still[] = {"rm -rf /", "rm -rf ~", "rm -rf /*", "rm -fr /", "rm -r -f \"/\"",
+        "rm -rf $HOME", "rm -rf ${HOME}/", "rm -rf ~/*", "cd /tmp && rm -fr ../..", "sudo ls",
+        "mkfs.ext4 /dev/x", "echo x > /dev/sda", "flywheel --allow-outside-writes x", NULL};
+    for (int i = 0; outside[i]; i++) T(outside[i], deny_check(outside[i], cwd) != NULL);
+    g_cfg.outside_writes = true;
+    for (int i = 0; outside[i]; i++) T(outside[i], deny_check(outside[i], cwd) == NULL);
+    for (int i = 0; still[i]; i++) T(still[i], deny_check(still[i], cwd) != NULL);
+    g_cfg.outside_writes = false;
+    char *argv[] = {"flywheel", "--allow-outside-writes", "-h", NULL};
+    char *out = run_flywheel(false, argv);
+    T("flag is accepted", run_status == 0 && strstr(out, "--allow-outside-writes"));
+}
+
+static void test_review2_perm(void) {
+    free(g_cfg.cwd);
+    g_cfg.cwd = str_dup(projdir);
+    perm_free();
+    static const char *no[] = {
+        "grep -R x .", "grep -rnR x .", "grep -S -r x .", "grep --dereference-recursive x .",
+        "rg -L x", "rg --follow x", "find -L . -name x", "find . -follow", "fd -L x", "fd --follow x",
+        "ls -L", "ls -lRL .", "grep -e x /etc/passwd", "grep /etc/passwd -e x",
+        "rg --ignore-file /etc/passwd x", "grep -A 3 x /etc/passwd", "cut -d / -f1 /etc/passwd", NULL};
+    for (int i = 0; no[i]; i++) T(no[i], !perm_allowed(no[i]));
+    static const char *yes[] = {
+        "grep -r \"/api/users\" src", "grep -rn \"//TODO\" .", "grep -n '/\\*' a.c", "cut -d / -f1 a",
+        "rg /api src", "grep -A 3 /api src", "sort -t / a", "grep -r x .", NULL};
+    for (int i = 0; yes[i]; i++) T(yes[i], perm_allowed(yes[i]));
+    perm_add_rule("perl");
+    T("perl -e never auto-allowed", !perm_allowed("perl -e 'unlink 1'") && !perm_allowed("perl -ne print a") &&
+      !perm_allowed("perl -E say"));
+    static const char *none[] = {
+        "make", "make build", "pip install x", "uv run x", "docker run x", "kubectl exec x", "sqlite3 db",
+        "vim x", "tar -xf a", "sed s/a/b/ f", "curl x", "./run.sh", "python3 manage.py test", "node app.js",
+        "git push", "git config a b", "npm run", "npm publish", "go run .", "cargo run", "npx cowsay", NULL};
+    for (int i = 0; none[i]; i++) { char *p = perm_prefix(none[i]); T(none[i], p && !*p); free(p); }
+    static const char *some[][2] = {{"git status -s", "git status"}, {"npm test", "npm test"},
+        {"npm run build -- x", "npm run build"}, {"cargo test --all", "cargo test"},
+        {"go vet ./...", "go vet"}, {"uname -a", "uname"}};
+    for (int i = 0; i < 6; i++) {
+        char *p = perm_prefix(some[i][0]);
+        T(some[i][0], p && !strcmp(p, some[i][1]));
+        free(p);
+    }
+    char pf[1200];
+    if (perm_project_file(pf, sizeof pf)) unlink(pf);
+    perm_free();
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     memset(&g_cfg, 0, sizeof g_cfg);
@@ -1174,6 +1263,11 @@ int main(void) {
     test_gate();
     test_agent_review();
     test_cli_values();
+    setenv("HOME", "/home/fwdeny", 1);
+    test_review2_deny();
+    test_review2_optout();
+    setenv("HOME", fakehome, 1);
+    test_review2_perm();
 #ifdef FW_MINI_HTTP
     test_connect_timeout();
 #endif

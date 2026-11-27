@@ -134,8 +134,18 @@ static bool expands_unsafely(const char *w) {
 }
 
 /* may `w` be written/removed? inside cwd, /tmp or harmless /dev nodes */
+static bool block_device(const char *p) {
+    return !strncmp(p, "/dev/sd", 7) || !strncmp(p, "/dev/disk", 9) ||
+           !strncmp(p, "/dev/rdisk", 10) || !strncmp(p, "/dev/nvme", 9);
+}
+
+/* with g_cfg.outside_writes (a container run) only devices stay off limits */
 static bool path_ok(const char *w, const char *cwd) {
     if (!*w) return true;
+    if (g_cfg.outside_writes) {
+        char norm[PATH_MAX];
+        return !(w[0] == '/' && lex_normalize(w, norm, sizeof norm) && block_device(norm));
+    }
     if (expands_unsafely(w)) return false;
     const char *home = getenv("HOME") ? getenv("HOME") : "/nonexistent-home";
     char ex[PATH_MAX], abs[PATH_MAX], norm[PATH_MAX], real[PATH_MAX];
@@ -154,8 +164,7 @@ static bool path_ok(const char *w, const char *cwd) {
         w = abs;
     }
     if (!lex_normalize(w, norm, sizeof norm)) return false;
-    if (!strncmp(norm, "/dev/sd", 7) || !strncmp(norm, "/dev/disk", 9) ||
-        !strncmp(norm, "/dev/rdisk", 10) || !strncmp(norm, "/dev/nvme", 9)) return false;
+    if (block_device(norm)) return false;
     if (!realpath(cwd, real)) snprintf(real, sizeof real, "%s", cwd);
     return is_within(cwd, norm) || is_within(real, norm) || is_within("/tmp", norm) ||
            is_within("/private/tmp", norm) || is_within("/dev", norm);
@@ -219,74 +228,216 @@ static bool target_ok(const char *w, const char *cwd) {
 
 static const char *check_simple(char **v, int n, const char *cwd, int depth);
 
+/* w with every {} replaced by `by` */
+static char *fill_braces(const char *w, const char *by) {
+    size_t n = 0, bl = strlen(by);
+    for (const char *p = w; (p = strstr(p, "{}")); p += 2) n++;
+    char *out = malloc(strlen(w) + n * bl + 1), *q = out;
+    while (*w) {
+        if (w[0] == '{' && w[1] == '}') { memcpy(q, by, bl); q += bl; w += 2; }
+        else *q++ = *w++;
+    }
+    *q = 0;
+    return out;
+}
+
 /* find: -delete, -fprint and a mutating -exec act below the starting points */
 static const char *check_find(char **a, int na, const char *cwd, int depth) {
     static const char *const readers[] = {"grep", "egrep", "fgrep", "rg", "cat", "head", "tail", "wc",
         "ls", "stat", "file", "echo", "printf", "basename", "dirname", "du", "md5", "md5sum",
         "shasum", "sha256sum", "test", NULL};
-    int k = 0;
-    while (k < na && a[k][0] == '-' && a[k][1] && strspn(a[k] + 1, "HLPEXdsx") == strlen(a[k] + 1)) k++;
-    int first = k;
-    while (k < na && a[k][0] != '-' && strcmp(a[k], "!") && strcmp(a[k], "(")) k++;
-    int end = k;
-    bool mutates = false;
-    for (; k < na; k++) {
-        if (!strcmp(a[k], "-delete")) mutates = true;
+    /* check_operands knows which operands these write */
+    static const char *const known[] = {"rm", "tee", "cp", "mv", "touch", "mkdir", "rmdir", "truncate",
+        "chmod", "chown", "chgrp", "ln", "rsync", "install", NULL};
+    char **pts = malloc((size_t)(na + 2) * sizeof *pts);
+    int np = 0, k = 0;
+    while (k < na) {
+        if (!strcmp(a[k], "--")) k++;
+        else if (!strcmp(a[k], "-D")) k += 2;
+        else if (!strcmp(a[k], "-f") && k + 1 < na) { pts[np++] = a[k + 1]; k += 2; }
+        else if (a[k][0] == '-' && a[k][1] == 'O') k++;
+        else if (a[k][0] == '-' && a[k][1] && strspn(a[k] + 1, "HLPEXdsx") == strlen(a[k] + 1)) k++;
+        else break;
+    }
+    for (; k < na && a[k][0] != '-' && strcmp(a[k], "!") && strcmp(a[k], "("); k++) pts[np++] = a[k];
+    if (!np) pts[np++] = (char *)".";
+    bool mutates = false, listed = false;
+    const char *err = NULL;
+    for (; !err && k < na; k++) {
+        if (!strncmp(a[k], "-files0-from", 12)) listed = true;
+        else if (!strcmp(a[k], "-delete")) mutates = true;
         else if ((!strncmp(a[k], "-fprint", 7) || !strcmp(a[k], "-fls")) && k + 1 < na) {
-            if (!target_ok(a[++k], cwd)) return E_OUTSIDE;
+            if (!target_ok(a[++k], cwd)) err = E_OUTSIDE;
         } else if (!strncmp(a[k], "-exec", 5) || !strncmp(a[k], "-ok", 3)) {
+            bool indir = strstr(a[k], "dir") != NULL;
             int s = ++k;
             while (k < na && strcmp(a[k], ";") && strcmp(a[k], "+")) k++;
             if (s == k) continue;
+            if (depth > 4) { err = E_RULE; break; }
             const char *c = strrchr(a[s], '/') ? strrchr(a[s], '/') + 1 : a[s];
-            if (!one_of(c, readers)) mutates = true;
-            if (depth > 4) return E_RULE;
-            const char *e = check_simple(a + s, k - s, cwd, depth + 1);
-            if (e) return e;
+            err = check_simple(a + s, k - s, cwd, depth + 1);
+            if (one_of(c, readers)) continue;
+            if (indir || !one_of(c, known)) { mutates = true; continue; }
+            /* judge the command as if {} were a file below each start point */
+            char **x = malloc((size_t)(k - s) * sizeof *x);
+            for (int i = 0; !err && i < np; i++) {
+                size_t cap = strlen(pts[i]) + 3;
+                char *under = malloc(cap);
+                snprintf(under, cap, "%s/x", pts[i]);
+                for (int j = s; j < k; j++) x[j - s] = fill_braces(a[j], under);
+                err = check_simple(x, k - s, cwd, depth + 1);
+                for (int j = 0; j < k - s; j++) free(x[j]);
+                free(under);
+            }
+            free(x);
         }
     }
-    for (int i = first; mutates && i < end; i++)
-        if (!target_ok(a[i], cwd)) return E_OUTSIDE;
-    return NULL;
+    if (!err && mutates && listed && !g_cfg.outside_writes) err = E_OUTSIDE;
+    for (int i = 0; !err && mutates && i < np; i++)
+        if (!target_ok(pts[i], cwd)) err = E_OUTSIDE;
+    free(pts);
+    return err;
 }
 
-/* sed -i / perl -i: the files edited in place (not the script) */
-static const char *check_inplace(bool perl, char **a, int na, const char *cwd) {
+/* past a delimited sed part; `re` parts may hold the delimiter inside [...] */
+static const char *sed_part(const char *p, char d, bool re) {
+    for (; *p && *p != d; p++) {
+        if (*p == '\\' && p[1]) p++;
+        else if (re && *p == '[') {
+            const char *q = p + 1;
+            if (*q == '^') q++;
+            if (*q == ']') q++;
+            while (*q && *q != ']') q++;
+            if (*q) p = q;
+        }
+    }
+    return *p ? p + 1 : p;
+}
+
+/* is the file named by the rest of the line writable? advances *p */
+static const char *sed_file(const char **p, const char *cwd) {
+    const char *s = *p;
+    while (*s == ' ' || *s == '\t') s++;
+    size_t n = strcspn(s, "\n");
+    char *f = malloc(n + 1);
+    memcpy(f, s, n);
+    f[n] = 0;
+    *p = s + n;
+    bool ok = path_ok(f, cwd);
+    free(f);
+    return ok ? NULL : E_OUTSIDE;
+}
+
+/* w/W and s///w write files without -i, e runs a shell command */
+static const char *check_sed_script(const char *p, const char *cwd) {
+    if (g_cfg.outside_writes) return NULL;
+    if (strchr(p, OPAQUE)) return E_OUTSIDE;
+    /* a whole script held in a shell variable cannot be seen */
+    if (p[0] == '$' && (p[1] == '{' || (isalpha((unsigned char)p[1]) && isalnum((unsigned char)p[2]))))
+        return NULL;
+    const char *err = NULL;
+    while (!err && *p) {
+        if (strchr(" \t\r\n;{}!,+~$", *p) || isdigit((unsigned char)*p)) { p++; continue; }
+        if (*p == '/') { p = sed_part(p + 1, '/', true); p += strspn(p, "IM"); continue; }
+        if (*p == '\\' && p[1]) { p = sed_part(p + 2, p[1], true); p += strspn(p, "IM"); continue; }
+        char c = *p++;
+        if (c == 'w' || c == 'W') err = sed_file(&p, cwd);
+        else if (c == 'e') err = E_OUTSIDE;
+        else if (strchr("rR#:btTv", c)) p += strcspn(p, c == 'r' || c == 'R' || c == '#' ? "\n" : ";\n");
+        else if (strchr("aic", c)) {
+            while (*p && *p != '\n') p += *p == '\\' && p[1] ? 2 : 1;
+        } else if (c == 's' || c == 'y') {
+            char d = *p;
+            if (!d) break;
+            p = sed_part(p + 1, d, c == 's');
+            p = sed_part(p, d, false);
+            while (c == 's' && !err && *p && !strchr(";\n}", *p)) {
+                char f = *p++;
+                if (f == 'w') err = sed_file(&p, cwd);
+                else if (f == 'e') err = E_OUTSIDE;
+            }
+        } else if (!strchr("pPdDgGhHnNxlqQzF=", c)) err = E_OUTSIDE;
+    }
+    return err;
+}
+
+/* sed: files edited by -i and files written by the script itself */
+static const char *check_sed(char **a, int na, const char *cwd) {
+    static const char *const flags[] = {"quiet", "silent", "regexp-extended", "separate", "unbuffered",
+        "null-data", "zero-terminated", "posix", "debug", "follow-symlinks", "sandbox", "help",
+        "version", NULL};
+    bool inplace = false, script = false, opts = true;
+    char **files = malloc((size_t)(na + 1) * sizeof *files);
+    int nf = 0;
+    const char *err = NULL;
+    for (int k = 0; !err && k < na; k++) {
+        const char *o = a[k], *code = NULL;
+        if (opts && !strcmp(o, "--")) { opts = false; continue; }
+        if (!opts || o[0] != '-' || !o[1]) { files[nf++] = a[k]; continue; }
+        if (o[1] == '-') {
+            const char *eq = strchr(o, '=');
+            size_t len = eq ? (size_t)(eq - o - 2) : strlen(o + 2);
+            if (len == 10 && !strncmp(o + 2, "expression", len)) {
+                script = true;
+                code = eq ? eq + 1 : k + 1 < na ? a[++k] : "";
+            } else if (len == 4 && !strncmp(o + 2, "file", len)) {
+                script = true;
+                if (!eq) k++;
+            } else if (len == 11 && !strncmp(o + 2, "line-length", len)) {
+                if (!eq) k++;
+            } else if (len == 8 && !strncmp(o + 2, "in-place", len)) inplace = true;
+            else if (!one_of(o + 2, flags) && !g_cfg.outside_writes) err = E_OUTSIDE;
+        } else {
+            for (const char *c = o + 1; *c; c++) {
+                if (*c == 'i' || *c == 'I') {
+                    inplace = true;
+                    if (!c[1] && k + 1 < na && !*a[k + 1]) k++;   /* BSD: -i '' */
+                    break;
+                }
+                if (*c == 'e') {
+                    script = true;
+                    code = c[1] ? c + 1 : k + 1 < na ? a[++k] : "";
+                    break;
+                }
+                if (*c == 'f') { script = true; if (!c[1]) k++; break; }
+                if (*c == 'l' && !c[1] && k + 1 < na && *a[k + 1] &&
+                    strspn(a[k + 1], "0123456789") == strlen(a[k + 1])) k++;
+            }
+        }
+        if (code && !err) err = check_sed_script(code, cwd);
+    }
+    int first = 0;
+    if (!script && nf) { if (!err) err = check_sed_script(files[0], cwd); first = 1; }
+    for (int k = first; !err && inplace && k < nf; k++)
+        if (!target_ok(files[k], cwd)) err = E_OUTSIDE;
+    free(files);
+    return err;
+}
+
+/* perl -i: the files edited in place (not the program) */
+static const char *check_perl(char **a, int na, const char *cwd) {
     bool inplace = false, script = false;
     int k = 0;
     for (; k < na && a[k][0] == '-' && a[k][1]; k++) {
         const char *o = a[k];
         if (!strcmp(o, "--")) { k++; break; }
-        if (o[1] == '-') {
-            if (!strncmp(o, "--in-place", 10)) inplace = true;
-            if (!strncmp(o, "--expression", 12) || !strncmp(o, "--file", 6)) {
-                script = true;
-                if (!strchr(o, '=')) k++;
-            }
-            continue;
-        }
-        for (const char *c = o + 1; *c; c++) {
+        for (const char *c = o + 1; o[1] != '-' && *c; c++) {
             if (*c == 'i') {
                 inplace = true;
-                if (!perl && !c[1] && k + 1 < na && !*a[k + 1]) k++;   /* BSD: -i '' */
                 /* perl -pie 'code': the e still introduces the program */
-                if (perl && (c[1] == 'e' || c[1] == 'E') && !c[2]) { script = true; k++; }
+                if ((c[1] == 'e' || c[1] == 'E') && !c[2]) { script = true; k++; }
                 break;
             }
-            if (*c == 'e' || (perl ? *c == 'E' : *c == 'f')) {
+            if (*c == 'e' || *c == 'E') {
                 script = true;
                 if (!c[1]) k++;
                 break;
             }
-            if (perl && strchr("IMm", *c)) { if (!c[1]) k++; break; }
+            if (strchr("IMm", *c)) { if (!c[1]) k++; break; }
         }
     }
-    /* -i may also follow the script (GNU sed permutes) */
-    for (int j = k; !perl && j < na; j++)
-        if (!strncmp(a[j], "-i", 2) || !strncmp(a[j], "--in-place", 10)) inplace = true;
     if (!inplace) return NULL;
     for (; k < na; k++) {
-        if (!perl && !strncmp(a[k], "-e", 2)) { if (!a[k][2]) k++; continue; }
         if (a[k][0] == '-') continue;
         if (!script) { script = true; continue; }
         if (!target_ok(a[k], cwd)) return E_OUTSIDE;
@@ -316,43 +467,136 @@ static const char *check_git(char **a, int na, const char *cwd) {
     return NULL;
 }
 
+/* Options of the commands that change the files named by their operands.
+   Long options: `flags` take no separate word, `values` take one, `files`
+   name something written. Anything unlisted is refused. */
+typedef struct {
+    const char *cmd, *valued;   /* short options that take a value */
+    char target;                /* short option naming a target directory */
+    const char *flags, *values, *files;
+} OpSpec;
+
+static const OpSpec OPSPECS[] = {
+    {"rm", "", 0, "force interactive one-file-system no-preserve-root preserve-root recursive dir", "", ""},
+    {"tee", "", 0, "append ignore-interrupts output-error", "", ""},
+    {"cp", "S", 't', "archive attributes-only backup copy-contents dereference force interactive link "
+        "no-clobber no-dereference preserve no-preserve parents recursive reflink remove-destination "
+        "sparse strip-trailing-slashes symbolic-link no-target-directory update one-file-system context",
+        "suffix", ""},
+    {"mv", "S", 't', "backup force interactive no-clobber strip-trailing-slashes no-target-directory "
+        "update context", "suffix", ""},
+    {"ln", "S", 't', "backup directory force no-dereference interactive logical physical relative "
+        "symbolic no-target-directory", "suffix", ""},
+    {"install", "mogSBf", 't', "backup compare directory preserve-timestamps strip no-target-directory "
+        "preserve-context context", "group mode owner suffix", "strip-program"},
+    {"touch", "rtdA", 0, "no-create no-dereference", "date reference time", ""},
+    {"mkdir", "m", 0, "parents context", "mode", ""},
+    {"rmdir", "", 0, "ignore-fail-on-non-empty parents", "", ""},
+    {"truncate", "sr", 0, "no-create io-blocks", "reference size", ""},
+    {"chmod", "", 0, "changes quiet silent no-preserve-root preserve-root recursive", "reference", ""},
+    {"chown", "", 0, "changes quiet silent no-preserve-root preserve-root recursive dereference "
+        "no-dereference", "reference from", ""},
+    {"chgrp", "", 0, "changes quiet silent no-preserve-root preserve-root recursive dereference "
+        "no-dereference", "reference from", ""},
+    {"rsync", "efBTM@", 0, "archive quiet checksum ignore-times size-only recursive relative backup "
+        "update inplace append append-verify dirs links copy-links copy-unsafe-links safe-links "
+        "munge-links copy-dirlinks keep-dirlinks hard-links perms executability acls xattrs owner group "
+        "devices specials times omit-dir-times omit-link-times super fake-super sparse preallocate "
+        "dry-run whole-file one-file-system existing ignore-existing remove-source-files delete "
+        "delete-before delete-during delete-delay delete-after delete-excluded ignore-errors force "
+        "partial delay-updates prune-empty-dirs numeric-ids compress stats human-readable progress "
+        "itemize-changes list-only cvs-exclude from0 protect-args secluded-args blocking-io fuzzy "
+        "mkpath ipv4 ipv6 del motd implied-dirs",
+        "exclude include exclude-from include-from files-from filter rsh rsync-path chmod chown usermap "
+        "groupmap max-size min-size max-delete bwlimit port timeout contimeout compare-dest copy-dest "
+        "link-dest password-file out-format log-file-format compress-level compress-choice "
+        "checksum-choice checksum-seed skip-compress block-size modify-window iconv suffix read-batch "
+        "info debug protocol sockopts address remote-option max-alloc outbuf stop-after stop-at",
+        "log-file backup-dir temp-dir partial-dir write-batch only-write-batch"},
+};
+
+static bool word_in(const char *list, const char *w, size_t n) {
+    for (const char *p = list; *p; ) {
+        size_t len = strcspn(p, " ");
+        if (len == n && !strncmp(p, w, n)) return true;
+        p += len;
+        p += strspn(p, " ");
+    }
+    return false;
+}
+
+/* is `w` / or the home directory, or everything in one of them? */
+static bool root_like(const char *w, const char *cwd) {
+    const char *home = getenv("HOME") ? getenv("HOME") : "/nonexistent-home";
+    char abs[PATH_MAX], norm[PATH_MAX], h[PATH_MAX];
+    if (strchr(w, OPAQUE)) return true;
+    if (!*w) return false;
+    if (w[0] == '~' && (!w[1] || w[1] == '/')) snprintf(abs, sizeof abs, "%s%s", home, w + 1);
+    else if (!strncmp(w, "$HOME", 5)) snprintf(abs, sizeof abs, "%s%s", home, w + 5);
+    else if (!strncmp(w, "${HOME}", 7)) snprintf(abs, sizeof abs, "%s%s", home, w + 7);
+    else if (w[0] == '/') snprintf(abs, sizeof abs, "%s", w);
+    else snprintf(abs, sizeof abs, "%s/%s", cwd, w);
+    if (!lex_normalize(abs, norm, sizeof norm)) return true;
+    for (char *s; (s = strrchr(norm, '/')) && (!strcmp(s, "/*") || !strcmp(s, "/.*")); ) *s = 0;
+    if (!lex_normalize(home, h, sizeof h)) h[0] = 0;
+    return !*norm || !strcmp(norm, "/") || !strcmp(norm, h);
+}
+
 /* commands that change the files named by their operands */
 static const char *check_operands(const char *base, char **a, int na, const char *cwd) {
-    bool chmod_ = !strcmp(base, "chmod");
+    const OpSpec *sp = NULL;
+    for (size_t i = 0; i < sizeof OPSPECS / sizeof *OPSPECS; i++)
+        if (!strcmp(base, OPSPECS[i].cmd)) sp = &OPSPECS[i];
+    if (!sp) return NULL;
+    bool rm = !strcmp(base, "rm"), cp = !strcmp(base, "cp"), chmod_ = !strcmp(base, "chmod");
     bool owner = !strcmp(base, "chown") || !strcmp(base, "chgrp");
     bool ln = !strcmp(base, "ln"), rsync = !strcmp(base, "rsync"), inst = !strcmp(base, "install");
-    bool all = !strcmp(base, "touch") || !strcmp(base, "mkdir") || !strcmp(base, "rmdir") ||
-               !strcmp(base, "truncate");
-    if (!all && !chmod_ && !owner && !ln && !rsync && !inst) return NULL;
-    /* options whose separate value is not a file being written */
-    const char *valued = !strcmp(base, "touch") ? "rtdA" : !strcmp(base, "truncate") ? "sr"
-        : !strcmp(base, "mkdir") ? "m" : inst ? "mogSBf" : rsync ? "ef" : "";
-    bool symbolic = false, dirs = false, moves = false, opts = true, mode_seen = false;
-    const char *target = NULL;
+    bool symbolic = false, dirs = false, moves = false, recursive = false, opts = true, mode_seen = false;
+    const char *target = NULL, *err = NULL;
     char **p = malloc((size_t)(na + 1) * sizeof *p);
     int np = 0;
     for (int k = 0; k < na; k++) {
         char *w = a[k];
         if (opts && !strcmp(w, "--")) { opts = false; continue; }
+        if (opts && w[0] == '-' && w[1] == '-') {
+            const char *name = w + 2, *eq = strchr(name, '='), *val = eq ? eq + 1 : NULL;
+            size_t n = eq ? (size_t)(eq - name) : strlen(name);
+            if (sp->target && word_in("target-directory", name, n)) {
+                target = val ? val : k + 1 < na ? a[++k] : "";
+            } else if (word_in(sp->files, name, n)) {
+                if (!val && k + 1 < na) val = a[++k];
+                if (val && !target_ok(val, cwd)) err = E_OUTSIDE;
+            } else if (word_in(sp->values, name, n)) {
+                if (!val) k++;
+                if (word_in("reference", name, n)) mode_seen = true;
+            } else if (word_in(sp->flags, name, n) || word_in("help version verbose", name, n) ||
+                       (rsync && !strncmp(name, "no-", 3) && word_in(sp->flags, name + 3, n - 3))) {
+                if (word_in("symbolic", name, n)) symbolic = true;
+                if (word_in("directory", name, n)) dirs = true;
+                if (word_in("recursive", name, n)) recursive = true;
+                if (word_in("remove-source-files", name, n)) moves = true;
+            } else if (!g_cfg.outside_writes) err = E_OUTSIDE;
+            continue;
+        }
         if (opts && w[0] == '-' && w[1]) {
             if (chmod_ && strspn(w + 1, "rwxXst,+=ugoa") == strlen(w + 1)) { mode_seen = true; continue; }
-            if (!strncmp(w, "--reference=", 12)) mode_seen = true;
-            if (!strncmp(w, "--target-directory=", 19)) target = w + 19;
-            if (!strcmp(w, "--symbolic")) symbolic = true;
-            if (!strcmp(w, "--directory")) dirs = true;
-            if (!strcmp(w, "--remove-source-files")) moves = true;
-            if (w[1] == '-') continue;
-            if (ln && strchr(w, 's')) symbolic = true;
-            if (inst && strchr(w, 'd')) dirs = true;
-            if ((ln || inst) && !strcmp(w, "-t") && k + 1 < na) target = a[++k];
-            else if (strchr(valued, w[strlen(w) - 1])) k++;
+            for (const char *c = w + 1; *c; c++) {
+                if (ln && *c == 's') symbolic = true;
+                if (inst && *c == 'd') dirs = true;
+                if (rm && (*c == 'r' || *c == 'R')) recursive = true;
+                bool named = *c == sp->target;
+                if (!named && !strchr(sp->valued, *c)) continue;
+                const char *val = c[1] ? c + 1 : k + 1 < na ? a[++k] : "";
+                if (named) target = val;
+                else if (rsync && *c == 'T' && !target_ok(val, cwd)) err = E_OUTSIDE;
+                break;
+            }
             continue;
         }
         if ((chmod_ || owner) && !mode_seen) { mode_seen = true; continue; }
         p[np++] = w;
     }
-    const char *err = NULL;
-    if (target && !target_ok(target, cwd)) err = E_OUTSIDE;
+    if (!err && target && !target_ok(target, cwd)) err = E_OUTSIDE;
     for (int k = 0; !err && k < np; k++) {
         bool check;
         if (ln)           /* a hard link makes the source itself writable here */
@@ -361,8 +605,14 @@ static const char *check_operands(const char *base, char **a, int na, const char
             check = np > 1 && (moves || k == np - 1);
         else if (inst)
             check = dirs || (!target && np > 1 && k == np - 1);
+        else if (cp)
+            check = !target && np > 1 && k == np - 1;
         else check = true;
-        if (check && !target_ok(p[k], cwd)) err = E_OUTSIDE;
+        if (!check) continue;
+        if (rm && recursive) {
+            /* never / or ~, whatever else is allowed */
+            if (g_cfg.outside_writes ? root_like(p[k], cwd) : !target_ok(p[k], cwd)) err = E_RULE;
+        } else if (!target_ok(p[k], cwd)) err = E_OUTSIDE;
     }
     free(p);
     return err;
@@ -394,6 +644,9 @@ static const char *check_simple(char **v, int n, const char *cwd, int depth) {
     if (!strcmp(base, "sudo") || !strcmp(base, "doas") || !strcmp(base, "shutdown") ||
         !strcmp(base, "reboot") || !strncmp(base, "mkfs", 4))
         return E_RULE;
+    if (!strncmp(base, "flywheel", 8))            /* a model must not opt itself out */
+        for (int k = 0; k < na; k++)
+            if (!strcmp(a[k], "--allow-outside-writes")) return E_RULE;
     if (!strcmp(base, "eval")) {                  /* eval joins its arguments */
         size_t len = 1;
         for (int k = 0; k < na; k++) len += strlen(a[k]) + 1;
@@ -423,48 +676,10 @@ static const char *check_simple(char **v, int n, const char *cwd, int depth) {
         return NULL;
     }
     if (!strcmp(base, "find")) return check_find(a, na, cwd, depth);
-    if (!strcmp(base, "sed") || !strcmp(base, "gsed")) return check_inplace(false, a, na, cwd);
-    if (!strcmp(base, "perl")) return check_inplace(true, a, na, cwd);
+    if (!strcmp(base, "sed") || !strcmp(base, "gsed")) return check_sed(a, na, cwd);
+    if (!strcmp(base, "perl")) return check_perl(a, na, cwd);
     if (!strcmp(base, "git")) return check_git(a, na, cwd);
-    bool rm = !strcmp(base, "rm"), tee = !strcmp(base, "tee");
-    bool cp = !strcmp(base, "cp"), mv = !strcmp(base, "mv");
-    if (!rm && !tee && !cp && !mv) return check_operands(base, a, na, cwd);
-    bool recursive = false, opts = true;
-    const char *target = NULL, *last = NULL;
-    int nargs = 0;
-    for (int k = 0; k < na; k++) {
-        const char *w = a[k];
-        if (opts && !strcmp(w, "--")) { opts = false; continue; }
-        if (opts && w[0] == '-' && w[1]) {
-            if (!strcmp(w, "--recursive") || (w[1] != '-' && (strchr(w, 'r') || strchr(w, 'R'))))
-                recursive = true;
-            if ((cp || mv) && !strcmp(w, "-t") && k + 1 < na) target = a[++k];
-            if ((cp || mv) && !strncmp(w, "--target-directory=", 19)) target = w + 19;
-            continue;
-        }
-        nargs++;
-        last = w;
-        if (tee && !path_ok(w, cwd)) return E_OUTSIDE;
-        if (mv && !path_ok(w, cwd)) return E_OUTSIDE;
-    }
-    if (rm && recursive) {
-        opts = true;
-        for (int k = 0; k < na; k++) {
-            if (opts && !strcmp(a[k], "--")) { opts = false; continue; }
-            if (opts && a[k][0] == '-') continue;
-            if (!target_ok(a[k], cwd)) return E_RULE;
-        }
-    } else if (rm) {
-        opts = true;
-        for (int k = 0; k < na; k++) {
-            if (opts && !strcmp(a[k], "--")) { opts = false; continue; }
-            if (opts && a[k][0] == '-' && a[k][1]) continue;
-            if (!target_ok(a[k], cwd)) return E_OUTSIDE;
-        }
-    }
-    if ((cp || mv) && target && !path_ok(target, cwd)) return E_OUTSIDE;
-    if (cp && !target && nargs >= 2 && !path_ok(last, cwd)) return E_OUTSIDE;
-    return NULL;
+    return check_operands(base, a, na, cwd);
 }
 
 /* Walk a script: split into simple commands, check redirect targets, skip
@@ -913,6 +1128,15 @@ static bool has_sig_format(const char *s) {
     return false;
 }
 
+/* one of `want` in a short option cluster, before any attached value */
+static bool has_letter(const char *a, const char *want, const char *valued) {
+    for (a++; *a; a++) {
+        if (strchr(want, *a)) return true;
+        if (strchr(valued, *a)) break;
+    }
+    return false;
+}
+
 /* read-only-looking commands whose flags can write or execute */
 static bool has_mutating_args(const char *cmd) {
     char *arena = malloc(2 * strlen(cmd) + 2), *top = arena;
@@ -934,11 +1158,21 @@ static bool has_mutating_args(const char *cmd) {
     bool file = !strcmp(c, "file"), pf = !strcmp(c, "printf");
     bool tst = !strcmp(c, "test") || !strcmp(c, "[");
     bool tsc = !strcmp(c, "npx") && n > 1 && !strcmp(v[1], "tsc"), noemit = false;
+    bool grep = !strcmp(c, "grep"), ls = !strcmp(c, "ls"), perl = !strncmp(c, "perl", 4);
     bool opts = true;
     int plain = 0;
     for (int i = 1; i < n && !bad; i++) {
         const char *a = v[i];
         bool shortopt = a[0] == '-' && a[1] != '-';
+        /* recursive reads that follow symlinks can leave the project */
+        if (grep && (abbrev(a, "--dereference-recursive", 5) || (shortopt && has_letter(a, "RS", "efmABCDd"))))
+            bad = true;
+        if (rg && (!strcmp(a, "--follow") || (shortopt && has_letter(a, "L", "efgtTABCmMjdEr")))) bad = true;
+        if (fd && (!strcmp(a, "--follow") || (shortopt && has_letter(a, "L", "deEtScoj")))) bad = true;
+        if (find && (!strcmp(a, "-follow") || (shortopt && strspn(a + 1, "HLPEXdsx") == strlen(a + 1) &&
+                                               strchr(a, 'L')))) bad = true;
+        if (ls && (abbrev(a, "--dereference", 5) || (shortopt && has_letter(a, "L", "wTI")))) bad = true;
+        if (perl && shortopt && (strchr(a, 'e') || strchr(a, 'E'))) bad = true;   /* opaque code */
         if ((find || fd || sort || rg || git) && (strchr(a, '$') || strchr(a, '{'))) bad = true;
         if (find && (!strcmp(a, "-delete") || !strncmp(a, "-exec", 5) || !strncmp(a, "-ok", 3) ||
                      !strncmp(a, "-fprint", 7) || !strcmp(a, "-fls"))) bad = true;
@@ -1000,6 +1234,46 @@ static bool read_inside(const char *p) {
     return lex_normalize(abs, norm, sizeof norm) && (is_within(cwd, norm) || is_within(root, norm));
 }
 
+/* grep/rg: the first operand is the pattern unless -e/-f gave one. Options
+   not listed here may shift that position, so then nothing is skipped. */
+static bool grep_reads_outside(const char *p, bool rg, char *buf) {
+    static const char *const flags[] = {"--recursive", "--line-number", "--ignore-case", "--count",
+        "--files-with-matches", "--word-regexp", "--fixed-strings", "--extended-regexp", "--hidden",
+        "--no-ignore", "--smart-case", "--color", NULL};
+    const char *valued = rg ? "efgtTABCmMjdEr" : "efmABCDd";
+    bool given = false, unknown = false, opts = true, out = false;
+    char next = 0;   /* option letter waiting for its value */
+    char *first = NULL;
+    while (!out && *p) {
+        if (strchr(" \t()", *p)) { p++; continue; }
+        read_word(&p, buf, NULL);
+        if (next) {
+            if (next == 'f') out = !read_inside(buf);
+            next = 0;
+        } else if (opts && !strcmp(buf, "--")) opts = false;
+        else if (opts && buf[0] == '-' && buf[1] == '-') {
+            const char *eq = strchr(buf, '=');
+            if (!strncmp(buf, "--regexp", 8) || !strncmp(buf, "--file=", 7) || !strcmp(buf, "--file"))
+                given = true;
+            else if (!eq && !one_of(buf, flags)) unknown = true;
+            if (!strcmp(buf, "--regexp")) next = 'e';
+            else if (eq && strncmp(buf, "--regexp=", 9)) out = !read_inside(eq + 1);
+        } else if (opts && buf[0] == '-' && buf[1]) {
+            for (const char *c = buf + 1; *c; c++) {
+                if (!strchr(valued, *c)) continue;
+                if (*c == 'e' || *c == 'f') given = true;
+                if (!c[1]) next = *c;
+                else if (*c == 'f') out = !read_inside(c + 1);
+                break;
+            }
+        } else if (!first) first = str_dup(buf);   /* judged once -e/-f are known */
+        else out = !read_inside(buf);
+    }
+    if (!out && first && (given || unknown)) out = !read_inside(first);
+    free(first);
+    return out;
+}
+
 /* a builtin reader given a path outside the project must prompt */
 static bool reads_outside(const char *cmd) {
     static const char *const readers[] = {"ls", "cat", "grep", "rg", "find", "fd", "head", "tail",
@@ -1007,17 +1281,22 @@ static bool reads_outside(const char *cmd) {
     char *buf = malloc(strlen(cmd) + 1);
     const char *p = cmd;
     read_word(&p, buf, NULL);
-    bool out = false, cut = !strcmp(buf, "cut"), sort = !strcmp(buf, "sort");
-    if (one_of(buf, readers))
+    bool out = false, cut = !strcmp(buf, "cut"), sort = !strcmp(buf, "sort"), skip = false;
+    if (!strcmp(buf, "grep") || !strcmp(buf, "rg"))
+        out = grep_reads_outside(p, buf[0] == 'r', buf);
+    else if (one_of(buf, readers))
         while (!out && *p) {
             if (strchr(" \t()", *p)) { p++; continue; }
             read_word(&p, buf, NULL);
+            if (skip) { skip = false; continue; }
             const char *path = buf;
             if (buf[0] == '-' && buf[1]) {
                 const char *eq = strchr(buf, '=');
                 if (buf[1] == '-') path = eq ? eq + 1 : "";
-                else if ((cut && buf[1] == 'd') || (sort && buf[1] == 't')) path = "";   /* delimiter */
-                else {   /* attached value: -f/etc/x, -nf../x */
+                else if ((cut && buf[1] == 'd') || (sort && buf[1] == 't')) {
+                    skip = !buf[2];                      /* separate delimiter */
+                    path = "";
+                } else {   /* attached value: -f/etc/x, -nf../x */
                     path = buf + 1 + strcspn(buf + 1, "/~.");
                 }
             }
@@ -1052,55 +1331,43 @@ void perm_add_rule(const char *rule) {
     if (f) { fprintf(f, "%s\n", rule); fclose(f); }
 }
 
-/* would remembering this command's prefix whitelist arbitrary code? */
-static bool runs_inline_code(const char *cmd) {
-    static const char *const interp[] = {"sh", "bash", "zsh", "dash", "ksh", "fish", "ruby", "perl",
-        "php", "lua", "awk", "gawk", "osascript", "deno", "bun", "swift", "tclsh", "Rscript", "env",
-        "xargs", "eval", "exec", "command", "nohup", "nice", "timeout", "setsid", "time", "source",
-        ".", "ssh", "su", "parallel", NULL};
-    char *a = malloc(strlen(cmd) + 1), *b = malloc(strlen(cmd) + 1);
-    const char *p = cmd;
-    while (*p == ' ' || *p == '\t') p++;
-    read_word(&p, a, NULL);
-    while (*p == ' ' || *p == '\t') p++;
-    read_word(&p, b, NULL);
-    const char *base = strrchr(a, '/') ? strrchr(a, '/') + 1 : a;
-    bool script = !strcmp(a, "python") || !strcmp(a, "python3") || !strcmp(a, "node");
-    bool multi = script || !strcmp(a, "git") || !strcmp(a, "npx") || !strcmp(a, "npm") ||
-                 !strcmp(a, "brew") || !strcmp(a, "go") || !strcmp(a, "cargo");
-    bool bad = one_of(base, interp) || strstr(cmd, "--eval") != NULL;
-    /* the rule is "tool second-word": a flag or nothing there covers any code */
-    if (multi && (*b == '-' || !*b)) bad = true;
-    /* python3.12, /usr/bin/node, nodejs: same interpreters under other names */
-    size_t stem = !strncmp(base, "python", 6) ? 6 : !strncmp(base, "nodejs", 6) ? 6
-                : !strncmp(base, "node", 4) ? 4 : 0;
-    if (!script && stem && !base[stem + strspn(base + stem, "0123456789.")]) bad = true;
-    if (!strcmp(a, "npm") && (!strcmp(b, "exec") || !strcmp(b, "x"))) bad = true;
-    free(a);
-    free(b);
-    return bad;
-}
+/* "always" rules are only offered for these: tools whose second word is a
+   fixed subcommand, and a few that cannot run other code. */
+static const struct { const char *tool, *subs; } SUBCMDS[] = {
+    {"git", "status log diff show add commit fetch branch blame rev-parse ls-files describe"},
+    {"npm", "test ls run"},
+    {"npx", "vitest jest tsc eslint prettier"},
+    {"go", "build test vet fmt"},
+    {"cargo", "build test check clippy fmt"},
+    {"brew", "list info search"},
+    {"pip", "list show"},
+    {"pip3", "list show"},
+    {"docker", "ps images"},
+    {"kubectl", "get describe"},
+};
+static const char *PLAIN_TOOLS = "rm rmdir mkdir touch cp mv ln chmod uname whoami id du df diff cmp "
+    "basename dirname realpath readlink md5 md5sum shasum sha256sum";
 
-/* "always" rule derived from a command: first token, or first two
-   tokens for multiword tools. "" = nothing safe to remember. */
+/* "always" rule derived from a command: the tool, or tool and subcommand
+   ("npm run" also needs the script name). "" = nothing safe to remember. */
 char *perm_prefix(const char *cmd) {
-    while (*cmd == ' ') cmd++;
-    if (runs_inline_code(cmd)) return str_dup("");
-    static const char *two[] = {"git", "npx", "npm", "brew", "go", "cargo", "python3", "python", "node", NULL};
-    char first[128] = {0};
-    int i = 0;
-    while (cmd[i] && cmd[i] != ' ' && cmd[i] != '\t' && i < 127) { first[i] = cmd[i]; i++; }
-    bool two_tok = false;
-    for (int j = 0; two[j]; j++) if (!strcmp(first, two[j])) two_tok = true;
-    if (!two_tok) return str_dup(first);
-    char out[260];
-    snprintf(out, sizeof out, "%s", first);
-    const char *p = cmd + i;
-    while (*p == ' ' || *p == '\t') p++;
-    int k = strlen(out);
-    out[k++] = ' ';
-    while (*p && *p != ' ' && *p != '\t' && k < 250) out[k++] = *p++;
-    out[k] = 0;
+    char w[3][96] = {{0}};
+    for (int i = 0; i < 3; i++) {
+        while (*cmd == ' ' || *cmd == '\t') cmd++;
+        size_t n = strcspn(cmd, " \t");
+        if (n < sizeof w[i]) memcpy(w[i], cmd, n);
+        cmd += n;
+    }
+    char out[300] = {0};
+    if (word_in(PLAIN_TOOLS, w[0], strlen(w[0])) && w[0][0]) snprintf(out, sizeof out, "%s", w[0]);
+    for (size_t i = 0; i < sizeof SUBCMDS / sizeof *SUBCMDS; i++) {
+        if (strcmp(w[0], SUBCMDS[i].tool) || !w[1][0] || !word_in(SUBCMDS[i].subs, w[1], strlen(w[1])))
+            continue;
+        if (strcmp(w[0], "npm") || strcmp(w[1], "run"))
+            snprintf(out, sizeof out, "%s %s", w[0], w[1]);
+        else if (w[2][0] && w[2][0] != '-')
+            snprintf(out, sizeof out, "%s %s %s", w[0], w[1], w[2]);
+    }
     return str_dup(out);
 }
 

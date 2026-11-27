@@ -490,7 +490,9 @@ static void security_tests(const char *dir, const char *cmd) {
     close_modal(s);
     CHECK(s, "esc option: modal", open_modal(s, "SEC_OPT"));
     pump(s, 150);
-    CHECK(s, "esc option: option 2 shows ESC visibly", find_row(s, "ask again for `ev^[[2Jil`") >= 0);
+    CHECK(s, "esc option: body shows ESC visibly", find_row(s, "ev^[[2Jil arg") >= 0);
+    CHECK(s, "esc option: no always option for an unlisted tool",
+          find_row(s, "ask again") < 0 && find_row(s, "2. No") >= 0);
     close_modal(s);
 
     /* type-ahead */
