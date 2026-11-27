@@ -1229,8 +1229,9 @@ static void sb_pin_above(Sb *b, const char *path) {
 }
 
 /* where `path` leads, also when its tail does not exist yet: the deepest
-   existing ancestor is resolved and dangling links are followed. out holds
-   PATH_MAX bytes. */
+   existing ancestor is resolved and dangling links are followed. Lenient about
+   what cannot be searched: for the secret rules only. out holds PATH_MAX
+   bytes. */
 static bool sbx_resolve(const char *path, char *out, int depth) {
     if (realpath(path, out)) return true;
     char parent[PATH_MAX], real[PATH_MAX], link[PATH_MAX], next[PATH_MAX];
@@ -1415,25 +1416,160 @@ static bool first_line(const char *path, char *out, size_t cap) {
     return *out != 0;
 }
 
+/* ----- the way to a protected file -----
+   A rule on the target means nothing if a link or a gitfile on the way can be
+   repointed, so every step is looked at, never through realpath. */
+
+typedef enum {
+    N_PIN,      /* a directory on the way: must stay where it is */
+    N_LINK,     /* a link on the way: closed */
+    N_ENTRY,    /* a gitfile, or what is not a directory yet: closed */
+    N_CLOSED    /* a protected file, or one not there yet: closed with all below */
+} Node;
+typedef void (*NodeFn)(Node kind, const char *path, void *arg);
+
+static char sbx_blocked[PATH_MAX];   /* what could not be followed or read */
+
+static bool cannot(const char *path) {
+    snprintf(sbx_blocked, sizeof sbx_blocked, "%s", path);
+    return false;
+}
+
+static bool absent(void) { return errno == ENOENT || errno == ENOTDIR; }
+
+/* Follow the absolute path one component at a time, reporting every step. A
+   final directory is only pinned unless `closed`. False, naming the place, for
+   a loop and for anything that cannot be looked at. out: where it leads,
+   PATH_MAX bytes. */
+static bool walk(const char *path, bool closed, char *out, NodeFn fn, void *arg) {
+    char rest[PATH_MAX], next[PATH_MAX], link[PATH_MAX];
+    if (snprintf(rest, sizeof rest, "%s", path) >= (int)sizeof rest) return cannot(path);
+    struct stat st;
+    bool there = true;
+    int hops = 0;
+    out[0] = 0;
+    for (char *s = rest;;) {
+        s += strspn(s, "/");
+        if (!*s) break;
+        size_t len = strcspn(s, "/"), at = strlen(out);
+        bool more = s[len + strspn(s + len, "/")] != 0;
+        if (len <= 2 && !strncmp(s, "..", len)) {
+            char *up = strrchr(out, '/');
+            if (len == 2 && up) *up = 0;
+            s += len;
+            continue;
+        }
+        if (at + len + 2 > PATH_MAX) return cannot(path);
+        snprintf(out + at, PATH_MAX - at, "/%.*s", (int)len, s);
+        s += len;
+        if (there && lstat(out, &st)) {
+            if (!absent()) return cannot(out);
+            there = false;
+        }
+        if (there && S_ISLNK(st.st_mode)) {
+            ssize_t n = readlink(out, link, sizeof link - 1);
+            if (n < 0 || ++hops > 32) return cannot(out);
+            link[n] = 0;
+            fn(N_LINK, out, arg);
+            if (snprintf(next, sizeof next, "%s%s", link, s) >= (int)sizeof next) return cannot(out);
+            memcpy(rest, next, sizeof rest);
+            s = rest;
+            out[*link == '/' ? 0 : at] = 0;
+            continue;
+        }
+        if (!more) continue;
+        if (there && S_ISDIR(st.st_mode)) fn(N_PIN, out, arg);
+        else {
+            there = false;
+            fn(N_ENTRY, out, arg);
+        }
+    }
+    if (!*out) snprintf(out, PATH_MAX, "/");
+    if (there && lstat(out, &st)) {
+        if (!absent()) return cannot(out);
+        there = false;
+    }
+    fn(closed || !there ? N_CLOSED : S_ISDIR(st.st_mode) ? N_PIN : N_ENTRY, out, arg);
+    return true;
+}
+
+static void no_node(Node kind, const char *path, void *arg) {
+    (void)kind;
+    (void)path;
+    (void)arg;
+}
+
 /* The root's git directory when .git only leads to it: a link, or a "gitdir:"
-   file. The rules by name do not see it. False if there is none; *bad if it
-   cannot be followed. out holds PATH_MAX bytes. */
-static bool gitdir_elsewhere(const char *proj, char *out, bool *bad) {
+   file. The rules by name do not see it. 1 with out (PATH_MAX bytes), 0 if
+   there is none, -1 if it cannot be followed or read. */
+static int gitdir_elsewhere(const char *proj, char *out, NodeFn fn, void *arg) {
     char git[PATH_MAX], at[PATH_MAX], line[PATH_MAX], next[PATH_MAX];
     struct stat st;
-    *bad = false;
-    if (snprintf(git, sizeof git, "%s/.git", proj) >= (int)sizeof git) { *bad = true; return false; }
-    if (lstat(git, &st) || S_ISDIR(st.st_mode)) return false;
-    if (!sbx_resolve(git, at, 0)) { *bad = true; return false; }
-    if (stat(at, &st) || S_ISDIR(st.st_mode)) {
+    if (snprintf(git, sizeof git, "%s/.git", proj) >= (int)sizeof git) { cannot(proj); return -1; }
+    if (lstat(git, &st)) return absent() ? 0 : (cannot(git), -1);
+    if (S_ISDIR(st.st_mode)) return 0;
+    if (!walk(git, false, at, fn, arg)) return -1;
+    bool missing = stat(at, &st) != 0;
+    if (missing && !absent()) { cannot(at); return -1; }
+    if (missing || S_ISDIR(st.st_mode)) {
         snprintf(out, PATH_MAX, "%s", at);
-        return true;
+        return 1;
     }
-    if (!first_line(at, line, sizeof line) || strncmp(line, "gitdir: ", 8)) return false;
+    if (!S_ISREG(st.st_mode)) return 0;
+    if (read_small(at, line, sizeof line) < 0) { cannot(at); return -1; }
+    line[strcspn(line, "\r\n")] = 0;
+    if (strncmp(line, "gitdir: ", 8)) return 0;
     const char *rel = line + 8;
     if (snprintf(next, sizeof next, "%s%s%s", *rel == '/' ? "" : proj, *rel == '/' ? "" : "/", rel)
-        >= (int)sizeof next || !sbx_resolve(next, out, 0)) { *bad = true; return false; }
+        >= (int)sizeof next) { cannot(at); return -1; }
+    return walk(next, false, out, fn, arg) ? 1 : -1;
+}
+
+/* what makes git run something, in a git directory */
+static const char *const GIT_CLOSED[] = {
+    "config", "config.worktree", "commondir", "hooks", "rebase-merge", "rebase-apply",
+    "sequencer", NULL
+};
+
+static bool walk_files(const char *dir, const char *const *names, NodeFn fn, void *arg) {
+    char p[PATH_MAX], out[PATH_MAX];
+    for (int i = 0; names[i]; i++) {
+        if (snprintf(p, sizeof p, "%s/%s", dir, names[i]) >= (int)sizeof p) return cannot(dir);
+        if (!walk(p, true, out, fn, arg)) return false;
+    }
     return true;
+}
+
+/* the directory a git directory's commondir file names, and its files */
+static bool walk_common(const char *gitdir, NodeFn fn, void *arg) {
+    char file[PATH_MAX], line[PATH_MAX], next[PATH_MAX], out[PATH_MAX];
+    struct stat st;
+    if (snprintf(file, sizeof file, "%s/commondir", gitdir) >= (int)sizeof file) return cannot(gitdir);
+    if (stat(file, &st)) return absent() || cannot(file);
+    if (!S_ISREG(st.st_mode)) return true;
+    if (!realpath(file, out) || read_small(out, line, sizeof line) < 0) return cannot(file);
+    line[strcspn(line, "\r\n")] = 0;
+    if (!*line) return true;
+    if (snprintf(next, sizeof next, "%s%s%s", *line == '/' ? "" : gitdir, *line == '/' ? "" : "/", line)
+        >= (int)sizeof next) return cannot(file);
+    return walk(next, false, out, fn, arg) && walk_files(out, GIT_CLOSED, fn, arg);
+}
+
+/* every step to every protected file of the project: SBX_PROJ, and the same
+   files wherever .git, gitdir: and commondir lead */
+static bool each_protected(const char *proj, NodeFn fn, void *arg) {
+    char p[PATH_MAX], other[PATH_MAX];
+    struct stat st;
+    if (!walk_files(proj, SBX_PROJ, fn, arg)) return false;
+    int moved = gitdir_elsewhere(proj, other, fn, arg);
+    if (moved < 0) return false;
+    if (moved && !walk_files(other, GIT_CLOSED, fn, arg)) return false;
+    if (!moved) {
+        if (snprintf(p, sizeof p, "%s/.git", proj) >= (int)sizeof p) return cannot(proj);
+        if (stat(p, &st)) return absent() || cannot(p);
+        if (!S_ISDIR(st.st_mode)) return true;
+    }
+    return walk_common(moved ? other : p, fn, arg);
 }
 
 /* ---------- linked worktree: git keeps its files outside the project ---------- */
@@ -1475,24 +1611,35 @@ static const char *const LINKED_CLOSED[] = {
     "rebase-merge", "rebase-apply", "sequencer", NULL
 };
 
-static void sb_linked_deny(Sb *b, const Linked *w, bool pins) {
-    char p[PATH_MAX];
+static bool walk_linked(const Linked *w, NodeFn fn, void *arg) {
+    char p[PATH_MAX], out[PATH_MAX];
     for (int h = 0; h < 2; h++)
         for (int i = 0; LINKED_CLOSED[i]; i++) {
-            if (snprintf(p, sizeof p, "%s/%s", h ? w->common : w->dir, LINKED_CLOSED[i]) >= (int)sizeof p)
-                b->full = true;
+            const char *dir = h ? w->common : w->dir;
             if (h && !strcmp(LINKED_CLOSED[i], "modules")) continue;
-            if (pins) sb_pin_above(b, p);
-            else sb_path(b, p);
+            if (snprintf(p, sizeof p, "%s/%s", dir, LINKED_CLOSED[i]) >= (int)sizeof p) return cannot(dir);
+            if (!walk(p, true, out, fn, arg)) return false;
         }
+    return true;
 }
 
-/* the SBX_PROJ files of the project: closed, along with what they link to and
-   every directory leading there. Without a real .git directory nothing may
-   create or change .git, or a prepared one could be moved into place. other is
-   the git directory .git leads to, or NULL. */
-static void sb_project(Sb *b, const char *proj, bool repo, const char *other, const Linked *linked) {
-    char p[PATH_MAX], target[PATH_MAX];
+typedef struct { Sb *b; bool pins; } Rules;
+
+static void sb_node(Node kind, const char *path, void *arg) {
+    const Rules *r = arg;
+    if (r->pins) {
+        if (kind == N_PIN) sb_pin(r->b, path);
+    } else if (kind == N_CLOSED) sb_path(r->b, path);
+    else if (kind != N_PIN && strncmp(path, "/dev/", 5)) sb_pin(r->b, path);
+}
+
+/* the protected files of the project: closed, along with every link and gitfile
+   on the way there, and every directory on the way pinned. Without a real .git
+   directory nothing may create or change .git, or a prepared one could be moved
+   into place. */
+static void sb_project(Sb *b, const char *proj, bool repo, const Linked *linked) {
+    char p[PATH_MAX];
+    Rules r = {b, false};
     /* a root that is already a bare repository */
     static const char *const bare[] = {"config", "config.worktree", "commondir", "hooks",
                                        "rebase-merge", "rebase-apply", "sequencer", NULL};
@@ -1507,19 +1654,9 @@ static void sb_project(Sb *b, const char *proj, bool repo, const char *other, co
     for (int i = 0; SBX_PROJ[i]; i++) {
         if (snprintf(p, sizeof p, "%s/%s", proj, SBX_PROJ[i]) >= (int)sizeof p) b->full = true;
         sb_path(b, p);
-        if (!sbx_resolve(p, target, 0)) b->full = true;
-        else if (strcmp(p, target)) sb_path(b, target);
     }
-    /* a git directory not made yet cannot be prepared and moved in */
-    struct stat st;
-    if (other && lstat(other, &st)) {
-        sb_path(b, other);
-        snprintf(p, sizeof p, "%s", other);
-        for (char *s; (s = strrchr(p, '/')) && s != p; ) {
-            *s = 0;
-            if (lstat(p, &st)) sb_filter(b, "literal", p);
-        }
-    }
+    if (!each_protected(proj, sb_node, &r) || (linked && !walk_linked(linked, sb_node, &r)))
+        b->full = true;
     /* once .git is not valid, a HEAD (in any case) makes the root itself a
        repository, and a command can make it so: never one in the root */
     for (int m = 0; m < 16; m++) {
@@ -1528,19 +1665,11 @@ static void sb_project(Sb *b, const char *proj, bool repo, const char *other, co
         if (snprintf(p, sizeof p, "%s/%s", proj, head) >= (int)sizeof p) b->full = true;
         sb_filter(b, "literal", p);
     }
-    if (linked) sb_linked_deny(b, linked, false);
     sb_add(b, ")(deny file-write-unlink");
     sb_pin(b, proj);
-    for (int i = 0; SBX_PROJ[i]; i++) {
-        snprintf(p, sizeof p, "%s/%s", proj, SBX_PROJ[i]);
-        sb_pin_above(b, p);
-        if (sbx_resolve(p, target, 0) && strcmp(p, target)) sb_pin_above(b, target);
-    }
-    if (linked) sb_linked_deny(b, linked, true);
-    if (other) {
-        sb_pin(b, other);
-        sb_pin_above(b, other);
-    }
+    r.pins = true;
+    if (!each_protected(proj, sb_node, &r) || (linked && !walk_linked(linked, sb_node, &r)))
+        b->full = true;
     each_secret(sb_pin_secret, b);
     sb_add(b, ")");
 }
@@ -1675,15 +1804,16 @@ static void sb_names(Sb *b, const char *proj, bool repo, const char *other) {
    run. tmp and mark may be NULL. */
 static char *sbx_profile(const char *cwd, const char *tmp, bool net, const char *mark) {
     char proj[PATH_MAX], rtmp[PATH_MAX], git[PATH_MAX];
+    *sbx_blocked = 0;
     if (!cwd || !realpath(cwd, proj)) return NULL;
     if (tmp && !realpath(tmp, rtmp)) return NULL;
     struct stat st;
     if (snprintf(git, sizeof git, "%s/.git", proj) >= (int)sizeof git) return NULL;
     bool repo = !lstat(git, &st) && S_ISDIR(st.st_mode);
     char elsewhere[PATH_MAX];
-    bool bad;
-    const char *other = gitdir_elsewhere(proj, elsewhere, &bad) ? elsewhere : NULL;
-    if (bad) return NULL;
+    int moved = gitdir_elsewhere(proj, elsewhere, no_node, NULL);
+    if (moved < 0) return NULL;
+    const char *other = moved ? elsewhere : NULL;
     Sb b = {.s = malloc(SBX_CAP)};
     b.s[0] = 0;
     sb_add(&b,
@@ -1709,7 +1839,7 @@ static char *sbx_profile(const char *cwd, const char *tmp, bool net, const char 
     sb_add(&b, "(deny file-read* file-write*");
     each_secret(sb_deny_secret, &b);
     sb_add(&b, ")");
-    sb_project(&b, proj, repo, other, linked ? &w : NULL);
+    sb_project(&b, proj, repo, linked ? &w : NULL);
     sb_names(&b, proj, repo, other);
     /* names this command's processes, so that all of them can be found later */
     if (mark) {
@@ -1867,9 +1997,14 @@ static char *run_command(const char *cmd, const char *cwd, int timeout_s, int *c
             clock_gettime(CLOCK_REALTIME, &ts);
             if (net) snprintf(mark, sizeof mark, "fw.mark.%ld.%ld.%09ld.%u", (long)getpid(),
                               (long)ts.tv_sec, ts.tv_nsec, ++runs);
+            *sbx_blocked = 0;
             if (each_secret(secret_unresolved, NULL)
-                || !(prof = sbx_profile(cwd, tmp, net, *mark ? mark : NULL)))
-                return str_dup("error: cannot set up the sandbox for this directory — not executed");
+                || !(prof = sbx_profile(cwd, tmp, net, *mark ? mark : NULL))) {
+                char why[PATH_MAX + 128];
+                snprintf(why, sizeof why, "error: cannot set up the sandbox for this directory%s%s"
+                         " — not executed", *sbx_blocked ? ": cannot follow or read " : "", sbx_blocked);
+                return str_dup(why);
+            }
         }
         sbx_env(env, tmp);
     }
@@ -2538,19 +2673,35 @@ const char *resolve_confined(const char *cwd, const char *path, char *out, size_
     return NULL;
 }
 
+typedef struct { const char *abs; bool hit; } Guard;
+
+/* abs is link-free, so a link on the way never is it */
+static void guard_node(Node kind, const char *path, void *arg) {
+    Guard *g = arg;
+    if ((kind == N_ENTRY || kind == N_CLOSED) && path_under(path, g->abs)) g->hit = true;
+}
+
 /* the file tools run outside the sandbox: they keep its SBX_PROJ rule, and for
    what is below the root, the same names the sandbox closes */
 static const char *protected_write(const char *cwd, const char *abs) {
     static const char *const why =
         "error: this file can run code outside the sandbox (.envrc, git hooks and config)";
-    char root[PATH_MAX], p[PATH_MAX], target[PATH_MAX], other[PATH_MAX];
+    static char unsure[PATH_MAX + 64];
+    char root[PATH_MAX], p[PATH_MAX], other[PATH_MAX];
     if (!realpath(cwd, root)) return NULL;
     for (int i = 0; SBX_PROJ[i]; i++) {
         if (snprintf(p, sizeof p, "%s/%s", root, SBX_PROJ[i]) >= (int)sizeof p) return why;
-        if (path_under(p, abs) || !sbx_resolve(p, target, 0) || path_under(target, abs)) return why;
+        if (path_under(p, abs)) return why;
     }
-    bool bad, moved = gitdir_elsewhere(root, other, &bad);
-    if (bad) return why;
+    Guard g = {abs, false};
+    *sbx_blocked = 0;
+    int moved = each_protected(root, guard_node, &g)
+                ? gitdir_elsewhere(root, other, no_node, NULL) : -1;
+    if (moved < 0) {
+        snprintf(unsure, sizeof unsure, "error: cannot follow or read %s — not written", sbx_blocked);
+        return unsure;
+    }
+    if (g.hit) return why;
     struct stat st;
     snprintf(p, sizeof p, "%s/.git", root);
     bool any = !lstat(p, &st);

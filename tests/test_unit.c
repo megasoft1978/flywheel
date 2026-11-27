@@ -2798,6 +2798,110 @@ static void test_root_bare(void) {
     free(old);
 }
 
+/* each way git can be led to its files: nothing on the way can be repointed
+   at a repository the command built */
+static void test_git_chains(void) {
+    char base[PATH_MAX], home[PATH_MAX], proj[PATH_MAX];
+    char *old = review_dirs(base, home, proj);
+    if (!old) { T("mkdtemp", false); return; }
+    static const char *const repo = "git init -q . && git config user.name t && git config user.email t@t"
+                                    " && git commit -qm one --allow-empty";
+    /* setup outside, then the command's attempt to repoint */
+    static const struct { const char *name, *setup, *attempt, *file, *text; } chain[] = {
+        {"link-gitfile", "mv .git real && echo 'gitdir: real' > gf && ln -s gf .git",
+         "echo 'gitdir: evil' > gf", "gf", "gitdir: evil\n"},
+        {"gitfile-link", "mv .git real && ln -s real L && echo 'gitdir: L' > .git",
+         "rm L && ln -s evil L; mv -h $PWD/n L", "L/x", NULL},
+        {"link-link", "mv .git real && ln -s real L && ln -s L .git",
+         "rm L && ln -s evil L", "L/x", NULL},
+        {"hooks-link", "mkdir -p real/hooks && ln -s real s && rm -rf .git/hooks && ln -s ../s/hooks .git/hooks",
+         "rm s && ln -s evil s", "s/x", NULL},
+        {"dotdot", "mkdir d && mv .git real && echo 'gitdir: d/../real' > .git",
+         "mv d d2; rmdir d; ln -s evil/sub d", "d", NULL},
+        {"gitdir-hooks-link", "mv .git real && echo 'gitdir: real' > .git && mkdir sh && rm -rf real/hooks"
+         " && ln -s ../sh real/hooks", "echo evil > sh/pre-commit", "sh/pre-commit", "evil\n"},
+        {"commondir", "mkdir c && mv .git real"
+         " && mkdir g && cp real/HEAD g/ && echo ../c/l2 > g/commondir && ln -s ../real c/l2"
+         " && echo 'gitdir: g' > .git", "rm c/l2 && ln -s ../evil c/l2", "c/l2/x", NULL},
+    };
+    for (int i = 0; i < (int)(sizeof chain / sizeof *chain); i++) {
+        char dir[PATH_MAX], cmd[600];
+        snprintf(dir, sizeof dir, "%s/%s", base, chain[i].name);
+        mkdir(dir, 0700);
+        host(dir, repo);
+        host(dir, chain[i].setup);
+        in_dir(dir);
+        snprintf(cmd, sizeof cmd, "mkdir -p evil/sub evil/hooks evil/real n; %s", chain[i].attempt);
+        char *o = run_bash(cmd, dir, 30);
+        T(chain[i].name, strncmp(o, "error:", 6));   /* it did run */
+        free(o);
+        struct stat st;
+        if (!strcmp(chain[i].name, "link-gitfile"))
+            T(chain[i].name, !holds(under(dir, chain[i].file), chain[i].text));
+        else if (!strcmp(chain[i].name, "gitdir-hooks-link"))
+            T(chain[i].name, gone(dir, chain[i].file));
+        else if (!strcmp(chain[i].name, "dotdot"))
+            T(chain[i].name, !lstat(under(dir, "d"), &st) && S_ISDIR(st.st_mode) && gone(dir, "d2"));
+        else {
+            char *at = str_dup(under(dir, chain[i].file));
+            *strrchr(at, '/') = 0;
+            char to[PATH_MAX];
+            ssize_t n = readlink(at, to, sizeof to - 1);
+            to[n > 0 ? n : 0] = 0;
+            T(chain[i].name, n > 0 && !strstr(to, "evil") && !strstr(to, "/n"));
+            free(at);
+        }
+        int code = -1;
+        o = run_bash_status("echo a > a && git add a && git commit -qm a && git branch new", dir, 30, &code);
+        T("chain: git add, commit and branch work", !code);
+        free(o);
+    }
+
+    /* the file tools keep the gitfile on the way as it is */
+    snprintf(proj, sizeof proj, "%s/link-gitfile", base);
+    refused("tool: gitfile behind a link", tool_write_file(proj, "gf", "gitdir: evil\n"));
+    refused("tool: gitfile through the link", tool_write_file(proj, ".git", "gitdir: evil\n"));
+    free(tool_write_file(proj, "other", "x"));
+    T("tool: other files still written", holds(under(proj, "other"), "x"));
+    setenv("HOME", old, 1);
+    free(old);
+}
+
+/* what cannot be searched or read cannot be ruled out: nothing runs */
+static void test_unreadable_git(void) {
+    char base[PATH_MAX], home[PATH_MAX], proj[PATH_MAX];
+    char *old = review_dirs(base, home, proj);
+    if (!old) { T("mkdtemp", false); return; }
+    static const char *const repo = "git init -q . && git config user.name t && git config user.email t@t"
+                                    " && git commit -qm one --allow-empty";
+    static const struct { const char *name, *setup, *shut, *open, *file; } how[] = {
+        {"chmod .git", "mkdir gh && rm -rf .git/hooks && ln -s ../gh .git/hooks",
+         "chmod 000 .git", "chmod 755 .git", "gh/pre-commit"},
+        {"acl .git", "mv .git/config cfg && ln -s ../cfg .git/config",
+         "chmod +a 'everyone deny search' .git", "chmod -N .git", "cfg"},
+        {"unreadable gitfile", "mv .git real && echo 'gitdir: real' > .git && mkdir gh && rm -rf real/hooks"
+         " && ln -s ../gh real/hooks", "chmod 000 .git", "chmod 644 .git", "gh/pre-commit"},
+    };
+    for (int i = 0; i < (int)(sizeof how / sizeof *how); i++) {
+        char dir[PATH_MAX], cmd[300];
+        snprintf(dir, sizeof dir, "%s/shut%d", base, i);
+        mkdir(dir, 0700);
+        host(dir, repo);
+        host(dir, how[i].setup);
+        host(dir, how[i].shut);
+        snprintf(cmd, sizeof cmd, "%s; echo evil >> %s; echo ran > ran", how[i].open, how[i].file);
+        char *o = run_bash(cmd, dir, 30);
+        T(how[i].name, !strncmp(o, "error:", 6) && strstr(o, dir) && gone(dir, "ran"));
+        free(o);
+        o = tool_write_file(dir, "ran", "x");
+        T(how[i].name, !strncmp(o, "error:", 6) && gone(dir, "ran"));
+        free(o);
+        host(dir, how[i].open);
+    }
+    setenv("HOME", old, 1);
+    free(old);
+}
+
 /* a rebase a command planted: what `git rebase --continue` outside would run */
 #define PLANT(d) "mkdir " d "; echo 'exec touch \"$OLDPWD/PWNED\"; touch PWNED' > " d "/git-rebase-todo;" \
     " : > " d "/done; : > " d "/interactive; git rev-parse HEAD > " d "/onto;" \
@@ -3028,6 +3132,8 @@ int main(void) {
         test_blocked_writes();
         test_root_bare();
         test_rebase_state();
+        test_git_chains();
+        test_unreadable_git();
         test_sandbox();
         test_sandbox_escapes();
         test_nested_git();
