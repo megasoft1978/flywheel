@@ -1706,28 +1706,32 @@ static void ui_event(const char *kind, const char *detail, void *ud) {
 /* Would an "always" rule silence this prompt next time? Ask perm_allowed itself
    (it always prompts for shell metacharacters and mutating flags) with the rule
    added in memory only: without a cwd nothing is persisted. */
-static bool can_remember(const char *cmd, const char *rule) {
+static bool can_remember(const char *cmd, const char *rule, bool gate) {
     if (!rule || !*rule) return false;
     perm_load();
     char *cwd = g_cfg.cwd;
     g_cfg.cwd = NULL;
     perm_add_rule(rule);
     g_cfg.cwd = cwd;
-    bool ok = perm_approved(cmd);
+    bool ok = gate ? perm_gate_allowed(cmd) : perm_allowed(cmd);
     perm_free();              /* drop the probe; the next check reloads from disk */
     return ok;
 }
 
 /* Claude-Code-style approval modal menu. */
-static bool ui_approve(const char *cmd, void *ud) {
+static bool ui_approve(const char *cmd, bool gate, void *ud) {
     (void)ud;
     /* OSC 9 notification for Mica attention indicator */
     fputs("\033]9;flywheel: command approval needed\007", stdout);
     fflush(stdout);
 
-    char *rule = perm_prefix(cmd);
-    bool remember = can_remember(cmd, rule);
-    bool gate = !strncmp(cmd, GATE_PERM, strlen(GATE_PERM));
+    char *rule;
+    if (gate) {   /* the whole command: nothing broader than what is shown */
+        size_t len = strlen(GATE_PERM) + strlen(cmd) + 1;
+        rule = malloc(len);
+        snprintf(rule, len, "%s%s", GATE_PERM, cmd);
+    } else rule = perm_prefix(cmd);
+    bool remember = can_remember(cmd, rule, gate);
     char opt2[256];
     if (gate) snprintf(opt2, sizeof opt2, "Yes, and don't ask again for exactly this check");
     else snprintf(opt2, sizeof opt2, "Yes, and don't ask again for `%s` commands", rule ? rule : cmd);

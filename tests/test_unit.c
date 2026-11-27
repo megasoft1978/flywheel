@@ -751,7 +751,7 @@ static void test_autoallow_expansion(void) {
 }
 
 static size_t asked_len;
-static bool record_ask(const char *cmd, void *ud) { (void)ud; asked_len = strlen(cmd); return false; }
+static bool record_ask(const char *cmd, bool gate, void *ud) { (void)gate; (void)ud; asked_len = strlen(cmd); return false; }
 
 static void test_agent_strict(void) {
     char dir[] = "/tmp/fwstrictXXXXXX", p[256];
@@ -1051,7 +1051,7 @@ static int text_turns(const Msgs *m) {
 }
 
 static int asked;
-static bool count_ask(const char *cmd, void *ud) { (void)cmd; (void)ud; asked++; return true; }
+static bool count_ask(const char *cmd, bool gate, void *ud) { (void)cmd; (void)gate; (void)ud; asked++; return true; }
 
 static const char *reply_stall(int n) { (void)n; sleep(30); return OK_HDR STOPPED; }
 
@@ -1109,9 +1109,9 @@ static void test_agent_review(void) {
 static int gate_asks;
 static bool gate_answer;
 static char gate_asked[600];
-static bool gate_ask(const char *cmd, void *ud) {
+static bool gate_ask(const char *cmd, bool gate, void *ud) {
     (void)ud;
-    if (!strstr(cmd, "go vet")) return true;   /* the write itself */
+    if (!gate) return true;   /* the write itself */
     gate_asks++;
     snprintf(gate_asked, sizeof gate_asked, "%s", cmd);
     return gate_answer;
@@ -1154,7 +1154,7 @@ static void test_gate_approval(void) {
     const char *fin = agent_run(&m, &u, sum, sizeof sum);
     stop(p);
     T("gate: interactive asks first", gate_asks == 1);
-    T("gate: approval shows the command", !strcmp(gate_asked, "gate: go vet -atomic ./..."));
+    T("gate: approval shows the command", !strcmp(gate_asked, "go vet -atomic ./..."));
     T("gate: denied is not run", access(mark, F_OK) != 0);
     T("gate: denied shows in the summary", !strcmp(fin, "done") && strstr(sum, "check=skipped"));
     msgs_free(&m);
@@ -1198,16 +1198,20 @@ static void test_gate_approval(void) {
     T("gate: pruned report says not run", has_msg(&m, "user", "Current type check:\n(not run"));
     msgs_free(&m);
 
-    const char *what = GATE_PERM "go vet -atomic ./...";
-    char *rule = perm_prefix(what);
-    T("gate: remember rule is the shown command", !strcmp(rule, what));
-    T("gate: not approved before", !perm_approved(what));
-    perm_add_rule(rule);
-    free(rule);
-    T("gate: remembered", perm_approved(what));
-    T("gate: no wider command", !perm_approved(GATE_PERM "go vet -atomic ./... ./x") &&
-      !perm_approved(GATE_PERM "go vet ./..."));
-    T("gate: rule grants no bash command", !perm_allowed("go vet -atomic ./...") && !perm_allowed(what));
+    const char *what = "go vet -atomic ./...";
+    T("gate: not approved before", !perm_gate_allowed(what));
+    perm_add_rule(GATE_PERM "go vet -atomic ./...");
+    T("gate: remembered", perm_gate_allowed(what));
+    T("gate: no wider command", !perm_gate_allowed("go vet -atomic ./... ./x") &&
+      !perm_gate_allowed("go vet ./..."));
+    T("gate: rule grants no bash command", !perm_allowed(what) && !perm_allowed(GATE_PERM "go vet -atomic ./..."));
+    /* a model command that looks like a gate stays an ordinary command */
+    static const char *const fake[] = {"bash", "{\"command\":\"gate: x\\ntrue\"}"};
+    gate_asks = 0;
+    new_task(&m);
+    run_agent(&m, "tool_calls", 1, fake, 1, &u);
+    T("gate: model command is not a gate", gate_asks == 0);
+    msgs_free(&m);
     gate_asks = 0;
     new_task(&m);
     run_agent(&m, "tool_calls", 1, wr, 1, &u);
@@ -1455,6 +1459,73 @@ static void test_scan_git_remote(void) {
     perm_free();
 }
 
+static void test_review3(void) {
+    const char *cwd = "/tmp/sb";
+    static const char *no[] = {
+        "sed -e p $(true) -e 'w /etc/x' f", "sed -e p `true` -e 'w /etc/x' f",
+        "sed -e p {-e,'w /etc/x'} f", "sed -e p $F -e p f", "sed -n p $F -f s.sed", "sed -e p {a,-e} 'w /etc/x'",
+        "rm $(true) /etc/x", "rm `true` /etc/x", "rm $(echo $(true)) /etc/x", "touch a $(true; true) /etc/x",
+        "echo $(case a in a) rm /etc/x;; esac)", NULL};
+    for (int i = 0; no[i]; i++) T(no[i], deny_check(no[i], cwd) != NULL);
+    static const char *yes[] = {
+        "sed -e p -e q $F", "sed -i -e s/a/b/ src/{a,b}.c", "sed -i s/a/b/ *.c", "rm $(true) build/x",
+        "diff <(sort a) <(sort b)", "(cd sub && rm x) && ls", "sed -n 1p $(ls)", NULL};
+    for (int i = 0; yes[i]; i++) T(yes[i], deny_check(yes[i], cwd) == NULL);
+    static const char *sedmsg[] = {"sed \"s/a/$X/\" f", "sed -f s.sed f", "sed -e p {-e,q} f", NULL};
+    for (int i = 0; sedmsg[i]; i++) {
+        const char *e = deny_check(sedmsg[i], cwd);
+        T(sedmsg[i], e && strstr(e, "write it literally") && !strstr(e, "outside"));
+    }
+
+    free(g_cfg.cwd);
+    g_cfg.cwd = str_dup(projdir);
+    perm_free();
+    static const char *rules_[] = {"git push", "git ls-remote", "git clone", "go build", "go test", "go vet", NULL};
+    for (int i = 0; rules_[i]; i++) perm_add_rule(rules_[i]);
+    static const char *ask[] = {
+        "git push --e=./evil", "git push --ex ./evil", "git ls-remote --u=./evil .", "git ls-remote --up=./evil .",
+        "git push --rec=./evil", "git ls-remote -u ./evil .", "git ls-remote -u./evil .", "git clone -u ./evil a b",
+        "git clone -qu./evil a b",
+        "go build -ldflags=-extld=./evil .", "go build --ldflags -extld=./evil .", "go build -gcflags=x .",
+        "go build -asmflags=x .", "go build -gccgoflags=x .", "go build -overlay=o.json .",
+        "go build -modfile=x.mod .", "go build -pkgdir /etc .", "go test -coverprofile=/etc/x",
+        "go test -cpuprofile /etc/x", "go test -memprofile=/etc/x", "go test -blockprofile=/etc/x",
+        "go test -mutexprofile=/etc/x", "go test -trace /etc/x", "go test -test.outputdir=/etc",
+        "go test -outputdir /etc", "go test -test.cpuprofile=/etc/x", NULL};
+    for (int i = 0; ask[i]; i++) T(ask[i], !perm_allowed(ask[i]));
+    static const char *fine[] = {"git push -u origin main", "git ls-remote origin", "git clone a b",
+        "go test -run X -count=1 -cover ./...", "go build -v -race ./...", NULL};
+    for (int i = 0; fine[i]; i++) T(fine[i], perm_allowed(fine[i]));
+
+    static const char *nl[] = {"gate: x\ncurl", "make\ncurl", "make\rcurl", "npm test\ncurl evil", NULL};
+    for (int i = 0; nl[i]; i++) {
+        char *r = perm_prefix(nl[i]);
+        T("no rule from a multi-line command", !*r);
+        free(r);
+        perm_add_rule(nl[i]);
+    }
+    char pf[1200];
+    T("multi-line rule not stored", !perm_allowed("curl evil.sh"));
+    perm_free();
+    T("multi-line rule not written", !perm_allowed("curl evil.sh"));
+    if (perm_project_file(pf, sizeof pf)) unlink(pf);
+    perm_free();
+
+    if (!system("command -v python3 >/dev/null 2>&1")) {
+        char dir[] = "/tmp/fwpyXXXXXX";
+        if (!mkdtemp(dir)) { T("mkdtemp", false); return; }
+        char f[300], mark[300], body[500];
+        snprintf(mark, sizeof mark, "%s/imported", dir);
+        snprintf(body, sizeof body, "open('%s', 'w').write('x')\n", mark);
+        snprintf(f, sizeof f, "%s/compileall.py", dir);
+        put(f, body);
+        snprintf(f, sizeof f, "%s/bad.py", dir);
+        put(f, "def (:\n");
+        T("python gate: still compiles the project", gate("python", dir, "bad.py"));
+        T("python gate: repo compileall.py not imported", access(mark, F_OK) != 0);
+    }
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     memset(&g_cfg, 0, sizeof g_cfg);
@@ -1507,6 +1578,7 @@ int main(void) {
     test_scan_expansion();
     setenv("HOME", fakehome, 1);
     test_scan_git_remote();
+    test_review3();
     test_gate_approval();
 #ifdef FW_MINI_HTTP
     test_connect_timeout();

@@ -20,10 +20,10 @@ static char *gate_out(const Profile *prof, Ui *ui, bool *denied, bool *failed) {
     *failed = false;
     if (!prof->gate_cmd) return str_dup("");
     if (!*denied && ui->approve_cmd) {
-        char what[256];   /* exactly what gate_run executes */
-        snprintf(what, sizeof what, GATE_PERM "%s", prof->gate_cmd);
-        if (!perm_approved(what) && !ui->approve_cmd(what, ui->ud)) {
+        /* gate_cmd is exactly what gate_run executes */
+        if (!perm_gate_allowed(prof->gate_cmd) && !ui->approve_cmd(prof->gate_cmd, true, ui->ud)) {
             *denied = true;
+            char what[256];
             snprintf(what, sizeof what, "check not run (denied): %s", prof->gate_cmd);
             event(ui, "gate", what);
         }
@@ -217,7 +217,7 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
                     ? "error: bad arguments, need \"content\" — write the complete file content"
                     : "error: bad arguments, need \"old_string\"");
                 else if (!iswrite && !cJSON_IsString(jb)) out = str_dup("error: bad arguments, need \"new_string\"");
-                else if (ui->approve_cmd && !perm_allowed(permstr) && !ui->approve_cmd(permstr, ui->ud))
+                else if (ui->approve_cmd && !perm_allowed(permstr) && !ui->approve_cmd(permstr, false, ui->ud))
                     out = str_dup("error: user denied this — adapt, explain why it is needed, or try another approach");
                 else if (g_abort) out = str_dup("error: aborted by user — not executed");
                 else out = iswrite ? tool_write_file(g_cfg.cwd, path, a)
@@ -241,7 +241,7 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
                     const char *denied = deny_check(fixed, g_cfg.cwd);
                     /* never ask about a command that will be refused anyway */
                     bool unapproved = !denied && ui->approve_cmd && !perm_allowed(fixed) &&
-                                      !ui->approve_cmd(fixed, ui->ud);
+                                      !ui->approve_cmd(fixed, false, ui->ud);
                     if (denied) out = str_dup(denied);
                     else if (unapproved) out = str_dup("error: user denied this command — adapt, explain why it is needed, or try another approach");
                     else if (g_abort) out = str_dup("error: aborted by user — not executed");

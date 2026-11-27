@@ -94,8 +94,8 @@ bool  cmd_is_write(const char *cmd);
 /* permission rules: builtin safe reads + ~/.config/flywheel/allow +
    ~/.config/flywheel/projects/<project>.allow (never read from the project) */
 bool  perm_allowed(const char *cmd);   /* rule match — no prompt needed */
-#define GATE_PERM "gate: "             /* approval string of a verification gate */
-bool  perm_approved(const char *what); /* like perm_allowed, also for gates */
+#define GATE_PERM "gate: "             /* rule-file prefix of a remembered gate */
+bool  perm_gate_allowed(const char *cmd);  /* may this gate run unasked? */
 void  perm_load(void);                 /* load rule files once */
 void  perm_add_rule(const char *rule); /* remember + persist per project */
 bool  perm_project_file(char *out, size_t cap); /* path of this project's rules */
@@ -155,7 +155,9 @@ typedef struct {
     void (*emit_status)(const char *, void *);      /* status-line text */
     void (*emit_event)(const char *kind, const char *detail, void *); /* prune/gate/reset/done */
     void (*emit_stats)(const AgentStats *, void *); /* live telemetry updates */
-    bool (*approve_cmd)(const char *cmd, void *);   /* NULL = auto-approve (non-interactive) */
+    /* NULL = auto-approve (non-interactive). gate: cmd is the verification
+       gate; it is never set for anything the model asked for */
+    bool (*approve_cmd)(const char *cmd, bool gate, void *);
     void *ud;
     bool interactive;
     bool deliverable;           /* the task expects files: nag until written */

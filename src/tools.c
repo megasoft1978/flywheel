@@ -73,6 +73,7 @@ static bool in_ranges(const Range *r, int n, const char *p) {
 
 #define MAXWORDS 4096
 #define MAXHEREDOC 8
+#define MAXNEST 64
 
 #define OPAQUE '\001'   /* word we cannot decode */
 
@@ -191,6 +192,7 @@ static bool path_ok(const char *w, const char *cwd) {
 
 static const char *E_RULE = "error: command blocked by deny rule";
 static const char *E_OUTSIDE = "error: write outside working dir is forbidden";
+static const char *E_SED = "error: sed script uses shell expansion or -f; write it literally";
 
 static const char *scan_script(const char *s, const char *cwd, int depth);
 
@@ -356,7 +358,7 @@ static const char *check_sed_script(const char *p, const char *cwd) {
     if (g_cfg.outside_writes || !*p) return NULL;
     /* p ends where its word does; scan_script stores the flag after the NUL.
        Anything the shell substitutes anywhere in it can add commands. */
-    if (strchr(p, OPAQUE) || p[strlen(p) + 1]) return E_OUTSIDE;
+    if (strchr(p, OPAQUE) || p[strlen(p) + 1]) return E_SED;
     const char *err = NULL;
     while (!err && *p) {
         if (strchr(" \t\r\n;{}!,+~$", *p) || isdigit((unsigned char)*p)) { p++; continue; }
@@ -388,16 +390,26 @@ static const char *check_sed(char **a, int na, const char *cwd) {
     static const char *const flags[] = {"quiet", "silent", "regexp-extended", "separate", "unbuffered",
         "null-data", "zero-terminated", "posix", "debug", "follow-symlinks", "sandbox", "help",
         "version", NULL};
-    bool inplace = false, script = false, opts = true;
+    bool inplace = false, script = false, opts = true, expanded = false;
     char **files = malloc((size_t)(na + 1) * sizeof *files);
     int nf = 0;
     const char *err = NULL;
     for (int k = 0; !err && k < na; k++) {
         const char *o = a[k], *code = NULL;
+        bool expands = o[strlen(o) + 1] && !g_cfg.outside_writes;
+        /* {-e,...} turns into options of its own */
+        if (expands && *o == '{') { err = E_SED; break; }
         if (opts && !strcmp(o, "--")) { opts = false; continue; }
-        if (!opts || o[0] != '-' || !o[1]) { files[nf++] = a[k]; continue; }
+        if (!opts || o[0] != '-' || !o[1]) { expanded |= expands; files[nf++] = a[k]; continue; }
         /* an expanded option word may carry a script of its own */
-        if (o[strlen(o) + 1] && !g_cfg.outside_writes) { err = E_OUTSIDE; break; }
+        if (expands) { err = E_SED; break; }
+        /* ...and an earlier expansion may change what a later -e/-f means */
+        if (expanded) {
+            bool later = !strncmp(o, "--e", 3) || !strncmp(o, "--fi", 4);
+            for (const char *c = o + 1; o[1] != '-' && *c && !strchr("iIl", *c); c++)
+                if (*c == 'e' || *c == 'f') later = true;
+            if (later) { err = E_SED; break; }
+        }
         if (o[1] == '-') {
             const char *eq = strchr(o, '=');
             size_t len = eq ? (size_t)(eq - o - 2) : strlen(o + 2);
@@ -407,7 +419,7 @@ static const char *check_sed(char **a, int na, const char *cwd) {
             } else if (len == 4 && !strncmp(o + 2, "file", len)) {
                 script = true;
                 if (!eq) k++;
-                if (!g_cfg.outside_writes) err = E_OUTSIDE;   /* script not visible */
+                if (!g_cfg.outside_writes) err = E_SED;   /* script not visible */
             } else if (len == 11 && !strncmp(o + 2, "line-length", len)) {
                 if (!eq) k++;
             } else if (len == 8 && !strncmp(o + 2, "in-place", len)) inplace = true;
@@ -427,7 +439,7 @@ static const char *check_sed(char **a, int na, const char *cwd) {
                 if (*c == 'f') {
                     script = true;
                     if (!c[1]) k++;
-                    if (!g_cfg.outside_writes) err = E_OUTSIDE;   /* script not visible */
+                    if (!g_cfg.outside_writes) err = E_SED;   /* script not visible */
                     break;
                 }
                 if (*c == 'l' && !c[1] && k + 1 < na && *a[k + 1] &&
@@ -773,13 +785,14 @@ static const char *check_simple(char **v, int n, const char *cwd, int depth) {
 
 /* Walk a script: split into simple commands, check redirect targets, skip
    heredoc payloads and comments (they're data, not shell syntax). */
-static const char *scan_script(const char *s, const char *cwd, int depth) {
+static const char *scan_pass(const char *s, const char *cwd, int depth, bool nest) {
     if (depth > 4) return E_RULE;   /* too deep to check: fail closed */
     char *arena = malloc(3 * strlen(s) + 3), *top = arena;
     char *v[MAXWORDS];
     char delim[MAXHEREDOC][64];
     bool dash[MAXHEREDOC];
     int n = 0, nd = 0;
+    int base = 0, outer[MAXNEST], level = 0;   /* current command is v[base..n) */
     bool redir_out = false, redir_in = false, tick = false;
     const char *err = NULL, *p = s, *word_end = NULL;
     static char subst[] = {'$', 0, 1};   /* stands for a `...` word */
@@ -829,15 +842,32 @@ static const char *scan_script(const char *s, const char *cwd, int depth) {
         if (c == '`') {   /* opening one: part of the current command's words */
             if (!tick && !redir_out && !redir_in) {
                 if (n && word_end == p) v[n - 1][strlen(v[n - 1]) + 1] = 1;
-                else if (n && n < MAXWORDS) v[n++] = subst;
+                else if (n > base && n < MAXWORDS) v[n++] = subst;
             }
             tick = !tick;
         }
         if (!c || strchr("\n;&|()`", c)) {
-            if (n) err = check_simple(v, n, cwd, depth);
-            n = 0;
             redir_out = redir_in = false;
-            if (!c) break;
+            if (nest && (c == '(' || (c == '`' && tick))) {
+                /* the outer command resumes after the substitution */
+                if (level == MAXNEST) err = E_RULE;
+                else {
+                    outer[level++] = base;
+                    base = n;
+                }
+            } else {
+                if (n > base) err = check_simple(v + base, n - base, cwd, depth);
+                n = base;
+                if (nest && (c == ')' || c == '`') && level) base = outer[--level];
+            }
+            if (!c) {
+                while (!err && level) {   /* unterminated: judge what is open */
+                    n = base;
+                    base = outer[--level];
+                    if (n > base) err = check_simple(v + base, n - base, cwd, depth);
+                }
+                break;
+            }
             p++;
             if (c == '\n') {
                 for (int h = 0; h < nd; h++) {
@@ -879,6 +909,13 @@ static const char *scan_script(const char *s, const char *cwd, int depth) {
     }
     free(arena);
     return err;
+}
+
+/* Judged twice: split at every substitution (finds the inner commands), then
+   with each outer command rejoined around them (finds its later operands). */
+static const char *scan_script(const char *s, const char *cwd, int depth) {
+    const char *err = scan_pass(s, cwd, depth, false);
+    return err ? err : scan_pass(s, cwd, depth, true);
 }
 
 char *deny_check(const char *cmd, const char *cwd) {
@@ -1258,7 +1295,9 @@ static bool has_mutating_args(const char *cmd) {
     bool file = !strcmp(c, "file"), pf = !strcmp(c, "printf");
     bool tst = !strcmp(c, "test") || !strcmp(c, "[");
     bool tsc = !strcmp(c, "npx") && n > 1 && !strcmp(v[1], "tsc"), noemit = false;
-    bool go = !strcmp(c, "go");
+    bool go = !strcmp(c, "go"), remote = false;
+    for (int i = 1; git && i < n; i++)   /* here -u names the program to run */
+        if (!strcmp(v[i], "ls-remote") || !strcmp(v[i], "clone")) remote = true;
     bool grep = !strcmp(c, "grep"), ls = !strcmp(c, "ls"), perl = !strncmp(c, "perl", 4);
     bool opts = true;
     int plain = 0;
@@ -1284,14 +1323,15 @@ static bool has_mutating_args(const char *cmd) {
         if (git && (!strncmp(a, "--output", 8) || abbrev(a, "--output", 3) || abbrev(a, "--ext-diff", 4) ||
                     (abbrev(a, "--textconv", 5) && strcmp(a, "--text")) ||
                     abbrev(a, "--show-signature", 8) || strstr(a, "signature") || has_sig_format(a))) bad = true;
-        if (git && (abbrev(a, "--upload-pack", 5) || abbrev(a, "--receive-pack", 5) ||
-                    abbrev(a, "--exec", 4))) bad = true;   /* runs a program */
+        if (git && (abbrev(a, "--upload-pack", 3) || abbrev(a, "--receive-pack", 5) ||
+                    abbrev(a, "--exec", 3))) bad = true;   /* runs a program */
+        if (remote && shortopt && strchr(a, 'u')) bad = true;
         if (go && a[0] == '-') {   /* run another program or write any file */
             const char *name = a + (a[1] == '-' ? 2 : 1);
-            size_t len = strcspn(name, "=");
-            static const char *const unsafe[] = {"exec", "toolexec", "vettool", "o", NULL};
-            for (int k = 0; unsafe[k]; k++)
-                if (len == strlen(unsafe[k]) && !strncmp(name, unsafe[k], len)) bad = true;
+            if (!strncmp(name, "test.", 5)) name += 5;
+            if (word_in("exec toolexec vettool o ldflags gcflags asmflags gccgoflags coverprofile "
+                        "cpuprofile memprofile blockprofile mutexprofile trace outputdir overlay modfile "
+                        "pkgdir", name, strcspn(name, "="))) bad = true;
         }
         if (uniq) {   /* a second operand is the output file; "-" is an operand */
             if (opts && !strcmp(a, "--")) opts = false;
@@ -1422,12 +1462,11 @@ static bool is_gate(const char *s) {
 
 /* A verification gate is remembered as its whole command, matched exactly and
    never applied to the model's own commands. */
-bool perm_approved(const char *what) {
-    if (!is_gate(what)) return perm_allowed(what);
+bool perm_gate_allowed(const char *cmd) {
     perm_load();
     for (int i = 0; i < nrules; i++)
-        if (!strcmp(rules[i], what)) return true;
-    return perm_allowed(what + sizeof GATE_PERM - 1);
+        if (is_gate(rules[i]) && !strcmp(rules[i] + sizeof GATE_PERM - 1, cmd)) return true;
+    return perm_allowed(cmd);
 }
 
 bool perm_allowed(const char *cmd) {
@@ -1446,6 +1485,7 @@ bool perm_allowed(const char *cmd) {
 }
 
 void perm_add_rule(const char *rule) {
+    if (strpbrk(rule, "\n\r")) return;   /* the file holds one rule per line */
     perm_load();
     for (int i = 0; i < nrules; i++)
         if (!strcmp(rules[i], rule)) return;
@@ -1476,7 +1516,7 @@ static const char *PLAIN_TOOLS = "rm rmdir mkdir touch cp mv ln chmod uname whoa
 /* "always" rule derived from a command: the tool, or tool and subcommand
    ("npm run" also needs the script name). "" = nothing safe to remember. */
 char *perm_prefix(const char *cmd) {
-    if (is_gate(cmd)) return str_dup(cmd);   /* nothing broader than shown */
+    if (strpbrk(cmd, "\n\r")) return str_dup("");
     char w[3][96] = {{0}};
     for (int i = 0; i < 3; i++) {
         while (*cmd == ' ' || *cmd == '\t') cmd++;

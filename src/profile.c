@@ -7,7 +7,7 @@ static const Profile PROFILES[] = {
      "TypeScript/React/Node engineer",
      "ts,tsx"},
     {"python",
-     "python3 -m compileall -q -x '(venv|\\.venv|node_modules|__pycache__)' .",
+     "python3 -I -m compileall -q -x '(venv|\\.venv|node_modules|__pycache__)' .",
      "Python engineer",
      "py"},
     {"go",
