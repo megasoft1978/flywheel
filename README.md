@@ -140,7 +140,7 @@ or your home directory stay blocked.
 
 ## Limits
 
-- Text only. The model has vision, but flywheel sends it text; pasted images do not reach it.
+- Text only. The model has vision, but flywheel sends it text only.
 - No API key support. The Linux build has no HTTPS.
 - No context compaction.
 - Go and Rust gates are experimental.

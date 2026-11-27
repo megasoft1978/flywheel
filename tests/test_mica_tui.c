@@ -634,6 +634,16 @@ int main(int argc, char **argv) {
     CHECK(s, "UTF-8 backspace removes whole emoji -> col 4", cr == input_row && cc == 4);
     assert_box_borders(s, "borders after emoji edit");
 
+    /* ^V is not a clipboard image paste: nothing is written into the project */
+    mica_session_text(s, 'c', VTERM_MOD_CTRL);
+    pump(s, 100);
+    mica_session_text(s, 'v', VTERM_MOD_CTRL);
+    pump(s, 1500);
+    char pastedir[1200];
+    snprintf(pastedir, sizeof pastedir, "%s/.flywheel", testdir);
+    CHECK(s, "^V writes nothing into the project", access(pastedir, F_OK) != 0);
+    CHECK(s, "^V reports no image paste", find_row(s, "image") < 0);
+
     /* 3. Long input soft-wrapping (must NOT break right border) */
     mica_session_text(s, 'c', VTERM_MOD_CTRL);
     pump(s, 100);

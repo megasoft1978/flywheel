@@ -4,7 +4,6 @@
 #include <termios.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
-#include <sys/stat.h>
 #include <signal.h>
 #include <wchar.h>
 #include <errno.h>
@@ -21,7 +20,6 @@
    - rounded input box + slash menu below it + status bar pinned at bottom
    - UTF-8 / emoji width via wcwidth(), soft-wrapped input (up to 4 visible rows)
    - Shift+Enter / Alt+Enter multiline, bracketed paste (?2004h) with [paste#N] collapse
-   - Cmd+V / Ctrl+V clipboard image paste (Mica sends 0x16 for images)
    - SIGWINCH live resize with full transcript re-wrap; Esc aborts streams */
 
 static struct termios saved_t;
@@ -1873,7 +1871,7 @@ static void run_slash(const char *cmd) {
         render_screen();
     } else if (!strcmp(cmd, "/help")) {
         push_raw("commands: /init /clear /model /allow /status /help /exit\n"
-                 "keys: ↑↓ history · Shift/Alt+Enter newline · ^O expand/collapse cmd · Cmd/Ctrl+V image · PgUp/PgDn or wheel scroll · Esc aborts · ^C clear · ^D quit");
+                 "keys: ↑↓ history · Shift/Alt+Enter newline · ^O expand/collapse cmd · PgUp/PgDn or wheel scroll · Esc aborts · ^C clear · ^D quit");
     } else if (!strncmp(cmd, "/model", 6)) {
         if (cmd[6] == ' ' && cmd[7]) {
             free(g_cfg.model);
@@ -1938,55 +1936,6 @@ static void run_slash(const char *cmd) {
         push_raw(b);
     }
 }
-
-/* Cmd+V (Mica sends 0x16 for clipboard images) / Ctrl+V:
-   save clipboard image (PNG, or TIFF fallback converted to PNG) without shell-injecting cwd. */
-#ifndef __APPLE__
-static void paste_clipboard_image(void) {
-    /* clipboard image paste is macOS-only (osascript); no-op elsewhere */
-}
-#else
-static void paste_clipboard_image_impl(void);
-static void paste_clipboard_image(void) { paste_clipboard_image_impl(); }
-static void paste_clipboard_image_impl(void) {
-    char dir[1024];
-    snprintf(dir, sizeof dir, "%s/.flywheel", g_cfg.cwd);
-    mkdir(dir, 0755);
-    static int imgn;
-    char path[1200], tiff[1200];
-    snprintf(path, sizeof path, "%s/paste-%d.png", dir, ++imgn);
-    snprintf(tiff, sizeof tiff, "%s/paste-%d.tiff", dir, imgn);
-    setenv("FW_IMG_PATH", path, 1);
-    setenv("FW_TIFF_PATH", tiff, 1);
-    const char *png_cmd =
-        "osascript -e 'set p to system attribute \"FW_IMG_PATH\"' "
-        "-e 'set d to (the clipboard as «class PNGf»)' "
-        "-e 'set fp to open for access POSIX file p with write permission' "
-        "-e 'write d to fp' -e 'close access fp' >/dev/null 2>&1";
-    const char *tiff_cmd =
-        "osascript -e 'set p to system attribute \"FW_TIFF_PATH\"' "
-        "-e 'set d to (the clipboard as TIFF picture)' "
-        "-e 'set fp to open for access POSIX file p with write permission' "
-        "-e 'write d to fp' -e 'close access fp' >/dev/null 2>&1 "
-        "&& sips -s format png \"$FW_TIFF_PATH\" --out \"$FW_IMG_PATH\" >/dev/null 2>&1 "
-        "&& rm -f \"$FW_TIFF_PATH\"";
-    bool ok = (system(png_cmd) == 0 && access(path, F_OK) == 0);
-    if (!ok) {
-        unlink(path);
-        ok = (system(tiff_cmd) == 0 && access(path, F_OK) == 0);
-        unlink(tiff);
-    }
-    if (ok) {
-        char ref[1300];
-        snprintf(ref, sizeof ref, "[image: %s]", path);
-        ins(ref, (int)strlen(ref));
-        set_status("image pasted (vision needs engine without --language-only)");
-    } else {
-        unlink(path);
-        set_status("no image in clipboard");
-    }
-}
-#endif /* __APPLE__ */
 
 static void collapse_paste_if_big(void) {
     if (paste_start < 0) return;
@@ -2308,7 +2257,6 @@ if (busy) {
         }
         render_screen(); return;
     }
-    if (ch == 22) { paste_clipboard_image(); render_screen(); return; }  /* Cmd+V image / Ctrl+V */
     if (ch >= 32) {
         char c1 = (char)ch;
         ins(&c1, 1);
