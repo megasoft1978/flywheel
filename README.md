@@ -87,7 +87,8 @@ Project instructions come from the first of `.flywheel.md`, `AGENTS.md` or `CLAU
 - **File tools.** `write_file` and `edit_file` with unique-match edits, confined to the project.
 - **Verification gate.** A per-language check (`tsc --noEmit`, `python3 -I -m compileall`,
   `go vet`, `cargo check`) and one requirement-by-requirement pass before finishing. A passing
-  check means the code type-checks or compiles, not that it is correct. Go and Rust are
+  check means the code type-checks or compiles, not that it is correct. A run whose last check
+  fails or times out ends as `check-failed` or `check-timeout`, not `done`. Go and Rust are
   experimental.
 - **Transient errors.** HTTP 429 and 5xx and dropped connections are retried up to three times;
   cut-off streams are reported as errors.

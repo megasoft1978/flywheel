@@ -46,7 +46,8 @@ const Profile *profile_detect(const char *cwd, const char *force) {
 }
 
 /* No pipe in gate_cmd: it would hide the exit status. 126/127 (tool not
-   installed) and timeouts are not code errors. npx also exits non-zero
+   installed) is not a code error. A check that timed out or was killed did not
+   pass (unless the user aborted it). npx also exits non-zero
    without TypeScript installed, so ts additionally needs a diagnostic. */
 char *gate_run(const Profile *prof, const char *cwd, int timeout_s, bool *failed) {
     *failed = false;
@@ -56,6 +57,7 @@ char *gate_run(const Profile *prof, const char *cwd, int timeout_s, bool *failed
     *failed = code > 0 && code != 126 && code != 127;
     if (!strcmp(prof->name, "ts")) *failed = *failed && strstr(out, "error TS");
     if (!strcmp(prof->name, "go")) *failed = *failed && !strstr(out, "no packages to vet");
+    if (code < 0 && !g_abort) *failed = true;
     /* keep both ends: the messages quote about 1800 chars */
     size_t len = strlen(out);
     if (len > 1700) {

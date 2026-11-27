@@ -1227,6 +1227,71 @@ static void test_gate_approval(void) {
     free(oldpath);
 }
 
+/* ---------- exit status and check outcome reach the model and the user ---------- */
+
+static void test_truth(void) {
+    char dir[] = "/tmp/fwtruthXXXXXX";
+    if (!mkdtemp(dir)) { T("mkdtemp", false); return; }
+    char *oldpath = str_dup(getenv("PATH"));
+    char path[4096], tr[600], sum[256];
+    snprintf(path, sizeof path, "%s:%s", dir, oldpath);
+    setenv("PATH", path, 1);
+    snprintf(tr, sizeof tr, "%s/tr.jsonl", dir);
+    free(g_cfg.cwd);
+    g_cfg.cwd = str_dup(dir);
+    char *prof = g_cfg.profile;
+    g_cfg.profile = (char *)"go";
+    int gates = g_cfg.max_gates, turns = g_cfg.maxturns, to = g_cfg.cmd_timeout;
+    g_cfg.max_gates = 0; g_cfg.maxturns = 8; g_cfg.cmd_timeout = 1;
+    Ui u = {.interactive = true};
+    Msgs m;
+
+    static const char *const bad[] = {"bash", "{\"command\":\"echo hi; exit 3\"}",
+                                      "bash", "{\"command\":\"echo fine\"}",
+                                      "bash", "{\"command\":\"sleep 5\"}",
+                                      "bash", "{\"command\":\"kill -9 $$\"}"};
+    fake_tool(dir, "go", "exit 0");
+    new_task(&m);
+    run_agent(&m, "tool_calls", 4, bad, 1, &u);
+    T("bash: non-zero exit status reported", has_msg(&m, "tool", "hi\n[exit status 3]"));
+    T("bash: success has no status line", has_msg(&m, "tool", "fine") && !has_msg(&m, "tool", "[exit status 0]"));
+    T("bash: timeout reported", has_msg(&m, "tool", "[timeout after 1s"));
+    T("bash: signal death reported", has_msg(&m, "tool", "[killed by a signal]"));
+    msgs_free(&m);
+
+    static const char *const wr[] = {"write_file", "{\"path\":\"a.go\",\"content\":\"x\"}"};
+    static const struct { const char *body, *fin, *told; } cases[] = {
+        {"echo broken; exit 1", "check-failed", "failed. Fix"},
+        {"sleep 9", "check-timeout", "timed out"}};
+    for (int i = 0; i < 2; i++) {
+        fake_tool(dir, "go", cases[i].body);
+        g_cfg.transcript = tr;
+        unlink(tr);
+        new_task(&m);
+        agent_finish_reason = "tool_calls"; agent_calls = wr; agent_ncalls = 1; agent_tool_turns = 1;
+        pid_t p = serve(reply_agent);
+        const char *fin = agent_run(&m, &u, sum, sizeof sum);
+        stop(p);
+        g_cfg.transcript = NULL;
+        T(cases[i].fin, !strcmp(fin, cases[i].fin) && strstr(sum, cases[i].fin));
+        T("check outcome: model told", has_msg(&m, "user", cases[i].told));
+        char *c = slurp(tr), want[64];
+        snprintf(want, sizeof want, "\"run_finish\":\"%s\"", cases[i].fin);
+        T("check outcome: in transcript", c && strstr(c, want));
+        free(c);
+        msgs_free(&m);
+    }
+    bool failed_;
+    char *o = gate_run(profile_detect(dir, "go"), dir, 1, &failed_);
+    T("gate: timeout is not a pass", failed_);
+    free(o);
+
+    g_cfg.profile = prof;
+    g_cfg.max_gates = gates; g_cfg.maxturns = turns; g_cfg.cmd_timeout = to;
+    setenv("PATH", oldpath, 1);
+    free(oldpath);
+}
+
 #ifdef FW_MINI_HTTP
 int fw_mini_post_stream(const char *url, const char *payload, int streaming,
                         size_t (*cb)(char *, size_t, size_t, void *), void *ud,
@@ -1632,6 +1697,7 @@ int main(void) {
     test_review3();
     test_review4();
     test_gate_approval();
+    test_truth();
 #ifdef FW_MINI_HTTP
     test_connect_timeout();
 #endif

@@ -33,6 +33,26 @@ static char *gate_out(const Profile *prof, Ui *ui, bool *denied, bool *failed) {
     return gate_run(prof, g_cfg.cwd, g_cfg.cmd_timeout * 2, failed);
 }
 
+/* bash result for the model: output plus how the command ended, if not cleanly
+   (a timeout is already announced at the top of the output) */
+static char *bash_out(const char *cmd) {
+    int code;
+    char *out = run_bash_status(cmd, g_cfg.cwd, g_cfg.cmd_timeout, &code);
+    if (!code || (code < 0 && (!strncmp(out, "[timeout after", 14) || !strncmp(out, "error:", 6))))
+        return out;
+    char st[48] = "[killed by a signal]";
+    if (code > 0) snprintf(st, sizeof st, "[exit status %d]", code);
+    size_t n = strlen(out), cap = n + sizeof st + 2;
+    char *r = malloc(cap);
+    snprintf(r, cap, "%s%s%s", out, n && out[n - 1] == '\n' ? "" : "\n", st);
+    free(out);
+    return r;
+}
+
+static bool timed_out(const char *gate_output) {
+    return !strncmp(gate_output, "[timeout after", 14);
+}
+
 static bool wall_over(time_t wall0) {
     return g_cfg.wall && time(NULL) - wall0 >= g_cfg.wall;
 }
@@ -43,7 +63,7 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
     int prunes = 0, gates = 0, resets = 0, toks = 0, ptoks = 0, calls = 0, turns = 0;
     double secs = 0;
     bool wrote = false, gate_denied = false;
-    int escape_turns = 0;
+    int escape_turns = 0, slow_gates = 0;
     time_t wall0 = time(NULL);
     const char *finish = "turns";
     /* the current task is the newest user message (a REPL has older ones) */
@@ -142,6 +162,7 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
         if (ntcs == 0) {
             /* no tool call this turn */
             char gbuf[4096];
+            const char *check = NULL;   /* set when the final check did not pass */
             if (ui->deliverable && !wrote && turn < g_cfg.maxturns - 3) {
                 msgs_push(msgs, "user",
                     "You have not written any implementation files yet. Write the required files now, test them, and run the type check.");
@@ -151,10 +172,14 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
             if (prof->gate_cmd && (ui->deliverable || wrote)) {
                 bool bad;
                 char *go = gate_out(prof, ui, &gate_denied, &bad);
-                if (bad && turn < g_cfg.maxturns - 2) {
+                if (g_abort) { finish = "aborted"; free(go); chat_resp_free(r); break; }
+                bool slow = bad && timed_out(go);
+                if (bad) check = slow ? "check-timeout" : "check-failed";
+                /* a check that hangs is reported once, not retried until the cap */
+                if (bad && !(slow && slow_gates++) && turn < g_cfg.maxturns - 2) {
                     snprintf(gbuf, sizeof gbuf,
-                        "`%s` failed. Fix all errors, remove only broken scratch files you created yourself, then verify and reply DONE:\n%.1800s",
-                        prof->gate_cmd, go);
+                        "`%s` %s. Fix all errors, remove only broken scratch files you created yourself, then verify and reply DONE:\n%.1800s",
+                        prof->gate_cmd, slow ? "timed out" : "failed", go);
                     msgs_push(msgs, "user", gbuf);
                     free(go); chat_resp_free(r);
                     continue;
@@ -173,7 +198,7 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
             }
             static char fbuf[64];   /* r is freed below */
             snprintf(fbuf, sizeof fbuf, "%s", r->finish[0] ? r->finish : "stop");
-            finish = !strcmp(fbuf, "stop") ? "done" : fbuf;
+            finish = strcmp(fbuf, "stop") ? fbuf : check ? check : "done";
             chat_resp_free(r);
             break;
         }
@@ -246,7 +271,7 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
                     else if (unapproved) out = str_dup("error: user denied this command — adapt, explain why it is needed, or try another approach");
                     else if (g_abort) out = str_dup("error: aborted by user — not executed");
                     else {
-                        out = run_bash(fixed, g_cfg.cwd, g_cfg.cmd_timeout);
+                        out = bash_out(fixed);
                         if (cmd_is_write(fixed)) wrote = true;
                     }
                     snprintf(reckey, sizeof reckey, "%.1100s", fixed);
@@ -282,10 +307,10 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
             if (bad) {
                 char gb[4096];
                 snprintf(gb, sizeof gb,
-                    "Automatic type check: `%s` currently reports errors. Fix these first, they fail grading:\n%.1800s",
-                    prof->gate_cmd, go);
+                    "Automatic type check: `%s` %s. Fix these first, they fail grading:\n%.1800s",
+                    prof->gate_cmd, timed_out(go) ? "timed out" : "currently reports errors", go);
                 msgs_push(msgs, "user", gb);
-                event(ui, "gate", "auto typecheck failed");
+                event(ui, "gate", timed_out(go) ? "auto typecheck timed out" : "auto typecheck failed");
             }
             free(go);
         }
@@ -358,7 +383,15 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
                  "finish=%s turns=%d prunes=%d gates=%d resets=%d calls=%d tokens=%d secs=%.0f%s",
                  finish, turns, prunes, gates, resets, calls, toks, secs,
                  gate_denied ? " check=skipped" : "");
-    if (tr) fclose(tr);
+    if (tr) {
+        cJSON *e = cJSON_CreateObject();
+        cJSON_AddStringToObject(e, "run_finish", finish);
+        if (gate_denied) cJSON_AddStringToObject(e, "check", "skipped");
+        char *line = cJSON_PrintUnformatted(e);
+        fprintf(tr, "%s\n", line);
+        free(line); cJSON_Delete(e);
+        fclose(tr);
+    }
     rec_clear(&rec);
     free(taskmsg);
     return finish;
