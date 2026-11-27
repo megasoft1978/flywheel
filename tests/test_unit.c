@@ -1557,6 +1557,8 @@ static void test_review4(void) {
         "git clone -qc x=y a b", "git clone --recurse-submodules a b", "git ls-remote -c x=y .",
         "git ls-remote --config=x=y .", "git -c core.x=./evil ls-remote .", "git -c core.x=./evil clone a b",
         "git ls-remote --frob .",
+        "git --git-dir . ls-remote -u ./evil .", "git --work-tree . ls-remote -u ./evil .",
+        "git --namespace x clone -u ./evil a b",
         "go build -C /etc", "go -C /etc build", "go build -debug-actiongraph=/etc/x",
         "go build -debug-trace=/etc/x", "go build -debug-runtime-trace /etc/x",
         "go test -test.testlogfile=/etc/x", "go test -test.gocoverdir=/etc", "go test -test.fuzzcachedir=/etc",

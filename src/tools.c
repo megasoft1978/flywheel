@@ -192,7 +192,8 @@ static bool path_ok(const char *w, const char *cwd) {
 
 static const char *E_RULE = "error: command blocked by deny rule";
 static const char *E_OUTSIDE = "error: write outside working dir is forbidden";
-static const char *E_SED = "error: sed script uses shell expansion or -f; write it literally";
+static const char *E_SED = "error: sed script uses shell expansion or -f; write it literally "
+                           "(and put -- before expanded file operands)";
 
 static const char *scan_script(const char *s, const char *cwd, int depth);
 
@@ -1332,11 +1333,14 @@ static bool has_letter(const char *a, const char *want, const char *valued) {
    -u ...): only the exact ones listed here go unasked */
 static bool git_remote_unsafe(char **v, int n) {
     int k = 1;
-    bool global = false;
+    bool global = false, unknown = false;
     for (; k < n && v[k][0] == '-'; k++) {
         global = true;
         if (!strcmp(v[k], "-c") || !strcmp(v[k], "-C")) k++;
+        else unknown = true;   /* may take the next word as its value */
     }
+    for (int i = 1; unknown && i < n; i++)
+        if (!strcmp(v[i], "clone") || !strcmp(v[i], "ls-remote")) return true;
     if (k >= n) return false;
     bool clone = !strcmp(v[k], "clone");
     if (!clone && strcmp(v[k], "ls-remote")) return false;
