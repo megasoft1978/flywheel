@@ -1392,6 +1392,49 @@ static void test_truth(void) {
     free(oldpath);
 }
 
+/* ---------- loop breaker: an edit is its text, not only its path ---------- */
+
+static int loop_kind;   /* 0 new content, 1 new old/new strings, 2 identical write, 3 identical edit */
+
+static const char *reply_edits(int n) {
+    if (n >= 4) return OK_HDR STOPPED "data: [DONE]\n\n";
+    char args[1200], pad[801];
+    memset(pad, 'x', 800);
+    pad[800] = 0;
+    int k = loop_kind < 2 ? n : 0;
+    if (loop_kind % 2 == 0)
+        snprintf(args, sizeof args, "{\"path\":\"f.txt\",\"content\":\"%sv%d\"}", pad, k);
+    else
+        snprintf(args, sizeof args, "{\"path\":\"f.txt\",\"old_string\":\"v%d\",\"new_string\":\"v%d\"}", k, k + 1);
+    const char *calls[] = {loop_kind % 2 == 0 ? "write_file" : "edit_file", args};
+    return tool_reply("tool_calls", 1, calls);
+}
+
+static void test_loopedit(void) {
+    char dir[] = "/tmp/fwloopXXXXXX", p[256], sum[256];
+    if (!mkdtemp(dir)) { T("mkdtemp", false); return; }
+    snprintf(p, sizeof p, "%s/f.txt", dir);
+    free(g_cfg.cwd);
+    g_cfg.cwd = str_dup(dir);
+    char *prof = g_cfg.profile;
+    g_cfg.profile = (char *)"generic";
+    static const char *const names[] = {
+        "successive rewrites of one file are kept", "successive edits of one file are kept",
+        "identical writes are still a loop", "identical edits are still a loop"};
+    for (loop_kind = 0; loop_kind < 4; loop_kind++) {
+        put(p, "v0\n");
+        Ui u = {.interactive = true};
+        Msgs m;
+        new_task(&m);
+        pid_t srv = serve(reply_edits);
+        agent_run(&m, &u, sum, sizeof sum);
+        stop(srv);
+        T(names[loop_kind], (strstr(sum, "prunes=0 ") != NULL) == (loop_kind < 2));
+        msgs_free(&m);
+    }
+    g_cfg.profile = prof;
+}
+
 #ifdef FW_MINI_HTTP
 int fw_mini_post_stream(const char *url, const char *payload, int streaming,
                         size_t (*cb)(char *, size_t, size_t, void *), void *ud,
@@ -1799,6 +1842,7 @@ int main(void) {
     test_gate_approval();
     test_truth();
     test_atomic();
+    test_loopedit();
 #ifdef FW_MINI_HTTP
     test_connect_timeout();
 #endif

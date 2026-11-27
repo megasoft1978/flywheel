@@ -35,6 +35,12 @@ static char *gate_out(const Profile *prof, Ui *ui, bool *denied, bool *failed) {
 
 /* bash result for the model: output plus how the command ended, if not cleanly
    (a timeout is already announced at the top of the output) */
+/* FNV-1a; the terminating NUL separates consecutive strings */
+static unsigned long long fnv1a(unsigned long long h, const char *s) {
+    do h = (h ^ (unsigned char)*s) * 1099511628211ULL; while (*s++);
+    return h;
+}
+
 static char *bash_out(const char *cmd) {
     int code;
     char *out = run_bash_status(cmd, g_cfg.cwd, g_cfg.cmd_timeout, &code);
@@ -248,7 +254,13 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
                 else out = iswrite ? tool_write_file(g_cfg.cwd, path, a)
                                    : tool_edit_file(g_cfg.cwd, path, a, jb->valuestring);
                 if (!strncmp(out, "ok:", 3)) wrote = true;
-                snprintf(reckey, sizeof reckey, "%.1100s", permstr);
+                /* an edit is its text, not only its path; \001 makes the loop
+                   breaker compare these keys exactly */
+                if (args) {
+                    unsigned long long h = fnv1a(fnv1a(fnv1a(14695981039346656037ULL, path), a),
+                                                 cJSON_IsString(jb) ? jb->valuestring : "");
+                    snprintf(reckey, sizeof reckey, "\001%016llx %.1100s", h, permstr);
+                } else snprintf(reckey, sizeof reckey, "%.1100s", permstr);
                 free(permstr);
                 cJSON_Delete(args);
             } else if (!strcmp(tname, "bash") || !strcmp(tname, "shell")) {

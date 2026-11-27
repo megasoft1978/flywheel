@@ -81,7 +81,8 @@ Project instructions come from the first of `.flywheel.md`, `AGENTS.md` or `CLAU
 
 - **Loop breaker.** When similar commands keep returning similar results, it prunes those turns,
   adds a correction and temporarily raises temperature. The second and fourth prunes also restart the
-  context from the task, the file list and the check output.
+  context from the task, the file list and the check output. File edits count as repeats only when their
+  text is identical.
 - **Tool-call repair.** Recovers shell commands from JSON containing raw control characters.
   Truncated or auto-closed arguments are rejected, never executed.
 - **File tools.** `write_file` and `edit_file` with unique-match edits and atomic replacement, confined to the project.

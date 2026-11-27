@@ -62,9 +62,12 @@ void rec_push(Recent *r, const char *cmd, const char *out) {
 }
 
 /* A repeat needs a similar command AND a similar result: different scripts
-   often share their first lines, and a new result is progress. */
+   often share their first lines, and a new result is progress. File edits
+   (keys starting with \001) repeat only when identical. */
 static bool same(const Recent *r, int i, int j, double t) {
-    return sim_ratio(r->cmds[i], r->cmds[j]) > t && sim_ratio(r->outs[i], r->outs[j]) > t;
+    const char *a = r->cmds[i], *b = r->cmds[j];
+    bool cmd = *a == '\001' || *b == '\001' ? !strcmp(a, b) : sim_ratio(a, b) > t;
+    return cmd && sim_ratio(r->outs[i], r->outs[j]) > t;
 }
 
 const char *detect_loop(const Recent *r, int *clen) {
