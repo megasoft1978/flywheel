@@ -18,6 +18,12 @@ bool image_dims(const unsigned char *d, size_t n, long *w, long *h);
    malloc'd; NULL if it is not a single well-formed word */
 char *image_path_parse(const char *s);
 
+/* Image files and image URLs named in a message the user typed or pasted:
+   absolute, ~/, ./, ../ or file:// paths of existing .png/.jpg/.jpeg/.gif/.webp
+   files, and http(s) URLs ending so. Stores up to max malloc'd references and
+   returns their number; *only is true if the message holds nothing else. */
+int image_find_refs(const char *cwd, const char *msg, char **refs, int max, bool *only);
+
 /* Fill *out (free with image_part_free); false with a reason in err.
    Relative paths resolve against cwd (NULL = process cwd). */
 bool image_from_file(const char *cwd, const char *spec, ImagePart *out, char *err, size_t errcap);

@@ -1,6 +1,7 @@
 #define _XOPEN_SOURCE 700
 #define _DARWIN_C_SOURCE 1
 #include "flywheel.h"
+#include "image.h"
 #include <termios.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
@@ -74,7 +75,9 @@ static double plast;
 /* message queue for input typed while the agent is busy */
 #define QMAX 8
 static char *qmsg[QMAX];
+static char *qscan[QMAX];         /* the same, as typed: pastes still collapsed */
 static int qn;
+static Images pending;            /* attached, waiting for the next message */
 static bool want_exit;
 
 static const struct { const char *cmd, *desc; } SLASH[] = {
@@ -83,6 +86,7 @@ static const struct { const char *cmd, *desc; } SLASH[] = {
     {"/model",  "show or switch model (/model NAME)"},
     {"/allow",  "list this project's permission rules"},
     {"/status", "engine, model, profile, conversation size"},
+    {"/paste",  "attach the clipboard image to the next message"},
     {"/copy",   "copy the last reply to the clipboard"},
     {"/mouse",  "mouse on/off (off: select text natively)"},
     {"/help",   "keys, mouse, and commands"},
@@ -1680,7 +1684,7 @@ static void paste_tick(void) {
 }
 
 static void queue_clear(void) {
-    for (int i = 0; i < qn; i++) free(qmsg[i]);
+    for (int i = 0; i < qn; i++) { free(qmsg[i]); free(qscan[i]); }
     qn = 0;
 }
 
@@ -2107,6 +2111,17 @@ void tui_run_task(const char *prompt) {
     msgs_push(g_msgs, "user", prompt);
     TItem *u = item_new(T_USER);
     item_append(u, prompt);
+    Images *att = &g_msgs->v[g_msgs->n - 1].images;
+    *att = pending;
+    pending = (Images){0};
+    for (int i = 0; i < att->n; i++) {
+        const char *src = att->v[i].source, *base = strrchr(src, '/');
+        char b[400], name[256];
+        snprintf(b, sizeof b, DIM "  image: %s · %zu KB" RESET,
+                 clean_line(name, sizeof name, !strstr(src, "://") && base ? base + 1 : src),
+                 (att->v[i].size + 1023) / 1024);
+        item_append(item_new(T_RAW), b);
+    }
     render_screen();
 
     Ui ui = {.emit_text = ui_text, .emit_think = ui_think, .emit_tool = ui_tool,
@@ -2287,21 +2302,22 @@ static bool project_root(char root[PATH_MAX], struct stat *rst) {
     return !stat(root, rst);
 }
 
-/* First pbcopy on PATH that the project cannot have supplied: empty and
-   relative entries are skipped, as is anything resolving inside the project. */
-static bool find_pbcopy(char out[PATH_MAX]) {
+/* First program of that name on PATH that the project cannot have supplied:
+   empty and relative entries are skipped, as is anything resolving inside the
+   project. */
+static bool find_tool(const char *name, char out[PATH_MAX]) {
     char root[PATH_MAX];
     struct stat rst;
     const char *p = getenv("PATH");
     if (!p || !project_root(root, &rst)) return false;
     while (*p) {
         size_t n = strcspn(p, ":");
-        char dir[PATH_MAX], file[PATH_MAX + 8], real_dir[PATH_MAX];
+        char dir[PATH_MAX], file[PATH_MAX + 32], real_dir[PATH_MAX];
         struct stat st;
         if (n && n < sizeof dir && *p == '/') {
             memcpy(dir, p, n);
             dir[n] = 0;
-            snprintf(file, sizeof file, "%s/pbcopy", dir);
+            snprintf(file, sizeof file, "%s/%s", dir, name);
             if (realpath(dir, real_dir) && !path_within(real_dir, &rst) &&
                 realpath(file, out) && !path_within(out, &rst) &&
                 !stat(out, &st) && S_ISREG(st.st_mode) && !access(out, X_OK))
@@ -2313,12 +2329,12 @@ static bool find_pbcopy(char out[PATH_MAX]) {
     return false;
 }
 
-/* Feed s to pbcopy (see find_pbcopy, no shell). True only if it took everything
+/* Feed s to pbcopy (see find_tool, no shell). True only if it took everything
    and exited successfully. */
 static bool run_pbcopy(const char *s, size_t n) {
     int fd[2];
     char prog[PATH_MAX];
-    if (!find_pbcopy(prog) || pipe(fd)) return false;
+    if (!find_tool("pbcopy", prog) || pipe(fd)) return false;
     pid_t pid = fork();
     if (pid < 0) { close(fd[0]); close(fd[1]); return false; }
     if (pid == 0) {
@@ -2350,6 +2366,15 @@ static bool run_pbcopy(const char *s, size_t n) {
     while ((r = waitpid(pid, &st, WNOHANG)) == 0 && mono_now() < end) nanosleep(&nap, NULL);
     if (r == 0) { kill(pid, SIGKILL); waitpid(pid, &st, 0); return false; }
     return r == pid && off == n && WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+
+/* on this Mac's own terminal: over SSH its clipboard is not the user's */
+static bool local_mac(void) {
+#ifdef __APPLE__
+    return !getenv("SSH_CONNECTION") && !getenv("SSH_TTY") && !getenv("SSH_CLIENT");
+#else
+    return false;
+#endif
 }
 
 static void send_osc52(const char *s, size_t n) {
@@ -2399,16 +2424,13 @@ static void copy_last_reply(void) {
     }
     if (!text) { push_raw("  nothing to copy: no assistant reply yet"); return; }
     size_t n = strlen(text);
-    bool local_mac = false;
-#ifdef __APPLE__
-    local_mac = !getenv("SSH_CONNECTION") && !getenv("SSH_TTY") && !getenv("SSH_CLIENT");
-#endif
+    bool local = local_mac();
     char b[320];
     bool sent = true;
-    if (local_mac && run_pbcopy(text, n)) {
+    if (local && run_pbcopy(text, n)) {
         snprintf(b, sizeof b, GREEN "  ✓ copied the last reply" RESET " (%zu bytes, pbcopy)", n);
     } else {
-        const char *failed = local_mac ? "pbcopy failed. " : "";
+        const char *failed = local ? "pbcopy failed. " : "";
         if (n > OSC52_MAX) {
             sent = false;
             snprintf(b, sizeof b, YELLOW "  not copied:" RESET
@@ -2443,6 +2465,173 @@ static void toggle_mouse(void) {
     push_raw(b);
 }
 
+/* ---------- images ----------
+   Only the input box and the clipboard feed this: never model output, tool
+   output or project files. */
+
+#define CLIPBOARD_TIMEOUT_S 10.0
+
+/* shows as busy while an image loads: typed messages queue (nothing here can be
+   entered again) and Esc cancels */
+static void load_begin(void) {
+    g_abort = 0;
+    working = true;
+    g_stat.phase = "loading image";
+    g_stat.task_toks = g_stat.stream_chunks = 0;
+    clock_gettime(CLOCK_MONOTONIC, &g_stat.task_t0);
+    set_status("loading image…");
+    fw_tick_hook = tui_pump;
+    render_screen();
+}
+
+static void load_end(void) {
+    fw_tick_hook = NULL;
+    working = false;
+    set_status("ready");
+    render_screen();
+}
+
+/* true only when /models says the current model cannot take images */
+static bool vision_off(void) {
+    char *mj = http_get("/models");
+    cJSON *root = mj ? cJSON_Parse(mj) : NULL;
+    free(mj);
+    cJSON *data = root ? cJSON_GetObjectItemCaseSensitive(root, "data") : NULL, *el;
+    int blind = 0, seeing = 0;
+    const cJSON *mine = NULL;
+    cJSON_ArrayForEach(el, data) {
+        cJSON *id = cJSON_GetObjectItemCaseSensitive(el, "id");
+        cJSON *v = cJSON_GetObjectItemCaseSensitive(el, "vision");
+        if (cJSON_IsString(id) && !strcmp(id->valuestring, g_cfg.model)) mine = el;
+        blind += cJSON_IsFalse(v);
+        seeing += cJSON_IsTrue(v);
+    }
+    /* a name the server does not list: refuse only if nothing it serves sees */
+    bool off = mine ? cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(mine, "vision"))
+                    : blind && !seeing;
+    cJSON_Delete(root);
+    return off;
+}
+
+static void no_vision(char *why, size_t cap) {
+    char m[200];
+    snprintf(why, cap, "model %s is serving without vision.\n  Restart the engine without "
+             "--language-only (stop it, then run flywheel setup)\n  or pick another with /model.",
+             clean_line(m, sizeof m, g_cfg.model));
+}
+
+/* Load every reference into pending, all or none; false with the reason. */
+static bool attach_refs(char **refs, int n, char *why, size_t cap) {
+    Images got = images_copy(&pending);
+    bool ok = true;
+    for (int i = 0; ok && i < n; i++) {
+        ImagePart p = {0};
+        char err[256] = "";
+        bool url = !strncasecmp(refs[i], "http://", 7) || !strncasecmp(refs[i], "https://", 8);
+        ok = url ? image_from_url(refs[i], &p, err, sizeof err)
+                 : image_from_file(g_cfg.cwd, refs[i], &p, err, sizeof err);
+        const char *no = ok && !g_abort ? images_add(&got, &p, g_msgs) : NULL;
+        if (g_abort) snprintf(err, sizeof err, "cancelled");
+        else if (no) snprintf(err, sizeof err, "%s", no);
+        if (g_abort || no) {
+            if (ok) image_part_free(&p);
+            ok = false;
+        }
+        if (!ok) {
+            char name[300], e[256];
+            snprintf(why, cap, "%s: %s", clean_line(name, sizeof name, refs[i]),
+                     clean_line(e, sizeof e, err));
+        }
+    }
+    if (ok) {
+        images_free(&pending);
+        pending = got;
+    } else images_free(&got);
+    return ok;
+}
+
+/* osascript writes the clipboard picture to path; no shell */
+static bool run_clipboard(const char *path) {
+    char prog[PATH_MAX];
+    if (!find_tool("osascript", prog)) return false;
+    pid_t pid = fork();
+    if (pid < 0) return false;
+    if (pid == 0) {
+        int nul = open("/dev/null", O_RDWR);
+        if (nul >= 0) { dup2(nul, 0); dup2(nul, 1); dup2(nul, 2); }
+        unsetenv("LC_ALL");
+        setenv("LC_CTYPE", "UTF-8", 1);
+        execv(prog, (char *const[]){
+            "osascript", "-e", "on run argv",
+            "-e", "set d to (the clipboard as «class PNGf»)",
+            "-e", "set f to open for access (POSIX file (item 1 of argv)) with write permission",
+            "-e", "write d to f", "-e", "close access f", "-e", "end run",
+            (char *)path, NULL});
+        _exit(127);
+    }
+    double end = mono_now() + CLIPBOARD_TIMEOUT_S;
+    struct timespec nap = {.tv_sec = 0, .tv_nsec = 20000000};
+    int st = 0;
+    pid_t r;
+    while ((r = waitpid(pid, &st, WNOHANG)) == 0 && mono_now() < end && !g_abort) {
+        if (fw_tick_hook) fw_tick_hook();
+        nanosleep(&nap, NULL);
+    }
+    if (r == 0) { kill(pid, SIGKILL); waitpid(pid, &st, 0); return false; }
+    return r == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+
+static bool attach_clipboard(char *why, size_t cap) {
+    const char *tmp = getenv("TMPDIR");
+    char dir[1024], file[1100];
+    snprintf(dir, sizeof dir, "%s/fw-clip-XXXXXX", tmp && *tmp == '/' ? tmp : "/tmp");
+    if (!mkdtemp(dir)) { snprintf(why, cap, "cannot create a temporary directory"); return false; }
+    snprintf(file, sizeof file, "%s/clipboard.png", dir);
+    ImagePart p = {0};
+    char err[256] = "";
+    bool ran = run_clipboard(file);
+    bool ok = ran && image_from_file(NULL, file, &p, err, sizeof err);
+    unlink(file);
+    rmdir(dir);
+    if (g_abort) snprintf(why, cap, "cancelled");
+    else if (!ran) snprintf(why, cap, "no image on the clipboard");
+    else if (!ok) snprintf(why, cap, "%s", err);
+    else {
+        free(p.source);
+        p.source = str_dup("clipboard");
+        const char *no = images_add(&pending, &p, g_msgs);
+        if (!no) return true;
+        snprintf(why, cap, "%s", no);
+    }
+    if (ok) image_part_free(&p);
+    return false;
+}
+
+static void say_attached(void) {
+    char b[160];
+    snprintf(b, sizeof b, GREEN "  ✓ %d image%s attached" RESET ": type your message (^C drops %s)",
+             pending.n, pending.n == 1 ? "" : "s", pending.n == 1 ? "it" : "them");
+    push_raw(b);
+}
+
+static void paste_clipboard(void) {
+    if (!local_mac()) {
+        push_raw("  /paste reads the clipboard of a local Mac session only.\n"
+                 "  Drag the file in or give an image URL instead.");
+        return;
+    }
+    char why[600];
+    load_begin();
+    bool ok = !vision_off();
+    if (!ok) no_vision(why, sizeof why);
+    else ok = attach_clipboard(why, sizeof why);
+    load_end();
+    if (ok) { say_attached(); return; }
+    char b[700];
+    snprintf(b, sizeof b, YELLOW "  not attached:" RESET " %s", why);
+    push_raw(b);
+}
+
 static void run_slash(const char *cmd) {
     if (!strcmp(cmd, "/init")) {
         term_raw(false);
@@ -2454,18 +2643,22 @@ static void run_slash(const char *cmd) {
         push_raw(GREEN "  ✓ init done" RESET);
     } else if (!strcmp(cmd, "/clear")) {
         while (g_msgs->n > 1) msgs_trunc(g_msgs, 1);
+        images_free(&pending);
         transcript_clear();
         render_screen();
+    } else if (!strcmp(cmd, "/paste")) {
+        paste_clipboard();
     } else if (!strcmp(cmd, "/copy")) {
         copy_last_reply();
     } else if (!strcmp(cmd, "/mouse")) {
         toggle_mouse();
     } else if (!strcmp(cmd, "/help")) {
-        char b[700];
+        char b[900];
         snprintf(b, sizeof b,
-                 "commands: /init /clear /model /allow /status /copy /mouse /help /exit\n"
+                 "commands: /init /clear /model /allow /status /paste /copy /mouse /help /exit\n"
                  "keys: ↑↓ history · Alt+Enter newline (Shift+Enter if the terminal sends it) · ^O expand/collapse cmd · PgUp/PgDn%s scroll · Esc aborts · ^C clear · ^D quit\n"
                  "copy: /copy takes the last reply · /mouse lets the terminal select text\n"
+                 "images: drag a file in or give an image URL · /paste takes the clipboard's\n"
                  "mouse on: hold %s and drag to select",
                  mouse_on ? " or wheel" : "", select_key());
         push_raw(b);
@@ -2542,6 +2735,7 @@ void tui_cleanup(void) {
     for (int i = 0; i < npastes; i++) free(pastes[i].text);
     free(pastes); pastes = NULL; npastes = cap_pastes = 0;
     queue_clear();
+    images_free(&pending);
     free(pbuf); pbuf = NULL; plen = pcap = 0; pasting = false;
     free(inbuf); inbuf = NULL; incap = 0; ilen = icur = 0;
 }
@@ -2628,6 +2822,65 @@ static void push_welcome_card(const Profile *prof) {
     free(card.b);
 }
 
+/* what is searched for images: the input as typed, with one-line pastes (a long
+   drag) filled in. A pasted block of several lines is quoted material. */
+static char *scan_text(const char *s) {
+    size_t len = strlen(s), w = 0;
+    char *out = malloc(expand_into(NULL, s) + len + 1);
+    if (!out) return NULL;
+    for (size_t r = 0; r < len;) {
+        int k = paste_at(s + r, len - r);
+        if (k < 0) { out[w++] = s[r++]; continue; }
+        size_t n = pastes[k].len, tl = strlen(pastes[k].tok);
+        while (n && pastes[k].text[n - 1] == '\n') n--;
+        bool block = memchr(pastes[k].text, '\n', n) != NULL;
+        memcpy(out + w, block ? pastes[k].tok : pastes[k].text, block ? tl : n);
+        w += block ? tl : n;
+        r += tl;
+    }
+    out[w] = 0;
+    return out;
+}
+
+static bool known_command(const char *s) {
+    size_t n = strcspn(s, " ");
+    for (int i = 0; SLASH[i].cmd; i++)
+        if (strlen(SLASH[i].cmd) == n && !memcmp(SLASH[i].cmd, s, n)) return true;
+    return false;
+}
+
+/* Send one message the user entered: cmd as the model gets it, raw as typed.
+   A path starts with '/' too, so known commands are told apart first. */
+static void submit(const char *cmd, const char *raw) {
+    if (is_slash(cmd) && known_command(cmd)) { run_slash(cmd); return; }
+    char *refs[IMG_MAX_COUNT + 1], *scan = scan_text(raw);
+    bool only = false;
+    int n = scan ? image_find_refs(g_cfg.cwd, scan, refs, IMG_MAX_COUNT + 1, &only) : 0;
+    free(scan);
+    if (!n && is_slash(cmd)) { run_slash(cmd); return; }
+    if (n || pending.n) {
+        char why[600];
+        load_begin();
+        bool ok = !vision_off();
+        if (!ok) {
+            no_vision(why, sizeof why);
+            images_free(&pending);      /* the model changed under them */
+        } else ok = attach_refs(refs, n, why, sizeof why);
+        load_end();
+        for (int i = 0; i < n; i++) free(refs[i]);
+        if (!ok) {
+            char b[800];
+            snprintf(b, sizeof b, YELLOW "  not sent:" RESET " %s%s", why,
+                     n ? "\n  To mention an image without attaching it, put it in `backticks`." : "");
+            push_raw(b);
+            if (!ilen) { in_set(raw); render_screen(); }
+            return;
+        }
+        if (only) { say_attached(); return; }
+    }
+    tui_run_task(cmd);
+}
+
 /* Central key handler shared by the idle REPL loop and the busy pump.
    busy=true while the agent is working: typing edits the input box normally,
    Enter queues the message, Esc/^C abort the task, scrolling/expand all work. */
@@ -2665,6 +2918,7 @@ if (busy) {
                                         if (!strcmp(pick, "/exit") || !strcmp(pick, "/quit")) { want_exit = true; return; }
                     render_screen();
                     run_slash(pick);
+                    drain_queue();
                     render_screen();
                 }
             }
@@ -2715,6 +2969,10 @@ if (busy) {
         paste_suspect = false;
         if (busy) { g_abort = 1; queue_clear(); set_status("aborting…"); render_screen(); return; }
         ilen = icur = 0; inbuf[0] = 0; hpos = -1; menu_sel = 0; menu_dismissed = false;
+        if (pending.n) {
+            images_free(&pending);
+            set_notice("attached images dropped");
+        }
         render_screen(); return;
     }
     if (ch == 15) { toggle_tool(-1); return; }      /* ^O expand/collapse last command */
@@ -2788,17 +3046,20 @@ if (busy) {
                 HIST[MAXHIST - 1] = str_dup(inbuf);
             }
         }
+        char *raw = str_dup(inbuf);
         ilen = icur = 0; inbuf[0] = 0; hpos = -1; menu_sel = 0; menu_dismissed = false;
         if (busy) {
+            qscan[qn] = raw;
             qmsg[qn++] = cmd;
             render_screen();
             return;
         }
-        if (isexit) { want_exit = true; free(cmd); return; }
+        if (isexit) { want_exit = true; free(cmd); free(raw); return; }
         render_screen();
-        if (is_slash(cmd)) run_slash(cmd);
-        else tui_run_task(cmd);
+        submit(cmd, raw);
         free(cmd);
+        free(raw);
+        drain_queue();      /* typed while an image was loading */
         render_screen();
         return;
     }
@@ -2819,12 +3080,13 @@ if (busy) {
 /* Drain queued messages after a task completes. */
 static void drain_queue(void) {
     while (qn > 0 && !g_abort) {
-        char *next = qmsg[0];
+        char *next = qmsg[0], *raw = qscan[0];
         qn--;
         memmove(qmsg, qmsg + 1, (size_t)qn * sizeof *qmsg);
-        if (is_slash(next)) run_slash(next);
-        else tui_run_task(next);
+        memmove(qscan, qscan + 1, (size_t)qn * sizeof *qscan);
+        submit(next, raw);
         free(next);
+        free(raw);
     }
     if (g_abort) queue_clear();
 }

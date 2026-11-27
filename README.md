@@ -106,8 +106,9 @@ Project instructions come from the first of `.flywheel.md`, `AGENTS.md` or `CLAU
 - Keep typing while the agent works: Enter queues, `Esc` interrupts, scrollback stays put.
 - Streaming markdown, code boxes, tables and links.
 - Tool output and thinking collapse; click or `^O` to expand.
-- Slash menu (`/init /clear /model /allow /status /copy /mouse /help /exit`), input history,
+- Slash menu (`/init /clear /model /allow /status /paste /copy /mouse /help /exit`), input history,
   large-paste collapse.
+- Images, see [Images](#images).
 - `/copy` copies the last assistant reply as plain text (escape sequences, control characters and
   bidi, zero-width and tag characters removed; the England, Scotland and Wales flags stay). It uses
   `pbcopy` on a local macOS session (never one found through a relative `PATH` entry or inside the
@@ -119,6 +120,31 @@ Project instructions come from the first of `.flywheel.md`, `AGENTS.md` or `CLAU
   turn reporting off. While it is off, scroll with `PgUp`/`PgDn` and expand the latest block with
   `^O`; `/mouse` turns it back on.
 - Live tokens per second (end to end), context gauge and completion summary.
+
+## Images
+
+In the interactive UI only (one-shot mode sends text only):
+
+- Drag an image file onto the terminal, or type its path: absolute, `~/`, `./`, `../` or `file://`,
+  ending in `.png`, `.jpg`, `.jpeg`, `.gif` or `.webp`. Shell escapes and quotes are understood.
+- Give an `http://` or `https://` URL ending the same way. Only public addresses are fetched, with no
+  redirects and no proxy. The static Linux build refuses URLs.
+- `/paste` attaches the picture on the clipboard (a local macOS session, not over SSH). A file copied
+  in Finder may give its icon, so drag files instead.
+
+A message holding only images keeps them for your next one; `^C` or `/clear` drops them. If one cannot
+be loaded, nothing is sent and the message returns to the input box. Only what you type or paste is
+searched, never model output, tool output or project files. A pasted block of several lines is not
+searched, and a path in backticks is left alone. Naming an image file attaches it, even outside the
+project.
+
+Limits: 10 MB per file, and 64 images or 32 MB (encoded) per conversation. On macOS, images over
+1568 px on a side are downscaled. Images stay in the conversation until `/clear`, also one the server
+rejected.
+
+The engine must serve the model with vision. `flywheel setup` starts it that way. A server started
+with `--language-only` (as earlier versions did) has to be stopped and started again; flywheel refuses
+images while the server reports no vision.
 
 ## Safety
 
@@ -281,7 +307,7 @@ applies unless `--unsafe` is also given.
 
 ## Limits
 
-- Text only. The model has vision, but flywheel sends it text only.
+- Images go only from the interactive UI ([Images](#images)); no audio or video.
 - No API key support. The Linux build has no HTTPS.
 - No context compaction.
 - No sandbox on Linux yet.

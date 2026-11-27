@@ -238,6 +238,28 @@ static bool handle_security(int cfd, const char *last_msg) {
     return true;
 }
 
+/* count the image parts of this request: in the last message and in all of them */
+static bool handle_images(int cfd, const char *body, const char *last_msg) {
+    if (strstr(last_msg, "SHOWPATH")) {          /* image paths in model text */
+        reply(cfd, "content", "see ./shot.png", false);
+        return true;
+    }
+    if (strstr(last_msg, "TOOLPATH")) {          /* and in tool output */
+        reply(cfd, NULL, "echo ./shot.png", true);
+        return true;
+    }
+    static const char PART[] = "\"type\":\"image_url\"";
+    if (!strstr(last_msg, PART) && !strstr(last_msg, "IMGQ")) return false;
+    int last = 0, all = 0;
+    for (const char *p = last_msg; (p = strstr(p, PART)); p++) last++;
+    for (const char *p = body; (p = strstr(p, PART)); p++) all++;
+    char out[96];
+    snprintf(out, sizeof out, "GOT last=%d all=%d png=%d", last, all,
+             strstr(last_msg, "data:image/png;base64,iVBOR") != NULL);
+    reply(cfd, "content", out, false);
+    return true;
+}
+
 /* the flag of Scotland: U+1F3F4, tags "gbsct", U+E007F */
 #define FLAG_SCT "\xf0\x9f\x8f\xb4\xf3\xa0\x81\xa7\xf3\xa0\x81\xa2\xf3\xa0\x81\xb3" \
                  "\xf3\xa0\x81\xa3\xf3\xa0\x81\xb4\xf3\xa0\x81\xbf"
@@ -271,7 +293,8 @@ static void handle_client(int cfd) {
 
     if (!strncmp(req, "GET /v1/models", 14)) {
         const char *resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
-                           "{\"data\":[{\"id\":\"mock/qwen\"},{\"id\":\"mock/qwen-alt\"}]}";
+                           "{\"data\":[{\"id\":\"mock/qwen\",\"vision\":true},"
+                           "{\"id\":\"mock/qwen-alt\",\"vision\":false}]}";
         send_all(cfd, resp, strlen(resp));
         close(cfd);
         return;
@@ -292,6 +315,7 @@ static void handle_client(int cfd) {
         return;
     }
 
+    if (handle_images(cfd, body, last_msg)) return;
     if (handle_probe(cfd, last_msg)) return;
     if (handle_security(cfd, last_msg)) return;
 
@@ -1044,7 +1068,7 @@ static void copy_tests(const char *dir, const char *cmd) {
     keys(s, "/clear\r");
     keys(s, "/");
     CHECK(s, "short menu: last command off screen", find_row(s, "/quit") < 0);
-    for (int i = 0; i < 9; i++) keys(s, "\033[B");
+    for (int i = 0; i < 10; i++) keys(s, "\033[B");
     int quit = find_row(s, "/quit");
     CHECK(s, "short menu: arrows reach /quit", quit >= 0 && find_row(s, "\xe2\x96\xb8 /quit") == quit);
     CHECK(s, "short menu: first command scrolled away", find_row(s, "write .flywheel.md") < 0);
@@ -1165,6 +1189,162 @@ static void copy_tests(const char *dir, const char *cmd) {
     rmdir(linkdir);
     rmdir(bin);
     rmdir(outside);
+}
+
+/* ---------- images ---------- */
+
+static const unsigned char TINY_PNG[] = {   /* signature + 1x1 IHDR */
+    0x89,'P','N','G','\r','\n',0x1a,'\n', 0,0,0,13,'I','H','D','R', 0,0,0,1, 0,0,0,1, 8,0,0,0,0};
+
+static void put_file(const char *path, const void *d, size_t n, int mode) {
+    FILE *f = fopen(path, "wb");
+    assert(f != NULL);
+    size_t w = fwrite(d, 1, n, f);
+    fclose(f);
+    assert(w == n && chmod(path, (mode_t)mode) == 0);
+}
+
+/* press Enter on msg and wait for the screen to say want */
+static bool sends(MicaSession *s, const char *msg, const char *want) {
+    type_str(s, msg);
+    mica_session_key(s, VTERM_KEY_ENTER, VTERM_MOD_NONE);
+    bool ok = wait_for_text(s, want, 8000);
+    pump(s, 300);
+    return ok;
+}
+
+/* every session here finds a fake osascript first on PATH: the real clipboard
+   is never read */
+static void image_tests(const char *cmd) {
+    char proj[] = "/tmp/fwimg-XXXXXX", outside[] = "/tmp/fwimgbin-XXXXXX";
+    assert(mkdtemp(proj) != NULL && mkdtemp(outside) != NULL);
+    char shot[1100], spaced[1100], bad[1100], md[1100], script[1100], slow[1100], hang[1100];
+    snprintf(shot, sizeof shot, "%s/shot.png", proj);
+    snprintf(spaced, sizeof spaced, "%s/my shot.png", proj);
+    snprintf(bad, sizeof bad, "%s/bad.png", proj);
+    snprintf(md, sizeof md, "%s/.flywheel.md", proj);
+    put_file(shot, TINY_PNG, sizeof TINY_PNG, 0600);
+    put_file(spaced, TINY_PNG, sizeof TINY_PNG, 0600);
+    put_file(bad, "nope", 4, 0600);
+    put_file(md, "# see ./shot.png\n", 17, 0600);
+    snprintf(script, sizeof script, "%s/osascript", outside);
+    snprintf(slow, sizeof slow, "%s/slow", outside);
+    snprintf(hang, sizeof hang, "%s/hang", outside);
+    char sh[4096];
+    int n = snprintf(sh, sizeof sh, "#!/bin/sh\nfor a; do out=$a; done\n"
+                     "[ -e '%s' ] && exec /bin/sleep 30\n[ -e '%s' ] && /bin/sleep 2\n"
+                     "exec /bin/cp '%s' \"$out\"\n", hang, slow, shot);
+    put_file(script, sh, (size_t)n, 0700);
+
+    char full[8192], msg[2048];
+    snprintf(full, sizeof full, "unset SSH_CONNECTION SSH_TTY SSH_CLIENT TMUX; "
+             "export PATH='%s':\"$PATH\"; %s", outside, cmd);
+    MicaSession *s = mica_session_create(proj, full, 30, 100);
+    assert(s != NULL);
+    CHECK(s, "image: ready", wait_for_text(s, "ready", 3000));
+    pump(s, 150);
+
+    /* a dragged file arrives as a paste of its shell-escaped path */
+    snprintf(msg, sizeof msg, PS "%s/my\\ shot.png " PE, proj);
+    CHECK(s, "image: dragged path alone is held", sends(s, msg, "1 image attached"));
+    CHECK(s, "image: held image goes with the next message",
+          sends(s, "IMGQ what is it", "GOT last=1 all=1 png=1"));
+    CHECK(s, "image: transcript names it", find_row(s, "image: my shot.png") >= 0);
+
+    keys(s, "/clear\r");
+    snprintf(msg, sizeof msg, "describe '%s' please", spaced);
+    CHECK(s, "image: quoted path in a message", sends(s, msg, "GOT last=1 all=1 png=1"));
+    keys(s, "/clear\r");
+    CHECK(s, "image: relative path in a message", sends(s, "describe ./shot.png", "GOT last=1 all=1"));
+
+    /* only typed or pasted text is searched */
+    keys(s, "/clear\r");
+    CHECK(s, "image: model text reply", sends(s, "SHOWPATH", "see ./shot.png"));
+    type_str(s, "TOOLPATH");
+    mica_session_key(s, VTERM_KEY_ENTER, VTERM_MOD_NONE);
+    pump(s, 1500);
+    if (find_row(s, "Do you want to proceed?") >= 0) keys(s, "y");
+    pump(s, 800);
+    CHECK(s, "image: model, tool and project text attach nothing",
+          sends(s, "IMGQ", "GOT last=0 all=0"));
+
+    keys(s, "/clear\r");
+    type_str(s, "IMGQ " PS "log line\nopen ./shot.png\n" PE);
+    CHECK(s, "image: a pasted block is not searched", sends(s, "", "GOT last=0 all=0"));
+    keys(s, "/clear\r");
+    CHECK(s, "image: backticks only mention", sends(s, "IMGQ `./shot.png`", "GOT last=0 all=0"));
+
+    /* a failure sends nothing and keeps the text */
+    keys(s, "/clear\r");
+    CHECK(s, "image: bad file is said",
+          sends(s, "IMGQ ./bad.png", "not a PNG, JPEG, GIF or WebP image"));
+    CHECK(s, "image: nothing sent", find_row(s, "not sent:") >= 0 && find_row(s, "GOT ") < 0);
+    CHECK(s, "image: text back in the input box",
+          find_last_row(s, "IMGQ ./bad.png") > find_row(s, "not sent:"));
+    keys(s, "\x03");
+    keys(s, "/clear\r");
+    CHECK(s, "image: private URL refused", sends(s, "IMGQ http://127.0.0.1/a.png", "not sent:"));
+    CHECK(s, "image: private URL not sent", find_row(s, "GOT ") < 0);
+    keys(s, "\x03");
+
+    /* held images are dropped by /clear and ^C */
+    keys(s, "/clear\r");
+    CHECK(s, "image: held", sends(s, "./shot.png", "1 image attached"));
+    keys(s, "/clear\r");
+    CHECK(s, "image: /clear drops it", sends(s, "IMGQ", "GOT last=0 all=0"));
+    keys(s, "/clear\r");
+    CHECK(s, "image: held again", sends(s, "./shot.png", "1 image attached"));
+    keys(s, "\x03");
+    CHECK(s, "image: ^C says it dropped", find_row(s, "attached images dropped") >= 0);
+    CHECK(s, "image: ^C drops it", sends(s, "IMGQ", "GOT last=0 all=0"));
+
+    /* the clipboard */
+    keys(s, "/clear\r");
+    CHECK(s, "paste: attaches", sends(s, "/paste", "1 image attached"));
+    CHECK(s, "paste: sent", sends(s, "IMGQ", "GOT last=1 all=1 png=1"));
+    CHECK(s, "paste: named clipboard", find_row(s, "image: clipboard") >= 0);
+
+    /* input during a load queues: nothing re-enters it */
+    keys(s, "/clear\r");
+    put_file(slow, "", 0, 0600);
+    keys(s, "/paste\r");
+    CHECK(s, "paste: shows loading", find_row(s, "loading image") >= 0);
+    keys(s, "IMGQ queued\r");
+    CHECK(s, "paste: message waits for the load", find_row(s, "GOT ") < 0);
+    CHECK(s, "paste: queued message gets the image",
+          wait_for_text(s, "GOT last=1 all=1", 8000));
+    pump(s, 300);
+    unlink(slow);
+
+    keys(s, "/clear\r");
+    put_file(hang, "", 0, 0600);
+    keys(s, "/paste\r");
+    keys(s, "\x1b");
+    CHECK(s, "paste: Esc cancels", wait_for_text(s, "cancelled", 4000));
+    unlink(hang);
+    pump(s, 200);
+    CHECK(s, "paste: nothing held after cancel", sends(s, "IMGQ", "GOT last=0 all=0"));
+    keys(s, "/exit\r");
+    CHECK(s, "image: clean exit", wait_for_exit(s, 3000));
+    mica_session_destroy(s);
+
+    /* a model without vision: cmd ends in the model name */
+    strncat(full, "-alt", sizeof full - strlen(full) - 1);
+    s = mica_session_create(proj, full, 30, 100);
+    assert(s != NULL);
+    CHECK(s, "no vision: ready", wait_for_text(s, "ready", 3000));
+    pump(s, 150);
+    CHECK(s, "no vision: path refused", sends(s, "IMGQ ./shot.png", "serving without vision"));
+    CHECK(s, "no vision: nothing sent", find_row(s, "GOT ") < 0);
+    keys(s, "\x03");
+    keys(s, "/clear\r");
+    CHECK(s, "no vision: /paste refused", sends(s, "/paste", "serving without vision"));
+    CHECK(s, "no vision: plain text still works", sends(s, "IMGQ", "GOT last=0 all=0"));
+    mica_session_destroy(s);
+
+    char rm[1200];
+    snprintf(rm, sizeof rm, "rm -rf '%s' '%s'", proj, outside);
+    system(rm);
 }
 
 int main(int argc, char **argv) {
@@ -1544,6 +1724,7 @@ int main(int argc, char **argv) {
     security_tests(testdir, cmd);
     input_tests(testdir, cmd);
     copy_tests(testdir, cmd);
+    image_tests(cmd);
     stop_mock_server(srv_th);
 
     char rm[1200];

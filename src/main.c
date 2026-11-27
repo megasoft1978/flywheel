@@ -336,7 +336,7 @@ int fw_do_setup(void) {
             char sc[2048];
             snprintf(sc, sizeof sc,
                 "nohup splash serve --model %s --model-dir '%s' --draft-model '%s' "
-                "--port 8312 --language-only --max-concurrent-requests 1 "
+                "--port 8312 --max-concurrent-requests 1 "
                 "--thinking-token-budget 1024 --no-webui >/tmp/flywheel-serve.log 2>&1 &",
                 g_cfg.model, mdir, ddir);
             if (confirm("start the server now? (detached, tuned flags)", true)) {
