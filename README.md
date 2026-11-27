@@ -120,18 +120,23 @@ untrusted repository or task in a VM.
 **Sandbox (macOS)**
 
 - Writes: the working directory and a private `$TMPDIR` (plus `/dev/null` and similar). Not `/tmp`.
-  Not the project's `.envrc`, `.git/hooks`, `.git/config`, `.git/config.worktree` or
-  `.git/commondir`, which run or redirect code later, outside the sandbox. Without a real `.git`
-  directory, nothing can create `.git`, nor a `HEAD` in the root. The project directory itself and
-  the directories above these files and the stores below cannot be renamed or removed.
+  Not the project's `.envrc`, `.git/hooks`, `.git/config`, `.git/config.worktree`,
+  `.git/commondir`, `.git/rebase-merge`, `.git/rebase-apply` or `.git/sequencer`, which run or
+  redirect code later, outside the sandbox. Without a real `.git` directory, nothing can create
+  `.git`. The project directory itself and the directories above these files and the stores below
+  cannot be renamed or removed.
+- Never a `HEAD` in the root, in any case of the name: with `.git` made invalid, git would treat the
+  root as a repository. So a root file called `head` cannot be written or checked out (a directory
+  of that name that already exists works).
 - Anywhere it can write, nested ones included: no creating, changing, renaming in or linking a
   `.envrc` or a nested `.git` (directory, file or symlink), and none of `config`,
-  `config.worktree`, `commondir` or `hooks` in a `.git` directory, its `modules` or its
-  `worktrees`. No new entry can appear in `.git/modules` or `.git/worktrees`. These are fixed
+  `config.worktree`, `commondir`, `hooks`, `rebase-merge`, `rebase-apply` or `sequencer` in a
+  `.git` directory, its `modules` or its `worktrees`. The same holds in the project's git directory
+  when `.git` is a link or a `gitdir:` file. No new entry can appear in `.git/modules` or `.git/worktrees`. These are fixed
   rules by name, in every spelling the filesystem treats as the same: nothing is scanned, moved
   or repaired, and detached processes are bound by them too. In a root that is already a bare
-  repository, its `config`, `config.worktree`, `commondir` and `hooks` are closed. If the rules
-  cannot be built, the command is not run.
+  repository (or has a `HEAD` file), the same names are closed there. If the rules cannot be built,
+  or a protected file or store is a link that cannot be followed (a loop), the command is not run.
 - A command that was given the network has all its processes killed when it ends, detached ones
   included, so that none keeps that access. Other background processes (a dev server) keep
   running, still inside the sandbox.
@@ -162,6 +167,9 @@ What stops working inside it:
 - `git init`, `clone`, `worktree add` and `submodule add` anywhere below the project, also in
   `$TMPDIR`, and so tests that make repositories and package installs that clone one (git
   dependencies) or ship an `.envrc`.
+- Rebase and cherry-pick sequences: the model cannot start, continue or abort a rebase,
+  `git pull --rebase`, `git am` or a cherry-pick or revert of several commits inside the sandbox.
+  You still can, outside it.
 - Removing a directory that holds a nested `.git` or `.envrc` (`rm -rf` removes the
   rest and leaves the protected files), and
   `git worktree remove` or `prune`. Renaming the directory around them works.
@@ -186,6 +194,8 @@ Where it does not protect you:
   link file that points outside any `.git`, for what a nested config, hook or `.envrc` symlink
   points to, for hard links that already exist, and for new directories under a
   `.git/modules/<group>/` of submodules with a `/` in their name.
+- Files that git config pulls in through `include.path` or `includeIf`: if one is inside the
+  project (or `$TMPDIR`), commands can change it, and git outside the sandbox obeys it.
 - Started in your home directory (or above it), the sandbox makes all of it writable, except the
   stores listed above.
 - A store reached through a chain of several symlinks is protected at both ends, but a link in the

@@ -1178,9 +1178,11 @@ static const char *const SBX_SECRETS[] = {
     NULL
 };
 
-/* in the project, but run or obeyed later by tools outside the sandbox */
+/* in the project, but run or obeyed later by tools outside the sandbox. The
+   rebase state carries commands a later `git rebase --continue` runs. */
 static const char *const SBX_PROJ[] = {
-    ".envrc", ".git/hooks", ".git/config", ".git/config.worktree", ".git/commondir", NULL
+    ".envrc", ".git/hooks", ".git/config", ".git/config.worktree", ".git/commondir",
+    ".git/rebase-merge", ".git/rebase-apply", ".git/sequencer", NULL
 };
 
 typedef struct { char *s; size_t n; bool full; } Sb;
@@ -1240,7 +1242,9 @@ static bool sbx_resolve(const char *path, char *out, int depth) {
     const char *dir = strcmp(real, "/") ? real : "";
     if (snprintf(out, PATH_MAX, "%s/%s", dir, slash + 1) >= PATH_MAX) return false;
     ssize_t n = readlink(out, link, sizeof link - 1);
-    if (n < 0) return true;
+    /* not a link, not there, or out of reach of the sandbox too */
+    if (n < 0) return errno == EINVAL || errno == ENOENT || errno == ENOTDIR
+                      || errno == EACCES || errno == EPERM;
     link[n] = 0;
     if (snprintf(next, sizeof next, "%s%s%s", *link == '/' ? "" : dir,
                  *link == '/' ? "" : "/", link) >= (int)sizeof next) return false;
@@ -1275,6 +1279,12 @@ static bool each_secret(SecretFn fn, void *arg) {
 
 static bool sb_deny_secret(const char *path, void *b) { sb_path(b, path); return false; }
 static bool sb_pin_secret(const char *path, void *b) { sb_pin_above(b, path); return false; }
+/* a store that cannot be followed cannot be ruled out: nothing runs */
+static bool secret_unresolved(const char *path, void *unused) {
+    (void)unused;
+    char target[PATH_MAX];
+    return !sbx_resolve(path, target, 0);
+}
 
 /* path is root or below it, however its case or Unicode form is spelled */
 static bool path_under(const char *root, const char *path) {
@@ -1359,7 +1369,18 @@ static bool bare_like(const char *dir) {
 
 static bool gitdir_name(const char *n) {
     return !strcasecmp(n, "config") || !strcasecmp(n, "config.worktree")
-        || !strcasecmp(n, "commondir") || !strcasecmp(n, "hooks");
+        || !strcasecmp(n, "commondir") || !strcasecmp(n, "hooks")
+        || !strcasecmp(n, "rebase-merge") || !strcasecmp(n, "rebase-apply")
+        || !strcasecmp(n, "sequencer");
+}
+
+/* bare_like, or a HEAD file already there: the root counts as a repository */
+static bool root_bare(const char *proj) {
+    char p[PATH_MAX];
+    struct stat st;
+    return bare_like(proj)
+        || (snprintf(p, sizeof p, "%s/HEAD", proj) < (int)sizeof p && !lstat(p, &st)
+            && !S_ISDIR(st.st_mode));
 }
 
 /* the whole of a small regular file, NUL terminated; -1 for anything else */
@@ -1392,6 +1413,27 @@ static bool first_line(const char *path, char *out, size_t cap) {
     if (read_small(path, out, cap) < 0) return false;
     out[strcspn(out, "\r\n")] = 0;
     return *out != 0;
+}
+
+/* The root's git directory when .git only leads to it: a link, or a "gitdir:"
+   file. The rules by name do not see it. False if there is none; *bad if it
+   cannot be followed. out holds PATH_MAX bytes. */
+static bool gitdir_elsewhere(const char *proj, char *out, bool *bad) {
+    char git[PATH_MAX], at[PATH_MAX], line[PATH_MAX], next[PATH_MAX];
+    struct stat st;
+    *bad = false;
+    if (snprintf(git, sizeof git, "%s/.git", proj) >= (int)sizeof git) { *bad = true; return false; }
+    if (lstat(git, &st) || S_ISDIR(st.st_mode)) return false;
+    if (!sbx_resolve(git, at, 0)) { *bad = true; return false; }
+    if (stat(at, &st) || S_ISDIR(st.st_mode)) {
+        snprintf(out, PATH_MAX, "%s", at);
+        return true;
+    }
+    if (!first_line(at, line, sizeof line) || strncmp(line, "gitdir: ", 8)) return false;
+    const char *rel = line + 8;
+    if (snprintf(next, sizeof next, "%s%s%s", *rel == '/' ? "" : proj, *rel == '/' ? "" : "/", rel)
+        >= (int)sizeof next || !sbx_resolve(next, out, 0)) { *bad = true; return false; }
+    return true;
 }
 
 /* ---------- linked worktree: git keeps its files outside the project ---------- */
@@ -1429,7 +1471,8 @@ static void sb_linked_allow(Sb *b, const Linked *w) {
 }
 
 static const char *const LINKED_CLOSED[] = {
-    "config", "config.worktree", "commondir", "gitdir", "hooks", "modules", NULL
+    "config", "config.worktree", "commondir", "gitdir", "hooks", "modules",
+    "rebase-merge", "rebase-apply", "sequencer", NULL
 };
 
 static void sb_linked_deny(Sb *b, const Linked *w, bool pins) {
@@ -1446,12 +1489,14 @@ static void sb_linked_deny(Sb *b, const Linked *w, bool pins) {
 
 /* the SBX_PROJ files of the project: closed, along with what they link to and
    every directory leading there. Without a real .git directory nothing may
-   create or change .git, or a prepared one could be moved into place. */
-static void sb_project(Sb *b, const char *proj, bool repo, bool any, const Linked *linked) {
+   create or change .git, or a prepared one could be moved into place. other is
+   the git directory .git leads to, or NULL. */
+static void sb_project(Sb *b, const char *proj, bool repo, const char *other, const Linked *linked) {
     char p[PATH_MAX], target[PATH_MAX];
     /* a root that is already a bare repository */
-    static const char *const bare[] = {"config", "config.worktree", "commondir", "hooks", NULL};
-    bool is_bare = bare_like(proj);
+    static const char *const bare[] = {"config", "config.worktree", "commondir", "hooks",
+                                       "rebase-merge", "rebase-apply", "sequencer", NULL};
+    bool is_bare = root_bare(proj);
     sb_add(b, "(deny file-write*");
     if (snprintf(p, sizeof p, "%s/.git", proj) >= (int)sizeof p) b->full = true;
     if (!repo) sb_path(b, p);
@@ -1462,10 +1507,22 @@ static void sb_project(Sb *b, const char *proj, bool repo, bool any, const Linke
     for (int i = 0; SBX_PROJ[i]; i++) {
         if (snprintf(p, sizeof p, "%s/%s", proj, SBX_PROJ[i]) >= (int)sizeof p) b->full = true;
         sb_path(b, p);
-        if (sbx_resolve(p, target, 0) && strcmp(p, target)) sb_path(b, target);
+        if (!sbx_resolve(p, target, 0)) b->full = true;
+        else if (strcmp(p, target)) sb_path(b, target);
     }
-    /* without a .git, a HEAD (in any case) makes the root itself a repository */
-    for (int m = 0; !any && m < 16; m++) {
+    /* a git directory not made yet cannot be prepared and moved in */
+    struct stat st;
+    if (other && lstat(other, &st)) {
+        sb_path(b, other);
+        snprintf(p, sizeof p, "%s", other);
+        for (char *s; (s = strrchr(p, '/')) && s != p; ) {
+            *s = 0;
+            if (lstat(p, &st)) sb_filter(b, "literal", p);
+        }
+    }
+    /* once .git is not valid, a HEAD (in any case) makes the root itself a
+       repository, and a command can make it so: never one in the root */
+    for (int m = 0; m < 16; m++) {
         char head[5] = "head";
         for (int i = 0; i < 4; i++) if (m >> i & 1) head[i] = (char)toupper((unsigned char)head[i]);
         if (snprintf(p, sizeof p, "%s/%s", proj, head) >= (int)sizeof p) b->full = true;
@@ -1480,6 +1537,10 @@ static void sb_project(Sb *b, const char *proj, bool repo, bool any, const Linke
         if (sbx_resolve(p, target, 0) && strcmp(p, target)) sb_pin_above(b, target);
     }
     if (linked) sb_linked_deny(b, linked, true);
+    if (other) {
+        sb_pin(b, other);
+        sb_pin_above(b, other);
+    }
     each_secret(sb_pin_secret, b);
     sb_add(b, ")");
 }
@@ -1539,22 +1600,37 @@ static void sb_regex(Sb *b, const char *head, const char *tail) {
 
 /* every nested .git and .envrc (directory, file or link) and the files in a git
    directory that make git run something. repo: proj/.git is a real directory,
-   the one .git that may be written into. */
-static void sb_names(Sb *b, const char *proj, bool repo) {
-    char git[256], mods[256], trees[256], a[256], cfg[256], wt[256], cd[256], hooks[256];
-    char closed[1100], t[2000], r[SBX_RX], p[PATH_MAX];
+   the one .git that may be written into. other: the root's git directory under
+   another name, closed in the same way, or NULL. */
+static void sb_names(Sb *b, const char *proj, bool repo, const char *other) {
+    char git[256], mods[256], trees[256], a[256], n[3][256], cfg[256];
+    char closed[2][1100], t[2000], r[SBX_RX], o[SBX_RX], p[PATH_MAX], dir[2][SBX_RX + 2];
     fold(".git", git);
     fold("modules", mods);
     fold("worktrees", trees);
-    snprintf(closed, sizeof closed, "(%s|%s|%s|%s)(/|$)", fold("config", cfg),
-             fold("config.worktree", wt), fold("commondir", cd), fold("hooks", hooks));
+    /* two groups: one regex would pass the length limit */
+    snprintf(closed[0], sizeof closed[0], "(%s|%s|%s|%s)(/|$)", fold("config", cfg),
+             fold("config.worktree", n[0]), fold("commondir", n[1]), fold("hooks", n[2]));
+    snprintf(closed[1], sizeof closed[1], "(%s|%s|%s)(/|$)", fold("rebase-merge", n[0]),
+             fold("rebase-apply", n[1]), fold("sequencer", n[2]));
     if (snprintf(p, sizeof p, "%s/.git", proj) >= (int)sizeof p) b->full = true;
+    /* where git directories are: any .git, and the other one by its path */
+    const char *head[2] = {"", "^"};
+    int dirs = other ? 2 : 1;
+    snprintf(dir[0], sizeof dir[0], "/%s", git);
+    if (other) {
+        re_path(other, o, sizeof o);
+        snprintf(dir[1], sizeof dir[1], "%s", o);
+    }
 
     sb_add(b, "(deny file-write*");
-    snprintf(t, sizeof t, "/%s/%s", git, closed);
-    sb_regex(b, "", t);
-    snprintf(t, sizeof t, "/%s/(%s/.+|%s/[^/]+)/%s", git, mods, trees, closed);
-    sb_regex(b, "", t);
+    for (int i = 0; i < dirs; i++)
+        for (int c = 0; c < 2; c++) {
+            snprintf(t, sizeof t, "%s/%s", dir[i], closed[c]);
+            sb_regex(b, head[i], t);
+            snprintf(t, sizeof t, "%s/(%s/.+|%s/[^/]+)/%s", dir[i], mods, trees, closed[c]);
+            sb_regex(b, head[i], t);
+        }
     snprintf(t, sizeof t, "/%s(/|$)", fold(".envrc", a));
     sb_regex(b, "", t);
     if (repo) {
@@ -1570,23 +1646,28 @@ static void sb_names(Sb *b, const char *proj, bool repo) {
         /* the root's, in any case of the name */
         re_path(proj, r, sizeof r);
         snprintf(t, sizeof t, "/%s(/|$)", git);
-        char head[SBX_RX + 2];
-        snprintf(head, sizeof head, "^%s", r);
-        sb_regex(b, head, t);
+        char start[SBX_RX + 2];
+        snprintf(start, sizeof start, "^%s", r);
+        sb_regex(b, start, t);
     }
     /* no submodule or worktree entry appears, by creation or by renaming */
     sb_add(b, ")(deny file-write-create");
-    snprintf(t, sizeof t, "/%s/%s(/(.+/%s/)?[^/]+)?$", git, mods, mods);
-    sb_regex(b, "", t);
-    snprintf(t, sizeof t, "/%s/%s(/[^/]+)?$", git, trees);
-    sb_regex(b, "", t);
+    for (int i = 0; i < dirs; i++) {
+        snprintf(t, sizeof t, "%s/%s(/(.+/%s/)?[^/]+)?$", dir[i], mods, mods);
+        sb_regex(b, head[i], t);
+        snprintf(t, sizeof t, "%s/%s(/[^/]+)?$", dir[i], trees);
+        sb_regex(b, head[i], t);
+    }
     /* nor is one moved away and another put in its place */
-    sb_add(b, ")(deny file-write-unlink (require-all");
-    snprintf(t, sizeof t, "/%s/%s(/.+)?$", git, mods);
-    sb_regex(b, "", t);
-    sb_add(b, " (vnode-type DIRECTORY))");
-    snprintf(t, sizeof t, "/%s/%s(/[^/]+)?$", git, trees);
-    sb_regex(b, "", t);
+    sb_add(b, ")(deny file-write-unlink");
+    for (int i = 0; i < dirs; i++) {
+        sb_add(b, " (require-all");
+        snprintf(t, sizeof t, "%s/%s(/.+)?$", dir[i], mods);
+        sb_regex(b, head[i], t);
+        sb_add(b, " (vnode-type DIRECTORY))");
+        snprintf(t, sizeof t, "%s/%s(/[^/]+)?$", dir[i], trees);
+        sb_regex(b, head[i], t);
+    }
     sb_add(b, ")");
 }
 
@@ -1598,8 +1679,11 @@ static char *sbx_profile(const char *cwd, const char *tmp, bool net, const char 
     if (tmp && !realpath(tmp, rtmp)) return NULL;
     struct stat st;
     if (snprintf(git, sizeof git, "%s/.git", proj) >= (int)sizeof git) return NULL;
-    bool any = !lstat(git, &st);
-    bool repo = any && S_ISDIR(st.st_mode);
+    bool repo = !lstat(git, &st) && S_ISDIR(st.st_mode);
+    char elsewhere[PATH_MAX];
+    bool bad;
+    const char *other = gitdir_elsewhere(proj, elsewhere, &bad) ? elsewhere : NULL;
+    if (bad) return NULL;
     Sb b = {.s = malloc(SBX_CAP)};
     b.s[0] = 0;
     sb_add(&b,
@@ -1625,8 +1709,8 @@ static char *sbx_profile(const char *cwd, const char *tmp, bool net, const char 
     sb_add(&b, "(deny file-read* file-write*");
     each_secret(sb_deny_secret, &b);
     sb_add(&b, ")");
-    sb_project(&b, proj, repo, any, linked ? &w : NULL);
-    sb_names(&b, proj, repo);
+    sb_project(&b, proj, repo, other, linked ? &w : NULL);
+    sb_names(&b, proj, repo, other);
     /* names this command's processes, so that all of them can be found later */
     if (mark) {
         char rule[160];
@@ -1783,7 +1867,8 @@ static char *run_command(const char *cmd, const char *cwd, int timeout_s, int *c
             clock_gettime(CLOCK_REALTIME, &ts);
             if (net) snprintf(mark, sizeof mark, "fw.mark.%ld.%ld.%09ld.%u", (long)getpid(),
                               (long)ts.tv_sec, ts.tv_nsec, ++runs);
-            if (!(prof = sbx_profile(cwd, tmp, net, *mark ? mark : NULL)))
+            if (each_secret(secret_unresolved, NULL)
+                || !(prof = sbx_profile(cwd, tmp, net, *mark ? mark : NULL)))
                 return str_dup("error: cannot set up the sandbox for this directory — not executed");
         }
         sbx_env(env, tmp);
@@ -2458,12 +2543,14 @@ const char *resolve_confined(const char *cwd, const char *path, char *out, size_
 static const char *protected_write(const char *cwd, const char *abs) {
     static const char *const why =
         "error: this file can run code outside the sandbox (.envrc, git hooks and config)";
-    char root[PATH_MAX], p[PATH_MAX];
+    char root[PATH_MAX], p[PATH_MAX], target[PATH_MAX], other[PATH_MAX];
     if (!realpath(cwd, root)) return NULL;
     for (int i = 0; SBX_PROJ[i]; i++) {
         if (snprintf(p, sizeof p, "%s/%s", root, SBX_PROJ[i]) >= (int)sizeof p) return why;
-        if (path_under(p, abs)) return why;
+        if (path_under(p, abs) || !sbx_resolve(p, target, 0) || path_under(target, abs)) return why;
     }
+    bool bad, moved = gitdir_elsewhere(root, other, &bad);
+    if (bad) return why;
     struct stat st;
     snprintf(p, sizeof p, "%s/.git", root);
     bool any = !lstat(p, &st);
@@ -2478,9 +2565,21 @@ static const char *protected_write(const char *cwd, const char *abs) {
     for (char *tok = strtok_r(rel, "/", &save), *next; tok; tok = next) {
         next = strtok_r(NULL, "/", &save);
         if (!strcasecmp(tok, ".envrc")) return why;
-        if (!any && !strcmp(dir, root) && !strcasecmp(tok, "HEAD")) return why;
-        if (bare_like(dir) && (gitdir_name(tok) || non_ascii(tok))) return why;
+        bool top = !strcmp(dir, root);
+        /* in the root only what is below an existing directory of that name */
+        if (top && !strcasecmp(tok, "HEAD")) {
+            struct stat h;
+            snprintf(p, sizeof p, "%s/%s", root, tok);
+            if (!next || lstat(p, &h) || !S_ISDIR(h.st_mode)) return why;
+        }
+        if ((top ? root_bare(dir) : bare_like(dir)) && (gitdir_name(tok) || non_ascii(tok)))
+            return why;
+        size_t n = strlen(dir);
+        snprintf(dir + n, sizeof dir - n, "/%s", tok);
         if (!strcasecmp(tok, ".git")) {
+            if (!next) return why;
+            at = GITDIR;
+        } else if (moved && at == OUTSIDE && path_under(other, dir)) {
             if (!next) return why;
             at = GITDIR;
         } else if (at != OUTSIDE) {
@@ -2489,8 +2588,6 @@ static const char *protected_write(const char *cwd, const char *abs) {
             if (at == GITDIR)
                 at = !strcasecmp(tok, "modules") || !strcasecmp(tok, "worktrees") ? SUBREPOS : DATA;
         }
-        size_t n = strlen(dir);
-        snprintf(dir + n, sizeof dir - n, "/%s", tok);
     }
     return NULL;
 }

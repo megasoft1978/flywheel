@@ -2680,6 +2680,254 @@ static void test_blocked_writes(void) {
     free(old);
 }
 
+/* nothing a hostile config would run has run when git is used outside */
+static bool git_runs_nothing(const char *proj) {
+    char cmd[PATH_MAX + 80];
+    snprintf(cmd, sizeof cmd, "cd '%s' && git status >/dev/null 2>&1", proj);
+    if (system(cmd) < 0) return false;
+    return gone(proj, "PWNED");
+}
+
+#define HOSTILE "[core]\n repositoryformatversion=0\n bare=false\n worktree=.\n fsmonitor=\"touch PWNED; false\"\n"
+#define HOSTILE_SH "printf '[core]\\n repositoryformatversion=0\\n bare=false\\n worktree=.\\n fsmonitor=\"touch PWNED; false\"\\n' > config"
+
+/* the root cannot be made a bare repository, whatever state .git is in */
+static void test_root_bare(void) {
+    char base[PATH_MAX], home[PATH_MAX], proj[PATH_MAX];
+    char *old = review_dirs(base, home, proj);
+    if (!old) { T("mkdtemp", false); return; }
+    static const char *const repo = "git init -q . && git -c user.name=t -c user.email=t@t"
+                                    " commit -qm one --allow-empty";
+
+    /* shell: .git made invalid, then the root dressed up */
+    host(proj, repo);
+    in_dir(proj);
+    quiet("mv .git/HEAD .git/HEAD.x; mkdir -p objects refs/heads; " HOSTILE_SH);
+    quiet("echo 'ref: refs/heads/main' > HEAD; echo 'ref: refs/heads/main' > hEaD;"
+          " echo 'ref: refs/heads/main' > h; mv h Head; ln h head; ln -s refs/heads/main HEAD;"
+          " mkdir HEAD; mv $TMPDIR/none HEAD");
+    T("shell: no root HEAD with .git present", gone(proj, "HEAD"));
+    T("shell: git runs nothing", git_runs_nothing(proj));
+
+    /* file tools only */
+    snprintf(proj, sizeof proj, "%s/tools", base);
+    mkdir(proj, 0700);
+    host(proj, repo);
+    free(tool_write_file(proj, "config", HOSTILE));
+    refused("tool: root HEAD with .git", tool_write_file(proj, "HEAD", "ref: refs/heads/main\n"));
+    refused("tool: root head, other case", tool_write_file(proj, "hEaD", "ref: refs/heads/main\n"));
+    refused("tool: nothing below a new root HEAD", tool_write_file(proj, "Head/x", "x"));
+    free(tool_write_file(proj, "objects/k", "k"));
+    free(tool_write_file(proj, "refs/heads/k", "k"));
+    free(tool_write_file(proj, ".git/HEAD", "junk"));
+    T("tool: no root HEAD", gone(proj, "HEAD"));
+    T("tool: git runs nothing", git_runs_nothing(proj));
+
+    /* .git is a link */
+    snprintf(proj, sizeof proj, "%s/linked", base);
+    mkdir(proj, 0700);
+    host(proj, repo);
+    host(proj, "mv .git .realgit && ln -s .realgit .git");
+    in_dir(proj);
+    quiet("mv .realgit/HEAD .realgit/H; rm .git; mv .git g; mkdir -p objects refs/heads; " HOSTILE_SH);
+    quiet("echo 'ref: refs/heads/main' > HEAD");
+    refused("symlinked .git, tool: root HEAD", tool_write_file(proj, "HEAD", "ref: refs/heads/main\n"));
+    struct stat st;
+    T("symlinked .git: link kept, no root HEAD", !lstat(under(proj, ".git"), &st)
+      && S_ISLNK(st.st_mode) && gone(proj, "HEAD") && gone(proj, "g"));
+    T("symlinked .git: git runs nothing", git_runs_nothing(proj));
+
+    /* no .git at all */
+    snprintf(proj, sizeof proj, "%s/plain", base);
+    mkdir(proj, 0700);
+    in_dir(proj);
+    quiet("mkdir -p objects refs/heads; " HOSTILE_SH);
+    quiet("echo 'ref: refs/heads/main' > HeAd");
+    free(tool_write_file(proj, "HEAD", "ref: refs/heads/main\n"));
+    T("no .git: no root HEAD", gone(proj, "HEAD") && git_runs_nothing(proj));
+
+    /* a HEAD that is there already: the rest of a bare repository stays shut */
+    snprintf(proj, sizeof proj, "%s/hashead", base);
+    mkdir(proj, 0700);
+    host(proj, repo);
+    host(proj, "echo 'ref: refs/heads/main' > HEAD");
+    in_dir(proj);
+    quiet("mv .git/HEAD .git/H; mkdir -p objects refs/heads; " HOSTILE_SH "; echo x > HEAD; rm HEAD");
+    refused("existing HEAD, tool: config", tool_write_file(proj, "config", HOSTILE));
+    T("existing HEAD: unchanged, no config", holds(under(proj, "HEAD"), "ref: refs/heads/main\n")
+      && gone(proj, "config"));
+
+    /* a directory of that name holds ordinary files, and the repository works */
+    snprintf(proj, sizeof proj, "%s/headdir", base);
+    mkdir(proj, 0700);
+    host(proj, repo);
+    host(proj, "mkdir head hooks");
+    in_dir(proj);
+    int code = -1;
+    char *o = run_bash_status("echo a > head/a && echo b > hooks/b && git add head hooks &&"
+        " git -c user.name=t -c user.email=t@t commit -qm two && git branch n && git switch -q n",
+        proj, 30, &code);
+    T("head/ directory writable, git add, commit, branch work", !code);
+    free(o);
+    free(tool_write_file(proj, "head/c", "c"));
+    T("tool: file in an existing head/", holds(under(proj, "head/c"), "c"));
+
+    /* a protected link that cannot be followed: nothing runs */
+    static const char *const loops[] = {".envrc", ".git/hooks", ".git/config.worktree"};
+    for (int i = 0; i < 3; i++) {
+        char dir[PATH_MAX], target[PATH_MAX];
+        snprintf(dir, sizeof dir, "%s/loop%d", base, i);
+        mkdir(dir, 0700);
+        host(dir, repo);
+        snprintf(target, sizeof target, "%s", under(dir, loops[i]));
+        if (i == 1) host(dir, "rm -rf .git/hooks");
+        T("loop link made", !symlink(target, target));
+        o = run_bash("echo ran > ran", dir, 30);
+        T(loops[i], !strncmp(o, "error:", 6) && gone(dir, "ran"));
+        free(o);
+    }
+    snprintf(proj, sizeof proj, "%s/plain", base);
+    T("loop in a store", !symlink(".npmrc", under(home, ".npmrc")));
+    o = run_bash("echo ran > ran", proj, 30);
+    T("unresolvable store: command refused", !strncmp(o, "error:", 6) && gone(proj, "ran"));
+    free(o);
+    sandbox_disable_for_test(false);
+    T("unresolvable store: sandbox still counts as available", sandbox_available());
+    unlink(under(home, ".npmrc"));
+    setenv("HOME", old, 1);
+    free(old);
+}
+
+/* a rebase a command planted: what `git rebase --continue` outside would run */
+#define PLANT(d) "mkdir " d "; echo 'exec touch \"$OLDPWD/PWNED\"; touch PWNED' > " d "/git-rebase-todo;" \
+    " : > " d "/done; : > " d "/interactive; git rev-parse HEAD > " d "/onto;" \
+    " git rev-parse HEAD > " d "/orig-head; echo refs/heads/$(git symbolic-ref --short HEAD) > " d "/head-name"
+
+/* outside the sandbox, in temp repositories only */
+static bool continue_runs_nothing(const char *repo) {
+    char cmd[PATH_MAX + 120];
+    snprintf(cmd, sizeof cmd, "cd '%s' && GIT_EDITOR=true git rebase --continue >/dev/null 2>&1", repo);
+    if (system(cmd) < 0) return false;
+    return gone(repo, "PWNED");
+}
+
+/* each directory a command could not make or have a file in */
+static void no_state(const char *proj, const char *gitdir) {
+    static const char *const names[] = {"rebase-merge", "rebase-apply", "sequencer",
+        "Rebase-Merge", "REBASE-APPLY", ("\xc5\xbf" "equencer")};
+    for (int i = 0; i < (int)(sizeof names / sizeof *names); i++) {
+        char rel[PATH_MAX], cmd[PATH_MAX * 3];
+        snprintf(rel, sizeof rel, "%s/%s", gitdir, names[i]);
+        snprintf(cmd, sizeof cmd, "mkdir %s; echo x > %s; mkdir ready%d; : > ready%d/f; mv ready%d %s;"
+                 " ln -s \"$PWD/ready%d\" %s; : > file%d; ln file%d %s", rel, rel, i, i, i, rel, i, rel,
+                 i, i, rel);
+        quiet(cmd);
+        T(rel, gone(proj, rel));
+    }
+}
+
+static void test_rebase_state(void) {
+    char base[PATH_MAX], home[PATH_MAX], proj[PATH_MAX];
+    char *old = review_dirs(base, home, proj);
+    if (!old) { T("mkdtemp", false); return; }
+    static const char *const repo = "git init -q . && git config user.name t && git config user.email t@t"
+                                    " && git commit -qm one --allow-empty";
+
+    /* the reviewer's repro */
+    host(proj, repo);
+    in_dir(proj);
+    quiet(PLANT(".git/rebase-merge"));
+    T("no planted rebase", gone(proj, ".git/rebase-merge"));
+    T("rebase --continue runs nothing", continue_runs_nothing(proj));
+
+    host(proj, "git worktree add -q wt -b wt && git init -q sub && git init -q --bare .git/modules/m");
+    no_state(proj, ".git");
+    no_state(proj, ".git/worktrees/wt");
+    no_state(proj, "sub/.git");
+    no_state(proj, ".git/modules/m");
+    quiet("mkdir -p d/rebase-merge; mv d .git/worktrees/new; mv .git/worktrees/wt moved; mv d .git/worktrees/wt");
+    T("no prepared worktree entry", gone(proj, ".git/worktrees/new") && gone(proj, "moved"));
+    refused("tool: rebase todo", tool_write_file(proj, ".git/rebase-merge/git-rebase-todo", "exec x\n"));
+    refused("tool: rebase-apply", tool_write_file(proj, ".git/rebase-apply/next", "1\n"));
+    refused("tool: sequencer, other case", tool_write_file(proj, ".git/Sequencer/todo", "x\n"));
+    refused("tool: worktree rebase", tool_write_file(proj, ".git/worktrees/wt/rebase-merge/done", ""));
+    refused("tool: nested rebase", tool_write_file(proj, "sub/.git/rebase-merge/done", ""));
+    refused("tool: module rebase", tool_write_file(proj, ".git/modules/m/rebase-merge/done", ""));
+    T("tool: no state made", gone(proj, ".git/rebase-merge") && gone(proj, ".git/Sequencer")
+      && gone(proj, "sub/.git/rebase-merge"));
+
+    int code = -1;
+    char *o = run_bash_status("echo a > a && git add a && git commit -qm two && git branch sequencer &&"
+        " git switch -q -c side && echo b > b && git add b && git commit -qm three && git switch -q - &&"
+        " echo c > c && git add c && git commit -qm four && git merge -q --no-edit side &&"
+        " echo d >> a && git stash push -q && git stash pop -q && git commit -qam five &&"
+        " git switch -q sequencer", proj, 30, &code);
+    T("git add, commit, branch, merge, stash work", !code);
+    free(o);
+
+    /* the project is a linked worktree, of a plain and of a bare repository */
+    static const char *const mains[] = {
+        ("git init -q main && cd main && git config user.name t && git config user.email t@t"
+        " && git commit -qm one --allow-empty && git worktree add -q ../lwt -b lwt"),
+        ("git init -q seed && git -C seed -c user.name=t -c user.email=t@t commit -qm one --allow-empty"
+        " && git clone -q --bare seed repo.git && git -C repo.git worktree add -q ../bwt -b bwt"),
+    };
+    static const char *const dirs[][2] = {{"lwt", "../main/.git/worktrees/lwt"},
+                                          {"bwt", "../repo.git/worktrees/bwt"}};
+    host(base, mains[0]);
+    host(base, mains[1]);
+    for (int i = 0; i < 2; i++) {
+        char wt[PATH_MAX + 8];
+        snprintf(wt, sizeof wt, "%s/%s", base, dirs[i][0]);
+        in_dir(wt);
+        no_state(wt, dirs[i][1]);
+        char cmd[PATH_MAX * 3];
+        snprintf(cmd, sizeof cmd, "echo x > %s/Config.Worktree; mkdir %s/Hooks %s/Modules",
+                 dirs[i][1], dirs[i][1], dirs[i][1]);
+        quiet(cmd);
+        char p[PATH_MAX * 2];
+        snprintf(p, sizeof p, "%s/%s", wt, dirs[i][1]);
+        T("linked: no config, hooks or modules", gone(p, "Config.Worktree") && gone(p, "Hooks")
+          && gone(p, "Modules"));
+        o = run_bash_status("echo e > e && git add e && git commit -qm w && git branch w2", wt, 30, &code);
+        T("linked: git add, commit, branch work", !code);
+        free(o);
+    }
+
+    /* .git is a link, or a file naming a directory inside the project */
+    static const char *const moved[] = {
+        "mv .git .realgit && ln -s .realgit .git",
+        "mv .git .realgit && echo 'gitdir: .realgit' > .git",
+    };
+    for (int i = 0; i < 2; i++) {
+        snprintf(proj, sizeof proj, "%s/moved%d", base, i);
+        mkdir(proj, 0700);
+        host(proj, repo);
+        host(proj, "git worktree add -q wt -b wt");
+        host(proj, moved[i]);
+        in_dir(proj);
+        quiet(PLANT(".realgit/rebase-merge"));
+        T("moved git directory: no planted rebase", gone(proj, ".realgit/rebase-merge")
+          && continue_runs_nothing(proj));
+        no_state(proj, ".realgit");
+        no_state(proj, ".realgit/worktrees/wt");
+        char *config = slurp(under(proj, ".realgit/config"));
+        quiet("echo evil >> .realgit/config; echo evil > .realgit/Config.Worktree; mkdir .realgit/Hooks2;"
+              " echo evil > .realgit/hooks/pre-commit; mv .realgit gone; mv .realgit/worktrees/wt old");
+        T("moved git directory: config and hooks closed", config && holds(under(proj, ".realgit/config"), config)
+          && gone(proj, ".realgit/hooks/pre-commit") && gone(proj, "gone") && gone(proj, "old"));
+        free(config);
+        refused("moved, tool: rebase todo", tool_write_file(proj, ".realgit/rebase-merge/done", ""));
+        refused("moved, tool: sequencer", tool_write_file(proj, ".realgit/sequencer/todo", ""));
+        refused("moved, tool: config", tool_write_file(proj, ".realgit/config.worktree", "x"));
+        o = run_bash_status("echo f > f && git add f && git commit -qm m && git branch n", proj, 30, &code);
+        T("moved git directory: git add, commit, branch work", !code);
+        free(o);
+    }
+    setenv("HOME", old, 1);
+    free(old);
+}
+
 /* no sandbox: nothing may run unless someone approves or --unsafe says so */
 static void test_fail_closed(void) {
     char dir[] = "/tmp/fwfcXXXXXX", p[256];
@@ -2778,6 +3026,8 @@ int main(void) {
         test_detached();
         test_many_items();
         test_blocked_writes();
+        test_root_bare();
+        test_rebase_state();
         test_sandbox();
         test_sandbox_escapes();
         test_nested_git();
