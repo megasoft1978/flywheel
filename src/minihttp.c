@@ -13,7 +13,9 @@
 #include <errno.h>
 #include <ctype.h>
 #include <strings.h>
+#include <fcntl.h>
 #include <netdb.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <netinet/in.h>
@@ -40,6 +42,39 @@ static int parse_url(const char *url, char *host, size_t hcap, int *port, char *
     return 0;
 }
 
+/* whole-request deadline (CLOCK_MONOTONIC), set by mini_request */
+static double deadline;
+
+static double now_s(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec / 1e9;
+}
+
+/* select on fd for at most idle_s, never past the deadline; as select() */
+static int wait_fd(int fd, bool for_write, double idle_s) {
+    double left = deadline - now_s();
+    if (left <= 0) return 0;
+    if (left > idle_s) left = idle_s;
+    fd_set f;
+    FD_ZERO(&f);
+    FD_SET(fd, &f);
+    struct timeval tv = {.tv_sec = (time_t)left, .tv_usec = (suseconds_t)((left - (time_t)left) * 1e6)};
+    return select(fd + 1, for_write ? NULL : &f, for_write ? &f : NULL, NULL, &tv);
+}
+
+static int connect_within(int fd, const struct sockaddr *sa, socklen_t len, int timeout_s) {
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK)) return -1;
+    if (connect(fd, sa, len)) {
+        int err = 0;
+        socklen_t el = sizeof err;
+        if (errno != EINPROGRESS || wait_fd(fd, true, timeout_s) <= 0 ||
+            getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) || err) return -1;
+    }
+    return fcntl(fd, F_SETFL, fl) ? -1 : 0;
+}
+
 static int tcp_connect(const char *host, int port, int timeout_s) {
     char ps[16];
     snprintf(ps, sizeof ps, "%d", port);
@@ -51,12 +86,11 @@ static int tcp_connect(const char *host, int port, int timeout_s) {
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd < 0) continue;
-        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
+        if (connect_within(fd, ai->ai_addr, ai->ai_addrlen, timeout_s) == 0) break;
         close(fd);
         fd = -1;
     }
     freeaddrinfo(res);
-    (void)timeout_s;
     return fd;
 }
 
@@ -78,13 +112,9 @@ static int mb_putc(MBuf *b, char c) {
 
 /* read one byte with select-timeout; returns 1 byte-read, 0 eof, -1 error/abort, -2 timeout-idle */
 static int read_byte(int fd, char *out, int idle_s) {
-    fd_set rf;
-    FD_ZERO(&rf);
-    FD_SET(fd, &rf);
-    struct timeval tv = {.tv_sec = idle_s, .tv_usec = 0};
     if (fw_tick_hook) fw_tick_hook();
     if (g_abort) return -1;
-    int sr = select(fd + 1, &rf, NULL, NULL, &tv);
+    int sr = wait_fd(fd, false, idle_s);
     if (sr < 0) return -1;
     if (sr == 0) return -2;
     ssize_t n = read(fd, out, 1);
@@ -128,6 +158,7 @@ static int mini_request(const char *method, const char *url, const char *payload
         snprintf(errbuf, errcap, "bad url");
         return -1;
     }
+    deadline = now_s() + timeout_s;
     int fd = tcp_connect(host, port, timeout_s);
     if (fd < 0) {
         snprintf(errbuf, errcap, "connect failed");
@@ -230,13 +261,9 @@ static int mini_request(const char *method, const char *url, const char *payload
                 char buf[8192];
                 int want = left > (long)sizeof buf ? (int)sizeof buf : (int)left;
                 /* direct socket read for bulk bytes, but keep tick/abort responsiveness */
-                fd_set rf;
-                FD_ZERO(&rf);
-                FD_SET(fd, &rf);
-                struct timeval tv = {.tv_sec = idle, .tv_usec = 0};
                 if (fw_tick_hook) fw_tick_hook();
                 if (g_abort) { ret = -1; snprintf(errbuf, errcap, "aborted"); goto done; }
-                if (select(fd + 1, &rf, NULL, NULL, &tv) <= 0) { ret = -1; snprintf(errbuf, errcap, "read timeout"); goto done; }
+                if (wait_fd(fd, false, idle) <= 0) { ret = -1; snprintf(errbuf, errcap, "read timeout"); goto done; }
                 ssize_t n = read(fd, buf, (size_t)want);
                 if (n <= 0) { ret = -1; snprintf(errbuf, errcap, "connection closed mid-chunk"); goto done; }
                 if (feed(cb, ud, buf, (size_t)n) < 0) { ret = -1; snprintf(errbuf, errcap, "aborted"); goto done; }
@@ -255,13 +282,9 @@ static int mini_request(const char *method, const char *url, const char *payload
         while (left > 0) {
             char buf[8192];
             int want = left > (long)sizeof buf ? (int)sizeof buf : (int)left;
-            fd_set rf;
-            FD_ZERO(&rf);
-            FD_SET(fd, &rf);
-            struct timeval tv = {.tv_sec = idle, .tv_usec = 0};
             if (fw_tick_hook) fw_tick_hook();
             if (g_abort) { ret = -1; snprintf(errbuf, errcap, "aborted"); goto done; }
-            if (select(fd + 1, &rf, NULL, NULL, &tv) <= 0) { ret = -1; snprintf(errbuf, errcap, "read timeout"); goto done; }
+            if (wait_fd(fd, false, idle) <= 0) { ret = -1; snprintf(errbuf, errcap, "read timeout"); goto done; }
             ssize_t n = read(fd, buf, (size_t)want);
             if (n <= 0) { ret = -1; snprintf(errbuf, errcap, "connection closed: short body"); goto done; }
             if (feed(cb, ud, buf, (size_t)n) < 0) { ret = -1; snprintf(errbuf, errcap, "aborted"); goto done; }
@@ -271,13 +294,9 @@ static int mini_request(const char *method, const char *url, const char *payload
         /* read until close */
         for (;;) {
             char buf[8192];
-            fd_set rf;
-            FD_ZERO(&rf);
-            FD_SET(fd, &rf);
-            struct timeval tv = {.tv_sec = idle, .tv_usec = 0};
             if (fw_tick_hook) fw_tick_hook();
             if (g_abort) { ret = -1; snprintf(errbuf, errcap, "aborted"); goto done; }
-            int sr = select(fd + 1, &rf, NULL, NULL, &tv);
+            int sr = wait_fd(fd, false, idle);
             if (sr < 0) { ret = -1; goto done; }
             if (sr == 0) { ret = -1; snprintf(errbuf, errcap, "read timeout"); goto done; }
             ssize_t n = read(fd, buf, sizeof buf);
@@ -298,8 +317,8 @@ done:
 
 int fw_mini_post_stream(const char *url, const char *payload, int streaming,
                         size_t (*cb)(char *, size_t, size_t, void *), void *ud,
-                        int *status, char *errbuf, size_t errcap) {
-    return mini_request("POST", url, payload, streaming, cb, ud, 3600, status, errbuf, errcap);
+                        int timeout_s, int *status, char *errbuf, size_t errcap) {
+    return mini_request("POST", url, payload, streaming, cb, ud, timeout_s, status, errbuf, errcap);
 }
 
 size_t fw_mini_acc_cb(char *, size_t, size_t, void *);

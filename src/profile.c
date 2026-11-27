@@ -7,15 +7,15 @@ static const Profile PROFILES[] = {
      "TypeScript/React/Node engineer",
      "ts,tsx"},
     {"python",
-     "python3 -m compileall -q -x '(venv|\\.venv|node_modules|__pycache__)' . 2>&1 | head -30",
+     "python3 -m compileall -q -x '(venv|\\.venv|node_modules|__pycache__)' .",
      "Python engineer",
      "py"},
     {"go",
-     "go vet ./... 2>&1 | head -30",
+     "go vet ./...",
      "Go engineer",
      "go"},
     {"rust",
-     "cargo check --message-format=short 2>&1 | head -30",
+     "cargo check --message-format=short",
      "Rust engineer",
      "rs"},
     {"generic",
@@ -43,4 +43,25 @@ const Profile *profile_detect(const char *cwd, const char *force) {
     if (exists(cwd, "go.mod")) return &PROFILES[2];
     if (exists(cwd, "Cargo.toml")) return &PROFILES[3];
     return &PROFILES[4];
+}
+
+/* No pipe in gate_cmd: it would hide the exit status. 126/127 (tool not
+   installed) and timeouts are not code errors. npx also exits non-zero
+   without TypeScript installed, so ts additionally needs a diagnostic. */
+char *gate_run(const Profile *prof, const char *cwd, int timeout_s, bool *failed) {
+    *failed = false;
+    if (!prof->gate_cmd) return str_dup("");
+    int code;
+    char *out = run_bash_status(prof->gate_cmd, cwd, timeout_s, &code);
+    *failed = code > 0 && code != 126 && code != 127;
+    if (!strcmp(prof->name, "ts")) *failed = *failed && strstr(out, "error TS");
+    /* keep both ends: the messages quote about 1800 chars */
+    size_t len = strlen(out);
+    if (len > 1700) {
+        static const char mark[] = "\n...[truncated]...\n";
+        memcpy(out + 850, mark, sizeof mark - 1);
+        memmove(out + 850 + sizeof mark - 1, out + len - 800, 801);
+        utf8_sanitize(out);
+    }
+    return out;
 }

@@ -3,7 +3,7 @@
 #ifdef FW_MINI_HTTP
 int fw_mini_post_stream(const char *url, const char *payload, int streaming,
                         size_t (*cb)(char *, size_t, size_t, void *), void *ud,
-                        int *status, char *errbuf, size_t errcap);
+                        int timeout_s, int *status, char *errbuf, size_t errcap);
 char *fw_mini_get(const char *url);
 #else
 #include <curl/curl.h>
@@ -284,7 +284,7 @@ ChatResp *chat(Msgs *msgs, StreamCb *cb) {
     curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdrs);
     curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, on_data);
     curl_easy_setopt(h, CURLOPT_WRITEDATA, &a);
-    curl_easy_setopt(h, CURLOPT_TIMEOUT, 3600L);
+    curl_easy_setopt(h, CURLOPT_TIMEOUT, g_cfg.req_timeout > 0 ? (long)g_cfg.req_timeout : 3600L);
     curl_easy_setopt(h, CURLOPT_XFERINFOFUNCTION, on_progress);
     curl_easy_setopt(h, CURLOPT_XFERINFODATA, NULL);
     curl_easy_setopt(h, CURLOPT_NOPROGRESS, 0L);
@@ -295,7 +295,9 @@ ChatResp *chat(Msgs *msgs, StreamCb *cb) {
 #ifdef FW_MINI_HTTP
     char merr[256] = "";
     int status = 0;
-    int mrc = fw_mini_post_stream(url, payload, cb && cb->stream, on_data, &a, &status, merr, sizeof merr);
+    int mrc = fw_mini_post_stream(url, payload, cb && cb->stream, on_data, &a,
+                                  g_cfg.req_timeout > 0 ? g_cfg.req_timeout : 3600,
+                                  &status, merr, sizeof merr);
 #else
     CURLcode rc = curl_easy_perform(h);
     long status = 0;

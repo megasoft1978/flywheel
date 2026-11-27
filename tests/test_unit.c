@@ -791,6 +791,8 @@ static void test_agent_strict(void) {
 /* ---------- the real binary: init and non-interactive output ---------- */
 
 /* run ./flywheel, stdout on a pty or a pipe; returns what it printed */
+static int run_status;   /* exit code of the last run */
+
 static char *run_flywheel(bool tty, char *const *argv) {
     static char out[65536];
     int rd = -1, wr = -1, fds[2];
@@ -807,17 +809,21 @@ static char *run_flywheel(bool tty, char *const *argv) {
         int nul = open("/dev/null", O_RDWR);
         dup2(nul, 0); dup2(wr, 1); dup2(nul, 2);
         close(rd); close(wr);
-        execv("./flywheel", argv);
+        const char *bin = getenv("FW_BIN");
+        execv(bin ? bin : "./flywheel", argv);
         _exit(127);
     }
     if (!tty) close(wr);   /* keep the pty slave open so its output survives */
     fcntl(rd, F_SETFL, O_NONBLOCK);
     size_t len = 0;
+    int st = 0;
+    run_status = -1;
     for (bool exited = false;;) {
         ssize_t n = read(rd, out + len, sizeof out - 1 - len);
         if (n > 0) { len += (size_t)n; continue; }
         if (exited) break;
-        exited = waitpid(pid, NULL, WNOHANG) == pid;
+        exited = waitpid(pid, &st, WNOHANG) == pid;
+        if (exited && WIFEXITED(st)) run_status = WEXITSTATUS(st);
         if (!exited) usleep(10000);
     }
     out[len] = 0;
@@ -870,6 +876,264 @@ static void test_plain_output_sanitized(void) {
     stop(srv);
 }
 
+/* ---------- pre-launch review fixes ---------- */
+
+static void test_deny_operands(void) {
+    const char *cwd = "/tmp/sb";
+    static const char *no[] = {
+        "rm /etc/x", "rm -f ~/x", "rm a $HOME/x", "rm -- ../x", "rm src/{a,../../x}",
+        "find /etc -delete", "find -L /etc -name x -delete", "find . /etc -exec rm {} +",
+        "find /etc -exec sed -i s/a/b/ {} \\;", "find . -exec rm /etc/x \\;", "find . -exec sh -c 'rm /etc/x' \\;",
+        "find /etc -execdir chmod 600 {} +", "find . -fprint /etc/x",
+        "sed -i s/a/b/ /etc/x", "sed -i '' -e s/a/b/ /etc/x", "sed -i.bak '/a/d' /etc/x",
+        "sed -Ei s/a/b/ ~/x", "sed --in-place s/a/b/ /etc/x",
+        "sed s/a/b/ -i /etc/x",
+        "perl -pi -e s/a/b/ /etc/x", "perl -i.bak -pe s/a/b/ ~/x", "perl -pie s/a/b/ /etc/x",
+        "truncate -s 0 /etc/x", "ln -s a /etc/x", "ln -sf a ~/x", "ln /etc/passwd copy", "ln -t /etc a",
+        "chmod 600 /etc/x", "chmod -R u+w ~", "chmod -w /etc/x", "chown me /etc/x", "chgrp -R staff /etc",
+        "rsync -a src/ /etc/x/", "rsync -a --remove-source-files /etc/x out/", "install -m 755 a /etc/x",
+        "install -d /etc/x", "install -t /etc a", "touch /etc/x", "touch ~/x", "mkdir -p /etc/x",
+        "mkdir ../x", "rmdir /etc/x", "git -C /etc reset --hard", "git -C .. clean -fdx",
+        "git --git-dir=/etc/x commit -m a", "git --work-tree /etc checkout .", "timeout 5 touch /etc/x", NULL};
+    for (int i = 0; no[i]; i++) T(no[i], deny_check(no[i], cwd) != NULL);
+    static const char *yes[] = {
+        "rm a.o", "rm -f build/*.o", "rm src/{a,b}.o", "rm /tmp/x", "rm \"$TMPDIR/x\"", "rm ${TMPDIR}/x",
+        "rm /tmp/sb/x", "find . -name '*.tmp' -delete", "find /tmp/x -delete", "find src -exec rm {} +",
+        "find /usr/include -name x.h", "find /usr/include -exec grep -l x {} +", "find . -type f -exec sed -i s/a/b/ {} \\;",
+        "sed -i s/a/b/ src/a.c", "sed -i '' '/^$/d' src/a.c", "sed -i -e '/x/d' a b", "sed -n /x/p /etc/hosts",
+        "sed -i '/^#/d' conf", "perl -pi -e 's|/usr|/opt|' conf", "perl -ne print /etc/hosts", "perl -e 'print 1'",
+        "truncate -s 0 log.txt", "ln -s /usr/bin/python3 venv/python", "ln -sf ../lib/a b", "ln -s /usr/lib/x",
+        "ln a b", "chmod +x run.sh", "chmod -R 755 dist", "chown -R me .", "rsync -a src/ /tmp/out/",
+        "rsync -a /usr/share/x/ vendor/", "rsync -a dist/ host:/var/www/", "install -m 755 flywheel /tmp/bin/x",
+        "install -d build/out", "touch a b", "touch -r /etc/hosts a", "mkdir -p src/{components,utils}",
+        "mkdir -p /tmp/x/y", "mkdir -m 755 out", "rmdir build", "git -C sub commit -m x", "git -C /etc log --oneline",
+        "git -C /tmp/x init", "git commit -m 'rm /etc/x'", "echo hi > /dev/null", "echo x > $TMPDIR/x", NULL};
+    for (int i = 0; yes[i]; i++) T(yes[i], deny_check(yes[i], cwd) == NULL);
+}
+
+static void test_remember_inline(void) {
+    static const char *no[] = {
+        "python3 -c 'print(1)'", "python -c x", "python3 -m http.server", "node -e x", "node --eval x",
+        "node -p x", "node", "python3", "python3.12 -c x", "/usr/bin/python3 -c x", "bash -c ls", "sh x.sh",
+        "zsh -c ls", "perl -e 1", "ruby -e 1", "php -r 1", "osascript -e x", "awk 'BEGIN{}'", "env make",
+        "xargs rm", "eval ls", "ssh host ls", "deno eval x", "bun -e x", "git -c core.pager=x log",
+        "npx -c x", "npm exec x", "make --eval=x", NULL};
+    for (int i = 0; no[i]; i++) { char *p = perm_prefix(no[i]); T(no[i], p && !*p); free(p); }
+    char *p = perm_prefix("nodemon app.js");
+    T("nodemon is not node", p && !strcmp(p, "nodemon"));
+    free(p);
+    p = perm_prefix("python3 manage.py test");
+    T("script rule still offered", p && !strcmp(p, "python3 manage.py"));
+    free(p);
+}
+
+static void test_autoallow_paths(void) {
+    char dir[] = "/tmp/fwreadXXXXXX", l[256];
+    if (!mkdtemp(dir)) { T("mkdtemp", false); return; }
+    free(g_cfg.cwd);
+    g_cfg.cwd = str_dup(dir);
+    snprintf(l, sizeof l, "%s/out", dir);
+    T("link", !symlink("/etc", l));
+    perm_free();
+    static const char *no[] = {
+        "cat /etc/passwd", "cat '~/.ssh/id_rsa'", "cat ../x", "head -n 1 a/../../x", "ls /", "ls ..",
+        "grep -r x /etc", "grep -f/etc/passwd a", "grep --file=/etc/passwd a", "find /etc -name x",
+        "tail out/passwd", "wc -l a /etc/passwd", "cd ..", "rg x /etc", "sort ../x", "stat /etc", NULL};
+    for (int i = 0; no[i]; i++) T(no[i], !perm_allowed(no[i]));
+    char in[300];
+    snprintf(in, sizeof in, "cat %s/a.txt", dir);
+    T("absolute inside cwd", perm_allowed(in));
+    static const char *yes[] = {"cat a.txt", "ls -la src/", "cat src/../a.txt", "grep -rn foo .", "cut -d/ -f1 a",
+        "echo /etc/passwd ..", "which /bin/ls", "grep x /dev/null", NULL};
+    for (int i = 0; yes[i]; i++) T(yes[i], perm_allowed(yes[i]));
+    perm_add_rule("cat");   /* never turns an outside read into a silent one */
+    T("saved reader rule stays confined", !perm_allowed("cat /etc/passwd"));
+    char pf[1200];
+    if (perm_project_file(pf, sizeof pf)) unlink(pf);
+    perm_free();
+}
+
+static const char *reply_prune(int n) {
+    static const char *const first[] = {"bash", "{\"command\":\"echo VALID_EARLIER\"}"};
+    static const char *const loop[] = {"bash", "{\"command\":\"echo SAME\"}",
+        "bash", "{\"command\":\"echo SAME\"}", "bash", "{\"command\":\"echo SAME\"}"};
+    if (n == 0) return tool_reply("tool_calls", 1, first);
+    if (n == 1) return tool_reply("tool_calls", 3, loop);
+    return OK_HDR STOPPED "data: [DONE]\n\n";
+}
+
+static void test_prune_parallel(void) {
+    char dir[] = "/tmp/fwpruneXXXXXX";
+    if (!mkdtemp(dir)) { T("mkdtemp", false); return; }
+    free(g_cfg.cwd);
+    g_cfg.cwd = str_dup(dir);
+    Ui ui = {.interactive = true};
+    Msgs m;
+    new_task(&m);
+    pid_t p = serve(reply_prune);
+    agent_run(&m, &ui, NULL, 0);
+    stop(p);
+    T("parallel loop was pruned", has_msg(&m, "user", "Loop detected"));
+    T("valid earlier turn survives", has_msg(&m, "tool", "VALID_EARLIER"));
+    T("looping turn removed", !has_msg(&m, "tool", "SAME"));
+    msgs_free(&m);
+}
+
+/* ---------- verification gate: exit status decides ---------- */
+
+static void fake_tool(const char *dir, const char *name, const char *body) {
+    char p[300], s[600];
+    snprintf(p, sizeof p, "%s/%s", dir, name);
+    snprintf(s, sizeof s, "#!/bin/sh\n%s\n", body);
+    put(p, s);
+    chmod(p, 0755);
+}
+
+static bool gate(const char *prof, const char *cwd, const char *must_contain) {
+    bool failed;
+    char *o = gate_run(profile_detect(cwd, prof), cwd, 20, &failed);
+    if (must_contain) T(must_contain, strstr(o, must_contain) != NULL);
+    T("gate output bounded", strlen(o) <= 1800);
+    free(o);
+    return failed;
+}
+
+static void test_gate(void) {
+    char dir[] = "/tmp/fwgateXXXXXX";
+    if (!mkdtemp(dir)) { T("mkdtemp", false); return; }
+    char *old = str_dup(getenv("PATH"));
+    char path[4096];
+    snprintf(path, sizeof path, "%s:%s", dir, old);
+    setenv("PATH", path, 1);
+
+    fake_tool(dir, "go", "echo 'vet: ./a.go:3:2: undefined: x' >&2; exit 1");
+    T("go: compile error without the word fails", gate("go", dir, "undefined: x"));
+    fake_tool(dir, "go", "exit 0");
+    T("go: clean passes", !gate("go", dir, NULL));
+    fake_tool(dir, "cargo", "echo 'src/a.rs:1: warning: unused `Error`: error type'; exit 0");
+    T("rust: warning mentioning error passes", !gate("rust", dir, NULL));
+    fake_tool(dir, "cargo", "i=0; while [ $i -lt 200 ]; do echo \"warning: w$i padding padding\"; i=$((i+1)); done;"
+                            " echo 'could not compile LAST'; exit 101");
+    T("rust: failing status survives long output", gate("rust", dir, "could not compile LAST"));
+    fake_tool(dir, "npx", "echo 'a.ts(1,1): error TS2304: x'; exit 2");
+    T("ts: diagnostics fail", gate("ts", dir, "TS2304"));
+    fake_tool(dir, "npx", "exit 0");
+    T("ts: clean passes", !gate("ts", dir, NULL));
+    fake_tool(dir, "npx", "echo 'npm error could not determine executable to run'; exit 1");
+    T("ts: no typescript installed is not a code error", !gate("ts", dir, NULL));
+    fake_tool(dir, "go", "exit 127");
+    T("tool not installed is not a code error", !gate("go", dir, NULL));
+    setenv("PATH", old, 1);
+    free(old);
+
+    if (!system("command -v python3 >/dev/null 2>&1")) {
+        char f[300];
+        snprintf(f, sizeof f, "%s/ok.py", dir);
+        put(f, "error = 'Error'\n");
+        T("python: valid file passes", !gate("python", dir, NULL));
+        snprintf(f, sizeof f, "%s/bad.py", dir);
+        put(f, "def (:\n");
+        T("python: syntax error fails", gate("python", dir, "bad.py"));
+    }
+    T("generic: no gate", !gate("generic", dir, NULL));
+}
+
+/* ---------- questions, deliverables, approvals, wall clock ---------- */
+
+static int text_turns(const Msgs *m) {
+    int n = 0;
+    for (int i = 0; i < m->n; i++) n += !strcmp(m->v[i].role, "assistant");
+    return n;
+}
+
+static int asked;
+static bool count_ask(const char *cmd, void *ud) { (void)cmd; (void)ud; asked++; return true; }
+
+static const char *reply_stall(int n) { (void)n; sleep(30); return OK_HDR STOPPED; }
+
+static void test_agent_review(void) {
+    char dir[] = "/tmp/fwrevXXXXXX";
+    if (!mkdtemp(dir)) { T("mkdtemp", false); return; }
+    free(g_cfg.cwd);
+    g_cfg.cwd = str_dup(dir);
+    int gates = g_cfg.max_gates;
+    g_cfg.max_gates = 1;
+    Msgs m;
+
+    Ui q = {.interactive = false};
+    new_task(&m);
+    const char *fin = run_agent(&m, "tool_calls", 0, NULL, 0, &q);
+    T("one-shot question: first answer ends the task", !strcmp(fin, "done") && text_turns(&m) == 2);
+    T("one-shot question: no write nag", !has_msg(&m, "user", "written any"));
+    msgs_free(&m);
+
+    Ui d = {.interactive = false, .deliverable = true};
+    new_task(&m);
+    run_agent(&m, "tool_calls", 0, NULL, 0, &d);
+    T("deliverable: nag kept", has_msg(&m, "user", "You have not written any implementation files"));
+    msgs_free(&m);
+    static const char *const wr[] = {"write_file", "{\"path\":\"a.txt\",\"content\":\"x\"}"};
+    new_task(&m);
+    run_agent(&m, "tool_calls", 1, wr, 1, &d);
+    T("deliverable: verify pass kept", has_msg(&m, "user", "Before finishing"));
+    msgs_free(&m);
+    g_cfg.max_gates = gates;
+
+    static const char *const denied[] = {"bash", "{\"command\":\"touch /etc/fw > x\"}"};
+    Ui a = {.deliverable = true, .approve_cmd = count_ask};
+    asked = 0;
+    new_task(&m);
+    run_agent(&m, "tool_calls", 1, denied, 1, &a);
+    T("denied command is not put up for approval", asked == 0 && has_msg(&m, "tool", "forbidden"));
+    T("denied command does not count as written", has_msg(&m, "user", "written any implementation"));
+    msgs_free(&m);
+
+    g_cfg.wall = 2;
+    pid_t p = serve(reply_stall);
+    new_task(&m);
+    time_t t0 = time(NULL);
+    Ui w = {.interactive = true};
+    fin = agent_run(&m, &w, NULL, 0);
+    T("-W bounds a stalled request", time(NULL) - t0 <= 6 && !strcmp(fin, "wall"));
+    stop(p);
+    msgs_free(&m);
+    g_cfg.wall = 0;
+}
+
+#ifdef FW_MINI_HTTP
+int fw_mini_post_stream(const char *url, const char *payload, int streaming,
+                        size_t (*cb)(char *, size_t, size_t, void *), void *ud,
+                        int timeout_s, int *status, char *errbuf, size_t errcap);
+static void test_connect_timeout(void) {
+    char err[128] = "";
+    int status = 0;
+    time_t t0 = time(NULL);
+    /* private address nothing answers on (or no route: fails at once) */
+    int rc = fw_mini_post_stream("http://10.255.255.1:9/v1", "{}", 0, NULL, NULL, 1, &status, err, sizeof err);
+    T("connect honours its timeout", rc != 0 && time(NULL) - t0 <= 4);
+}
+#endif
+
+static void test_cli_values(void) {
+    static const char *const flags[] = {"-e", "-m", "-P", "-f", "-T", "-W", "--sys", "--transcript", "-C", NULL};
+    for (int i = 0; flags[i]; i++) {
+        char *av[] = {"flywheel", (char *)flags[i], NULL};
+        run_flywheel(false, av);
+        T(flags[i], run_status == 2);
+    }
+    char *av[] = {"flywheel", "-f", "/nonexistent/prompt.md", NULL};
+    run_flywheel(false, av);
+    T("unreadable prompt file is an error", run_status == 2);
+
+    bad_reply = OK_HDR STOPPED "data: [DONE]\n\n";
+    pid_t srv = serve(reply_fixed);
+    char *q[] = {"flywheel", "-C", "/tmp", "-P", "generic", "-e", g_cfg.endpoint,
+                 "describe the codebase layout", NULL};
+    char *o = run_flywheel(false, q);
+    T("one-shot question finishes in one turn", strstr(o, "finish=done turns=1 ") != NULL);
+    stop(srv);
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     memset(&g_cfg, 0, sizeof g_cfg);
@@ -901,6 +1165,18 @@ int main(void) {
     test_agent_strict();
     test_init_nofollow();
     test_plain_output_sanitized();
+    setenv("HOME", "/home/fwdeny", 1);
+    test_deny_operands();
+    setenv("HOME", fakehome, 1);
+    test_remember_inline();
+    test_autoallow_paths();
+    test_prune_parallel();
+    test_gate();
+    test_agent_review();
+    test_cli_values();
+#ifdef FW_MINI_HTTP
+    test_connect_timeout();
+#endif
     free(g_cfg.cwd);
     printf("unit: %d passed, %d failed\n", passed, failed);
     return failed ? 1 : 0;

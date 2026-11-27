@@ -337,7 +337,7 @@ int fw_do_bench(int argc, char **argv) {
         msgs_push(&msgs, "user", prompt);
         Ui ui = {.emit_text = NULL, .emit_think = NULL, .emit_tool = NULL,
                  .emit_out = NULL, .emit_status = bench_status, .emit_event = NULL,
-                 .interactive = false};
+                 .interactive = false, .deliverable = true};
 
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);

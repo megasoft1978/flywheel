@@ -37,7 +37,7 @@ static void usage(FILE *f) {
 "  -m MODEL   model name        (def local/qwen-pi4, env FW_MODEL)\n"
 "  -C DIR     working dir       (def cwd)\n"
 "  -P PROF    ts|python|go|rust|generic (def auto-detect)\n"
-"  -f FILE    prompt file\n"
+"  -f FILE    task file (a deliverable: files are expected)\n"
 "  -T N       max turns         (def 60)\n"
 "  -W SEC     wall clock        (def 0=off)\n"
 "  -t SEC     bash cmd timeout  (def 30)\n"
@@ -285,7 +285,7 @@ int fw_do_setup(void) {
     } else printf("model: %s " GREEN "ok" RESET "\n", mdir);
     if (!find_model_dir("z-lab--Qwen3.8-27B-DFlash2", "qwen27-dflash2", ddir, sizeof ddir)) {
         snprintf(ddir, sizeof ddir, "%s/models/qwen27-dflash2", home);
-        printf("drafter: %s (~1GB) not found\n", DRAFT_REPO);
+        printf("drafter: %s (~3.9GB) not found\n", DRAFT_REPO);
         if (have_cmd("aria2c") && confirm("download it for speculative decoding?", true))
             rc |= hf_download(DRAFT_REPO, ddir);
     } else printf("drafter: %s " GREEN "ok" RESET "\n", ddir);
@@ -391,7 +391,13 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         #define REQ (i + 1 < argc ? argv[++i] : NULL)
-        #define REQD(d) (i + 1 < argc ? argv[++i] : (d))
+        static const char *const valued[] = {"-e", "-m", "-P", "-f", "-T", "-W", "-t", "-K",
+            "--temp", "--topp", "--pp", "--think", "--gates", "--transcript", "--sys", NULL};
+        for (int k = 0; valued[k]; k++)
+            if (!strcmp(a, valued[k]) && i + 1 >= argc) {
+                fprintf(stderr, "flywheel: %s needs a value\n", a);
+                return 2;
+            }
         if (!strcmp(a, "-e")) g_cfg.endpoint = str_dup(REQ);
         else if (!strcmp(a, "-m")) g_cfg.model = str_dup(REQ);
         else if (!strcmp(a, "-C")) {
@@ -408,15 +414,15 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(a, "-P")) g_cfg.profile = str_dup(REQ);
         else if (!strcmp(a, "-f")) g_cfg.prompt_file = str_dup(REQ);
-        else if (!strcmp(a, "-T")) g_cfg.maxturns = atoi(REQD("60"));
-        else if (!strcmp(a, "-W")) g_cfg.wall = atoi(REQD("0"));
-        else if (!strcmp(a, "-t")) g_cfg.cmd_timeout = atoi(REQD("30"));
-        else if (!strcmp(a, "-K")) g_cfg.maxtok = atoi(REQD("12000"));
-        else if (!strcmp(a, "--temp")) g_cfg.temp = atof(REQD("0"));
-        else if (!strcmp(a, "--topp")) g_cfg.top_p = atof(REQD("0.95"));
-        else if (!strcmp(a, "--pp")) g_cfg.pp = atof(REQD("0"));
-        else if (!strcmp(a, "--think")) g_cfg.think_budget = atoi(REQD("0"));
-        else if (!strcmp(a, "--gates")) g_cfg.max_gates = atoi(REQD("1"));
+        else if (!strcmp(a, "-T")) g_cfg.maxturns = atoi(REQ);
+        else if (!strcmp(a, "-W")) g_cfg.wall = atoi(REQ);
+        else if (!strcmp(a, "-t")) g_cfg.cmd_timeout = atoi(REQ);
+        else if (!strcmp(a, "-K")) g_cfg.maxtok = atoi(REQ);
+        else if (!strcmp(a, "--temp")) g_cfg.temp = atof(REQ);
+        else if (!strcmp(a, "--topp")) g_cfg.top_p = atof(REQ);
+        else if (!strcmp(a, "--pp")) g_cfg.pp = atof(REQ);
+        else if (!strcmp(a, "--think")) g_cfg.think_budget = atoi(REQ);
+        else if (!strcmp(a, "--gates")) g_cfg.max_gates = atoi(REQ);
         else if (!strcmp(a, "--transcript")) g_cfg.transcript = str_dup(REQ);
         else if (!strcmp(a, "--sys")) g_cfg.sys_extra = str_dup(REQ);
         else if (!strcmp(a, "--no-color")) g_cfg.color = false;
@@ -438,7 +444,6 @@ int main(int argc, char **argv) {
         else if (a[0] != '-') g_cfg.once = str_dup(a);
         else { fprintf(stderr, "unknown flag: %s\n", a); usage(stderr); return 2; }
         #undef REQ
-        #undef REQD
     }
     if (!g_cfg.color) {
         /* strip color: redefine as empty via env trick — simplest: codes stay but that's fine on pipe */
@@ -453,20 +458,34 @@ int main(int argc, char **argv) {
     const Profile *prof = profile_detect(g_cfg.cwd, g_cfg.profile);
 
     char *prompt = NULL;
-    if (g_cfg.prompt_file) prompt = read_file(g_cfg.prompt_file);
-    else if (g_cfg.once) prompt = str_dup(g_cfg.once);
+    if (g_cfg.prompt_file) {
+        prompt = read_file(g_cfg.prompt_file);
+        if (!prompt) {
+            fprintf(stderr, "flywheel: cannot read %s\n", g_cfg.prompt_file);
+            return 2;
+        }
+    } else if (g_cfg.once) prompt = str_dup(g_cfg.once);
     else if (!isatty(0)) prompt = read_file("/dev/stdin");
 
     char *sysp = build_system(prof, prompt == NULL);
 
     if (prompt) {
-        /* non-interactive one-shot */
+        /* non-interactive one-shot. Only a task file promises a deliverable;
+           anything else may be a plain question */
+        if (!g_cfg.prompt_file) {
+            static const char ask[] = "\nIf the task is only a question, answer it in your reply; "
+                                      "do not create or change files.";
+            char *s = malloc(strlen(sysp) + sizeof ask);
+            sprintf(s, "%s%s", sysp, ask);
+            free(sysp);
+            sysp = s;
+        }
         Msgs msgs; msgs_init(&msgs);
         msgs_push(&msgs, "system", sysp);
         msgs_push(&msgs, "user", prompt);
         Ui ui = {.emit_text = p_text, .emit_think = p_think, .emit_tool = p_tool,
                  .emit_out = p_out, .emit_status = p_status, .emit_event = p_event,
-                 .interactive = false};
+                 .interactive = false, .deliverable = g_cfg.prompt_file != NULL};
         char sum[256];
         const char *fin = agent_run(&msgs, &ui, sum, sizeof sum);
         char *safe = tty_text(sum, false);   /* finish carries server text */

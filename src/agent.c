@@ -4,16 +4,12 @@
 #define MAXPRUNES 8
 #define MAXRESETS 2
 
-
-static char *gate_out(const Profile *prof, const char *cwd) {
-    if (!prof->gate_cmd) return str_dup("");
-    return run_bash(prof->gate_cmd, cwd, g_cfg.cmd_timeout * 2);
+static char *gate_out(const Profile *prof, const char *cwd, bool *failed) {
+    return gate_run(prof, cwd, g_cfg.cmd_timeout * 2, failed);
 }
 
-static bool gate_fails(const Profile *prof, const char *out) {
-    if (!prof->gate_cmd) return false;
-    if (!strcmp(prof->name, "ts")) return strstr(out, "error TS") != NULL;
-    return strstr(out, "error") != NULL || strstr(out, "Error") != NULL;
+static bool wall_over(time_t wall0) {
+    return g_cfg.wall && time(NULL) - wall0 >= g_cfg.wall;
 }
 
 static void emit(Ui *ui, void (*fn)(const char *, void *), const char *s) {
@@ -26,7 +22,6 @@ static void event(Ui *ui, const char *kind, const char *detail) {
 const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
     const Profile *prof = profile_detect(g_cfg.cwd, g_cfg.profile);
     Recent rec = {0};
-    int *starts = malloc((g_cfg.maxturns + 8) * sizeof(int));
     int prunes = 0, gates = 0, resets = 0, toks = 0, ptoks = 0, calls = 0, turns = 0;
     double secs = 0;
     bool wrote = false;
@@ -42,7 +37,6 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
     for (int turn = 0; turn < g_cfg.maxturns; turn++) {
         if (g_cfg.wall && time(NULL) - wall0 > g_cfg.wall) { finish = "wall"; break; }
         if (g_abort) { finish = "aborted"; break; }
-        starts[turn] = msgs->n;
         double base_t = g_cfg.temp, base_pp = g_cfg.pp;
         if (escape_turns > 0) { g_cfg.temp = base_t > g_cfg.loop_temp ? base_t : g_cfg.loop_temp;
                                 if (g_cfg.pp < 0.25) g_cfg.pp = 0.25; escape_turns--; }
@@ -57,13 +51,16 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
            user aborts and malformed-response errors stay fatal. */
         ChatResp *r = NULL;
         for (int attempt = 0; attempt < 4; attempt++) {
+            /* a request may not outlive the wall clock */
+            long left = g_cfg.wall ? g_cfg.wall - (long)(time(NULL) - wall0) : 0;
+            g_cfg.req_timeout = g_cfg.wall ? (left > 1 ? (int)left : 1) : 0;
             r = chat(msgs, &scb);
             if (!r || !r->error) break;
             int transient = !strcmp(r->error, "aborted") ? 0 :
                 (!strncmp(r->error, "http:", 5) || !strncmp(r->error, "curl:", 5) ||
                  strstr(r->error, "connect") || strstr(r->error, "timeout") ||
                  strstr(r->error, "read failed") || strstr(r->error, "closed") != NULL);
-            if (!transient || attempt == 3) break;
+            if (!transient || attempt == 3 || wall_over(wall0)) break;
             if (ui->emit_text) {
                 char nb[160];
                 snprintf(nb, sizeof nb, "\n[transport: %.60s — retry %d/3]\n", r->error, attempt + 1);
@@ -73,14 +70,15 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
             r = NULL;
             struct timespec ts = {.tv_sec = 2 << attempt, .tv_nsec = 0};
             nanosleep(&ts, NULL);
-            if (g_abort) break;
+            if (g_abort || wall_over(wall0)) break;
         }
+        g_cfg.req_timeout = 0;
         g_cfg.temp = base_t;
         g_cfg.pp = base_pp;
         if (!r || r->error) {
             static char ferr[96];
             snprintf(ferr, sizeof ferr, "error:%.80s", r && r->error ? r->error : "null");
-            finish = ferr;
+            finish = !g_abort && wall_over(wall0) ? "wall" : ferr;
             if (r) chat_resp_free(r);
             break;
         }
@@ -126,15 +124,16 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
         if (ntcs == 0) {
             /* no tool call this turn */
             char gbuf[4096];
-            if (!ui->interactive && !wrote && turn < g_cfg.maxturns - 3) {
+            if (ui->deliverable && !wrote && turn < g_cfg.maxturns - 3) {
                 msgs_push(msgs, "user",
                     "You have not written any implementation files yet. Write the required files now, test them, and run the type check.");
                 chat_resp_free(r);
                 continue;
             }
-            if (prof->gate_cmd && (!ui->interactive || wrote)) {
-                char *go = gate_out(prof, g_cfg.cwd);
-                if (gate_fails(prof, go) && turn < g_cfg.maxturns - 2) {
+            if (prof->gate_cmd && (ui->deliverable || wrote)) {
+                bool bad;
+                char *go = gate_out(prof, g_cfg.cwd, &bad);
+                if (bad && turn < g_cfg.maxturns - 2) {
                     snprintf(gbuf, sizeof gbuf,
                         "`%s` failed. Fix all errors, remove only broken scratch files you created yourself, then verify and reply DONE:\n%.1800s",
                         prof->gate_cmd, go);
@@ -144,7 +143,7 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
                 }
                 free(go);
             }
-            if ((!ui->interactive || wrote) && !strcmp(r->finish, "stop") && gates < g_cfg.max_gates && turn < g_cfg.maxturns - 4) {
+            if ((ui->deliverable || wrote) && !strcmp(r->finish, "stop") && gates < g_cfg.max_gates && turn < g_cfg.maxturns - 4) {
                 gates++;
                 msgs_push(msgs, "user",
                     "Before finishing: list every requirement bullet in the task prompt and verify each one with a quick script or test run against your code (edge cases, error classes/shapes, concurrency, ordering, cleanup, defaults). Fix any mismatch, remove only scratch files you created yourself (never delete files you did not create), make sure the type check is clean, then reply DONE.");
@@ -220,12 +219,16 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
                     snprintf(reckey, sizeof reckey, "badargs:%.1100s", rawargs);
                 } else {
                     const char *denied = deny_check(fixed, g_cfg.cwd);
-                    bool unapproved = ui->approve_cmd && !perm_allowed(fixed) && !ui->approve_cmd(fixed, ui->ud);
+                    /* never ask about a command that will be refused anyway */
+                    bool unapproved = !denied && ui->approve_cmd && !perm_allowed(fixed) &&
+                                      !ui->approve_cmd(fixed, ui->ud);
                     if (denied) out = str_dup(denied);
                     else if (unapproved) out = str_dup("error: user denied this command — adapt, explain why it is needed, or try another approach");
                     else if (g_abort) out = str_dup("error: aborted by user — not executed");
-                    else out = run_bash(fixed, g_cfg.cwd, g_cfg.cmd_timeout);
-                    if (cmd_is_write(fixed)) wrote = true;
+                    else {
+                        out = run_bash(fixed, g_cfg.cwd, g_cfg.cmd_timeout);
+                        if (cmd_is_write(fixed)) wrote = true;
+                    }
                     snprintf(reckey, sizeof reckey, "%.1100s", fixed);
                 }
                 free(fixed);
@@ -252,8 +255,9 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
         /* periodic gate */
         if (g_cfg.gate_every && wrote && turn % g_cfg.gate_every == g_cfg.gate_every - 1
             && turn < g_cfg.maxturns - 5 && prof->gate_cmd) {
-            char *go = gate_out(prof, g_cfg.cwd);
-            if (gate_fails(prof, go)) {
+            bool bad;
+            char *go = gate_out(prof, g_cfg.cwd, &bad);
+            if (bad) {
                 char gb[4096];
                 snprintf(gb, sizeof gb,
                     "Automatic type check: `%s` currently reports errors. Fix these first, they fail grading:\n%.1800s",
@@ -268,9 +272,14 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
         int clen = 0;
         const char *kind = detect_loop(&rec, &clen);
         if (kind && prunes < MAXPRUNES) {
-            int cut = clen < turns ? clen : turns;
-            int at = starts[turn - cut + 1];
-            if (at <= task) at = task + 1;   /* never prune the task itself */
+            /* clen counts tool calls, and one turn may hold several: cut back to
+               the turn that made the oldest of them, never into the task */
+            int at = msgs->n, seen = 0, cut = 0;
+            while (at > task + 1 && seen < clen)
+                if (!strcmp(msgs->v[--at].role, "tool")) seen++;
+            while (at > task + 1 && !strcmp(msgs->v[at].role, "tool")) at--;
+            for (int k = at; k < msgs->n; k++)
+                if (!strcmp(msgs->v[k].role, "assistant")) cut++;
             const char *lastout = msgs->n && !strcmp(msgs->v[msgs->n-1].role, "tool")
                                   && msgs->v[msgs->n-1].content ? msgs->v[msgs->n-1].content : "";
             char last600[640]; snprintf(last600, sizeof last600, "%.600s", lastout);
@@ -278,7 +287,8 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
             prunes++;
             rec_clear(&rec);
             escape_turns = 2;
-            char *go = gate_out(prof, g_cfg.cwd);
+            bool bad;
+            char *go = gate_out(prof, g_cfg.cwd, &bad);
             char *files = run_bash(
                 "find . -maxdepth 3 \\( -name node_modules -o -name .git \\) -prune -o -type f -print | head -40",
                 g_cfg.cwd, 10);
@@ -289,7 +299,6 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
                 msgs_trunc(msgs, task > 0 ? 1 : 0);
                 msgs_push(msgs, "user", taskmsg);
                 task = msgs->n - 1;
-                for (int k = 0; k <= turn; k++) starts[k] = msgs->n;
                 snprintf(pb, sizeof pb,
                     "Context reset after repeated %s loop. Your saved files:\n%s\nCurrent type check:\n%.1000s\nRe-read the task prompt carefully. Inspect the existing files, find what is still missing or wrong versus the requirements, fix it with a different approach, verify the type check is clean, and reply DONE.",
                     kind, files, go);
@@ -297,8 +306,8 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
                 event(ui, "reset", kind);
             } else {
                 snprintf(pb, sizeof pb,
-                    "Loop detected (%s): your last %d turns repeated the same actions without progress and were pruned. Last output:\n%s\nFiles:\n%s\nCurrent type check:\n%.1000s\nDo NOT repeat that command cycle. Step back, diagnose the root cause differently, fix cleanly, and if checks pass, reply DONE.",
-                    kind, clen, last600, files, go);
+                    "Loop detected (%s): your last %d turn(s) repeated the same actions without progress and were pruned. Last output:\n%s\nFiles:\n%s\nCurrent type check:\n%.1000s\nDo NOT repeat that command cycle. Step back, diagnose the root cause differently, fix cleanly, and if checks pass, reply DONE.",
+                    kind, cut, last600, files, go);
                 msgs_push(msgs, "user", pb);
                 event(ui, "prune", kind);
             }
@@ -307,7 +316,7 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
         }
 
         /* nudges */
-        if (!wrote && (turn == 6 || turn == 12 || turn == 18))
+        if (ui->deliverable && !wrote && (turn == 6 || turn == 12 || turn == 18))
             msgs_push(msgs, "user", "You have not written any file yet. Stop exploring: write the implementation now, then run the type check.");
         else if (turn == g_cfg.maxturns - 5)
             msgs_push(msgs, "user", "5 turns left. Make sure all required files exist, remove any broken scratch files, confirm the type check is clean, then reply DONE.");
@@ -328,7 +337,6 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
                  finish, turns, prunes, gates, resets, calls, toks, secs);
     if (tr) fclose(tr);
     rec_clear(&rec);
-    free(starts);
     free(taskmsg);
     return finish;
 }

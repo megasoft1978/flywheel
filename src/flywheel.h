@@ -22,6 +22,7 @@ typedef struct {
     int   maxturns;      /* default 60 */
     int   wall;          /* seconds, default 0=off */
     int   cmd_timeout;   /* default 30 */
+    int   req_timeout;   /* seconds left for one request, 0=default (set from -W) */
     int   maxtok;        /* default 12000 */
     int   gate_every;    /* default 8, 0=off */
     int   max_gates;     /* default 1 */
@@ -83,6 +84,8 @@ char     *http_get_url(const char *url); /* GET absolute URL, malloc'd body or N
 
 /* tools.c */
 char *run_bash(const char *cmd, const char *cwd, int timeout_s); /* never NULL */
+/* *code = exit status, -1 if timed out or killed */
+char *run_bash_status(const char *cmd, const char *cwd, int timeout_s, int *code);
 char *deny_check(const char *cmd, const char *cwd);              /* NULL=ok, else static reason */
 char *heredoc_fix(const char *cmd);                              /* returns new or copy */
 bool  cmd_is_write(const char *cmd);
@@ -127,6 +130,8 @@ typedef struct {
     const char *write_exts;      /* unused v1 */
 } Profile;
 const Profile *profile_detect(const char *cwd, const char *force);
+/* runs the profile's check; *failed from its exit status. Never NULL. */
+char *gate_run(const Profile *, const char *cwd, int timeout_s, bool *failed);
 
 /* agent.c — shared driver for --once and interactive tasks */
 typedef struct {
@@ -149,6 +154,7 @@ typedef struct {
     bool (*approve_cmd)(const char *cmd, void *);   /* NULL = auto-approve (non-interactive) */
     void *ud;
     bool interactive;
+    bool deliverable;           /* the task expects files: nag until written */
 } Ui;
 
 /* runs the task to DONE/cap; returns finish string (static); out_summary filled if non-NULL */

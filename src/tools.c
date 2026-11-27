@@ -172,6 +172,202 @@ static bool one_of(const char *s, const char *const *list) {
     return false;
 }
 
+/* path_ok for a command operand: harmless brace lists are expanded first */
+static bool operand_ok(const char *w, const char *cwd, int *budget) {
+    for (const char *b = strchr(w, '{'); b; b = strchr(b + 1, '{')) {
+        if (b > w && b[-1] == '$') continue;
+        const char *e = b + 1;
+        int level = 0;
+        bool list = false;
+        for (; *e && (level || *e != '}'); e++) {
+            if (*e == '{') level++;
+            else if (*e == '}') level--;
+            else if (*e == ',' && !level) list = true;
+        }
+        if (!*e) continue;
+        const char *dots = strstr(b + 1, "..");
+        bool range = !list && dots && dots > b + 1 && dots + 2 < e;
+        for (const char *c = b + 1; range && c < e; c++)
+            if (!isalnum((unsigned char)*c) && *c != '.' && *c != '-') range = false;
+        if (!list && !range) continue;
+        for (const char *alt = b + 1; alt <= e; ) {
+            const char *end = alt;
+            for (level = 0; end < e && (level || *end != ','); end++) {
+                if (*end == '{') level++;
+                else if (*end == '}') level--;
+            }
+            if (--*budget < 0) return false;
+            size_t cap = strlen(w) + 2;
+            char *x = malloc(cap);
+            if (range) snprintf(x, cap, "%.*s0%s", (int)(b - w), w, e + 1);
+            else snprintf(x, cap, "%.*s%.*s%s", (int)(b - w), w, (int)(end - alt), alt, e + 1);
+            bool ok = operand_ok(x, cwd, budget);
+            free(x);
+            if (!ok) return false;
+            if (range) break;
+            alt = end + 1;
+        }
+        return true;
+    }
+    return path_ok(w, cwd);
+}
+
+static bool target_ok(const char *w, const char *cwd) {
+    int budget = 256;
+    return operand_ok(w, cwd, &budget);
+}
+
+static const char *check_simple(char **v, int n, const char *cwd, int depth);
+
+/* find: -delete, -fprint and a mutating -exec act below the starting points */
+static const char *check_find(char **a, int na, const char *cwd, int depth) {
+    static const char *const readers[] = {"grep", "egrep", "fgrep", "rg", "cat", "head", "tail", "wc",
+        "ls", "stat", "file", "echo", "printf", "basename", "dirname", "du", "md5", "md5sum",
+        "shasum", "sha256sum", "test", NULL};
+    int k = 0;
+    while (k < na && a[k][0] == '-' && a[k][1] && strspn(a[k] + 1, "HLPEXdsx") == strlen(a[k] + 1)) k++;
+    int first = k;
+    while (k < na && a[k][0] != '-' && strcmp(a[k], "!") && strcmp(a[k], "(")) k++;
+    int end = k;
+    bool mutates = false;
+    for (; k < na; k++) {
+        if (!strcmp(a[k], "-delete")) mutates = true;
+        else if ((!strncmp(a[k], "-fprint", 7) || !strcmp(a[k], "-fls")) && k + 1 < na) {
+            if (!target_ok(a[++k], cwd)) return E_OUTSIDE;
+        } else if (!strncmp(a[k], "-exec", 5) || !strncmp(a[k], "-ok", 3)) {
+            int s = ++k;
+            while (k < na && strcmp(a[k], ";") && strcmp(a[k], "+")) k++;
+            if (s == k) continue;
+            const char *c = strrchr(a[s], '/') ? strrchr(a[s], '/') + 1 : a[s];
+            if (!one_of(c, readers)) mutates = true;
+            if (depth > 4) return E_RULE;
+            const char *e = check_simple(a + s, k - s, cwd, depth + 1);
+            if (e) return e;
+        }
+    }
+    for (int i = first; mutates && i < end; i++)
+        if (!target_ok(a[i], cwd)) return E_OUTSIDE;
+    return NULL;
+}
+
+/* sed -i / perl -i: the files edited in place (not the script) */
+static const char *check_inplace(bool perl, char **a, int na, const char *cwd) {
+    bool inplace = false, script = false;
+    int k = 0;
+    for (; k < na && a[k][0] == '-' && a[k][1]; k++) {
+        const char *o = a[k];
+        if (!strcmp(o, "--")) { k++; break; }
+        if (o[1] == '-') {
+            if (!strncmp(o, "--in-place", 10)) inplace = true;
+            if (!strncmp(o, "--expression", 12) || !strncmp(o, "--file", 6)) {
+                script = true;
+                if (!strchr(o, '=')) k++;
+            }
+            continue;
+        }
+        for (const char *c = o + 1; *c; c++) {
+            if (*c == 'i') {
+                inplace = true;
+                if (!perl && !c[1] && k + 1 < na && !*a[k + 1]) k++;   /* BSD: -i '' */
+                /* perl -pie 'code': the e still introduces the program */
+                if (perl && (c[1] == 'e' || c[1] == 'E') && !c[2]) { script = true; k++; }
+                break;
+            }
+            if (*c == 'e' || (perl ? *c == 'E' : *c == 'f')) {
+                script = true;
+                if (!c[1]) k++;
+                break;
+            }
+            if (perl && strchr("IMm", *c)) { if (!c[1]) k++; break; }
+        }
+    }
+    /* -i may also follow the script (GNU sed permutes) */
+    for (int j = k; !perl && j < na; j++)
+        if (!strncmp(a[j], "-i", 2) || !strncmp(a[j], "--in-place", 10)) inplace = true;
+    if (!inplace) return NULL;
+    for (; k < na; k++) {
+        if (!perl && !strncmp(a[k], "-e", 2)) { if (!a[k][2]) k++; continue; }
+        if (a[k][0] == '-') continue;
+        if (!script) { script = true; continue; }
+        if (!target_ok(a[k], cwd)) return E_OUTSIDE;
+    }
+    return NULL;
+}
+
+/* git -C / --git-dir / --work-tree outside the project: read-only only */
+static const char *check_git(char **a, int na, const char *cwd) {
+    static const char *const reads[] = {"status", "log", "diff", "show", "rev-parse", "ls-files",
+        "blame", "grep", "describe", "cat-file", NULL};
+    bool outside = false;
+    int k = 0;
+    for (; k < na && a[k][0] == '-'; k++) {
+        const char *o = a[k], *dir = NULL;
+        if ((!strcmp(o, "-C") || !strcmp(o, "--git-dir") || !strcmp(o, "--work-tree")) && k + 1 < na)
+            dir = a[++k];
+        else if (!strncmp(o, "--git-dir=", 10)) dir = o + 10;
+        else if (!strncmp(o, "--work-tree=", 12)) dir = o + 12;
+        else if (!strcmp(o, "-c")) k++;
+        if (dir && !target_ok(dir, cwd)) outside = true;
+    }
+    if (!outside) return NULL;
+    if (k >= na || !one_of(a[k], reads)) return E_OUTSIDE;
+    for (; k < na; k++)
+        if (!strncmp(a[k], "--output", 8)) return E_OUTSIDE;
+    return NULL;
+}
+
+/* commands that change the files named by their operands */
+static const char *check_operands(const char *base, char **a, int na, const char *cwd) {
+    bool chmod_ = !strcmp(base, "chmod");
+    bool owner = !strcmp(base, "chown") || !strcmp(base, "chgrp");
+    bool ln = !strcmp(base, "ln"), rsync = !strcmp(base, "rsync"), inst = !strcmp(base, "install");
+    bool all = !strcmp(base, "touch") || !strcmp(base, "mkdir") || !strcmp(base, "rmdir") ||
+               !strcmp(base, "truncate");
+    if (!all && !chmod_ && !owner && !ln && !rsync && !inst) return NULL;
+    /* options whose separate value is not a file being written */
+    const char *valued = !strcmp(base, "touch") ? "rtdA" : !strcmp(base, "truncate") ? "sr"
+        : !strcmp(base, "mkdir") ? "m" : inst ? "mogSBf" : rsync ? "ef" : "";
+    bool symbolic = false, dirs = false, moves = false, opts = true, mode_seen = false;
+    const char *target = NULL;
+    char **p = malloc((size_t)(na + 1) * sizeof *p);
+    int np = 0;
+    for (int k = 0; k < na; k++) {
+        char *w = a[k];
+        if (opts && !strcmp(w, "--")) { opts = false; continue; }
+        if (opts && w[0] == '-' && w[1]) {
+            if (chmod_ && strspn(w + 1, "rwxXst,+=ugoa") == strlen(w + 1)) { mode_seen = true; continue; }
+            if (!strncmp(w, "--reference=", 12)) mode_seen = true;
+            if (!strncmp(w, "--target-directory=", 19)) target = w + 19;
+            if (!strcmp(w, "--symbolic")) symbolic = true;
+            if (!strcmp(w, "--directory")) dirs = true;
+            if (!strcmp(w, "--remove-source-files")) moves = true;
+            if (w[1] == '-') continue;
+            if (ln && strchr(w, 's')) symbolic = true;
+            if (inst && strchr(w, 'd')) dirs = true;
+            if ((ln || inst) && !strcmp(w, "-t") && k + 1 < na) target = a[++k];
+            else if (strchr(valued, w[strlen(w) - 1])) k++;
+            continue;
+        }
+        if ((chmod_ || owner) && !mode_seen) { mode_seen = true; continue; }
+        p[np++] = w;
+    }
+    const char *err = NULL;
+    if (target && !target_ok(target, cwd)) err = E_OUTSIDE;
+    for (int k = 0; !err && k < np; k++) {
+        bool check;
+        if (ln)           /* a hard link makes the source itself writable here */
+            check = !symbolic || (!target && np > 1 && k == np - 1);
+        else if (rsync)
+            check = np > 1 && (moves || k == np - 1);
+        else if (inst)
+            check = dirs || (!target && np > 1 && k == np - 1);
+        else check = true;
+        if (check && !target_ok(p[k], cwd)) err = E_OUTSIDE;
+    }
+    free(p);
+    return err;
+}
+
 /* inspect one simple command (words after quote removal) */
 static const char *check_simple(char **v, int n, const char *cwd, int depth) {
     static const char *const kw[] = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "time", NULL};
@@ -226,9 +422,13 @@ static const char *check_simple(char **v, int n, const char *cwd, int depth) {
         }
         return NULL;
     }
+    if (!strcmp(base, "find")) return check_find(a, na, cwd, depth);
+    if (!strcmp(base, "sed") || !strcmp(base, "gsed")) return check_inplace(false, a, na, cwd);
+    if (!strcmp(base, "perl")) return check_inplace(true, a, na, cwd);
+    if (!strcmp(base, "git")) return check_git(a, na, cwd);
     bool rm = !strcmp(base, "rm"), tee = !strcmp(base, "tee");
     bool cp = !strcmp(base, "cp"), mv = !strcmp(base, "mv");
-    if (!rm && !tee && !cp && !mv) return NULL;
+    if (!rm && !tee && !cp && !mv) return check_operands(base, a, na, cwd);
     bool recursive = false, opts = true;
     const char *target = NULL, *last = NULL;
     int nargs = 0;
@@ -252,7 +452,14 @@ static const char *check_simple(char **v, int n, const char *cwd, int depth) {
         for (int k = 0; k < na; k++) {
             if (opts && !strcmp(a[k], "--")) { opts = false; continue; }
             if (opts && a[k][0] == '-') continue;
-            if (!path_ok(a[k], cwd)) return E_RULE;
+            if (!target_ok(a[k], cwd)) return E_RULE;
+        }
+    } else if (rm) {
+        opts = true;
+        for (int k = 0; k < na; k++) {
+            if (opts && !strcmp(a[k], "--")) { opts = false; continue; }
+            if (opts && a[k][0] == '-' && a[k][1]) continue;
+            if (!target_ok(a[k], cwd)) return E_OUTSIDE;
         }
     }
     if ((cp || mv) && target && !path_ok(target, cwd)) return E_OUTSIDE;
@@ -528,6 +735,11 @@ static bool drain_pipe(int fd, char *buf, size_t *len, int max_reads) {
 }
 
 char *run_bash(const char *cmd, const char *cwd, int timeout_s) {
+    return run_bash_status(cmd, cwd, timeout_s, NULL);
+}
+
+char *run_bash_status(const char *cmd, const char *cwd, int timeout_s, int *code) {
+    if (code) *code = -1;
     int fds[2];
     if (pipe(fds)) return str_dup("error: pipe failed");
     fcntl(fds[0], F_SETFL, O_NONBLOCK);
@@ -572,6 +784,7 @@ char *run_bash(const char *cmd, const char *cwd, int timeout_s) {
     close(fds[0]);
     buf[len] = 0;
     utf8_sanitize(buf);
+    if (code && !timed && WIFEXITED(status)) *code = WEXITSTATUS(status);
     char *out;
     if (timed) {
         out = malloc(len + 160);
@@ -769,12 +982,58 @@ static bool has_mutating_args(const char *cmd) {
     return bad;
 }
 
+/* does a read of `p` stay inside the project? */
+static bool read_inside(const char *p) {
+    if (!*p || !strcmp(p, "-") || !strcmp(p, "/dev/null")) return true;
+    bool away = p[0] == '/' || p[0] == '~';
+    for (const char *d = p; !away && (d = strstr(d, "..")); d += 2)
+        away = (d == p || d[-1] == '/') && (!d[2] || d[2] == '/');
+    const char *cwd = g_cfg.cwd;
+    char root[PATH_MAX], abs[PATH_MAX], real[PATH_MAX], norm[PATH_MAX];
+    if (!cwd || !realpath(cwd, root)) return !away;
+    if (p[0] == '~') return false;
+    int n = p[0] == '/' ? snprintf(abs, sizeof abs, "%s", p) : snprintf(abs, sizeof abs, "%s/%s", cwd, p);
+    if (n < 0 || (size_t)n >= sizeof abs) return false;
+    /* existing paths are judged by where their symlinks really lead */
+    if (realpath(abs, real)) return is_within(root, real);
+    if (!away) return true;
+    return lex_normalize(abs, norm, sizeof norm) && (is_within(cwd, norm) || is_within(root, norm));
+}
+
+/* a builtin reader given a path outside the project must prompt */
+static bool reads_outside(const char *cmd) {
+    static const char *const readers[] = {"ls", "cat", "grep", "rg", "find", "fd", "head", "tail",
+        "wc", "file", "stat", "cd", "test", "sort", "uniq", "cut", NULL};
+    char *buf = malloc(strlen(cmd) + 1);
+    const char *p = cmd;
+    read_word(&p, buf, NULL);
+    bool out = false, cut = !strcmp(buf, "cut"), sort = !strcmp(buf, "sort");
+    if (one_of(buf, readers))
+        while (!out && *p) {
+            if (strchr(" \t()", *p)) { p++; continue; }
+            read_word(&p, buf, NULL);
+            const char *path = buf;
+            if (buf[0] == '-' && buf[1]) {
+                const char *eq = strchr(buf, '=');
+                if (buf[1] == '-') path = eq ? eq + 1 : "";
+                else if ((cut && buf[1] == 'd') || (sort && buf[1] == 't')) path = "";   /* delimiter */
+                else {   /* attached value: -f/etc/x, -nf../x */
+                    path = buf + 1 + strcspn(buf + 1, "/~.");
+                }
+            }
+            out = !read_inside(path);
+        }
+    free(buf);
+    return out;
+}
+
 bool perm_allowed(const char *cmd) {
     perm_load();
     while (*cmd == ' ') cmd++;
     /* a leading VAR=value makes the real command whatever follows it */
     if (cmd[strcspn(cmd, "= \t")] == '=') return false;
     if (has_shell_meta(cmd) || has_expansion(cmd) || has_mutating_args(cmd)) return false;
+    if (reads_outside(cmd)) return false;
     for (int i = 0; BUILTIN_ALLOW[i]; i++)
         if (rule_match(BUILTIN_ALLOW[i], cmd)) return true;
     for (int i = 0; i < nrules; i++)
@@ -793,10 +1052,40 @@ void perm_add_rule(const char *rule) {
     if (f) { fprintf(f, "%s\n", rule); fclose(f); }
 }
 
+/* would remembering this command's prefix whitelist arbitrary code? */
+static bool runs_inline_code(const char *cmd) {
+    static const char *const interp[] = {"sh", "bash", "zsh", "dash", "ksh", "fish", "ruby", "perl",
+        "php", "lua", "awk", "gawk", "osascript", "deno", "bun", "swift", "tclsh", "Rscript", "env",
+        "xargs", "eval", "exec", "command", "nohup", "nice", "timeout", "setsid", "time", "source",
+        ".", "ssh", "su", "parallel", NULL};
+    char *a = malloc(strlen(cmd) + 1), *b = malloc(strlen(cmd) + 1);
+    const char *p = cmd;
+    while (*p == ' ' || *p == '\t') p++;
+    read_word(&p, a, NULL);
+    while (*p == ' ' || *p == '\t') p++;
+    read_word(&p, b, NULL);
+    const char *base = strrchr(a, '/') ? strrchr(a, '/') + 1 : a;
+    bool script = !strcmp(a, "python") || !strcmp(a, "python3") || !strcmp(a, "node");
+    bool multi = script || !strcmp(a, "git") || !strcmp(a, "npx") || !strcmp(a, "npm") ||
+                 !strcmp(a, "brew") || !strcmp(a, "go") || !strcmp(a, "cargo");
+    bool bad = one_of(base, interp) || strstr(cmd, "--eval") != NULL;
+    /* the rule is "tool second-word": a flag or nothing there covers any code */
+    if (multi && (*b == '-' || !*b)) bad = true;
+    /* python3.12, /usr/bin/node, nodejs: same interpreters under other names */
+    size_t stem = !strncmp(base, "python", 6) ? 6 : !strncmp(base, "nodejs", 6) ? 6
+                : !strncmp(base, "node", 4) ? 4 : 0;
+    if (!script && stem && !base[stem + strspn(base + stem, "0123456789.")]) bad = true;
+    if (!strcmp(a, "npm") && (!strcmp(b, "exec") || !strcmp(b, "x"))) bad = true;
+    free(a);
+    free(b);
+    return bad;
+}
+
 /* "always" rule derived from a command: first token, or first two
-   tokens for multiword tools. */
+   tokens for multiword tools. "" = nothing safe to remember. */
 char *perm_prefix(const char *cmd) {
     while (*cmd == ' ') cmd++;
+    if (runs_inline_code(cmd)) return str_dup("");
     static const char *two[] = {"git", "npx", "npm", "brew", "go", "cargo", "python3", "python", "node", NULL};
     char first[128] = {0};
     int i = 0;
