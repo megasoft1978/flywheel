@@ -25,19 +25,57 @@ from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
 DIST = Path(__file__).resolve().parent.parent / "dist"
+TIMEOUTS_TSV = Path(__file__).resolve().parent / "tb21-timeouts.tsv"
 # context-size wording; also inside HTTP 500 and 200-body errors (harvest_tb21 uses the same)
 CONTEXT_OVERFLOW = re.compile(
     r"context.{0,24}(length|window|size|limit)|maximum context|prompt is too long|exceeds? the context",
     re.IGNORECASE,
 )
+# flywheel's -W is checked only at the start of each turn and inside model requests (src/agent.c:106,
+# 123), so a command started just before it can run up to -t more. The margin is not a guarantee;
+# Harbor's kill (asyncio.wait_for) is the only hard cap. Open blocker in bench/PROTOCOL.md.
+WALL_MARGIN_SEC = 60
+# per-command limit (-t), a flywheel setting chosen in FW-TBTIME. It is not matched to Terminus 2:
+# Terminus 2 sends commands non-blocking and waits min(duration, 60) s without killing them
+# (terminus_2.py:1400, :1434). flywheel gates get 2x -t (src/agent.c:39).
+CMD_TIMEOUT_SEC = 180
+# -T must not bind before -W; the largest tb21 budget is 12000 s and a model turn takes >1 s
+MAX_TURNS = 20000
+
+
+def task_budget_sec(task_name: str, multiplier: float, table: Path = TIMEOUTS_TSV) -> float:
+    """Harbor's agent timeout for one task: task.toml agent.timeout_sec x timeout_multiplier.
+
+    Harbor applies it with asyncio.wait_for around the agent's run() (trial/trial.py:784) and
+    passes custom agents only their -k kwargs (agents/factory.py:30), so the agent looks it up
+    in tb21-timeouts.tsv, which records the task.toml values of the pinned dataset.
+    """
+    for line in table.read_text().splitlines():
+        if not line or line.startswith("#"):
+            continue
+        name, agent_sec, *_ = line.split("\t")
+        if name == task_name:
+            return float(agent_sec) * multiplier
+    raise KeyError(f"no agent timeout for task {task_name!r} in {table.name}")
+
+
+def wall_limit_sec(budget_sec: float) -> int:
+    """flywheel -W for a Harbor budget. -W 0 means unlimited in flywheel, so refuse it."""
+    wall = int(budget_sec - WALL_MARGIN_SEC)
+    if wall <= 0:
+        raise ValueError(
+            f"budget {budget_sec:g} s leaves no flywheel wall limit after the "
+            f"{WALL_MARGIN_SEC} s margin"
+        )
+    return wall
 
 
 class FlywheelAgent(BaseAgent):
     def __init__(self, *args, **kwargs):
         self._engine_url = kwargs.pop("engine_url", "http://host.docker.internal:8312/v1")
         self._model = kwargs.pop("fw_model", None)
-        self._turn_timeout = kwargs.pop("turn_timeout", 150)
-        self._wall_timeout = kwargs.pop("wall_timeout", 900)
+        # set by run-tb21.sh to the same --timeout-multiplier that Harbor applies
+        self._timeout_multiplier = float(kwargs.pop("timeout_multiplier", 1.0))
         super().__init__(*args, **kwargs)
 
     @staticmethod
@@ -71,6 +109,9 @@ class FlywheelAgent(BaseAgent):
         environment: BaseEnvironment,
         context: AgentContext,
     ) -> None:
+        # resolve the budget before touching the container
+        budget = task_budget_sec(environment.environment_name, self._timeout_multiplier)
+        wall = wall_limit_sec(budget)
         # write the instruction into the container (avoids quoting hell)
         instr = shlex.quote(instruction)
         await environment.exec(
@@ -88,14 +129,14 @@ class FlywheelAgent(BaseAgent):
             # the task container is throwaway and tasks write outside /app;
             # there is no sandbox on Linux, so --unsafe is required there
             f"flywheel -q --allow-outside-writes --unsafe "
-            f"-f /tmp/fw_instruction.txt -T {self._turn_timeout} "
-            f"-W {self._wall_timeout} -t 180 --transcript /tmp/fw_transcript.jsonl "
+            f"-f /tmp/fw_instruction.txt -T {MAX_TURNS} "
+            f"-W {wall} -t {CMD_TIMEOUT_SEC} --transcript /tmp/fw_transcript.jsonl "
             "> /tmp/fw_out.log 2>&1; echo FW_EXIT_$?"
         )
         res = await environment.exec(
             cmd,
             env=env,
-            timeout_sec=self._wall_timeout + 120,
+            timeout_sec=wall + 120,
         )
         out = res.stdout or ""
         self.logger.info("flywheel exec tail: %s", out[-400:])
