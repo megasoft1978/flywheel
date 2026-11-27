@@ -1526,6 +1526,55 @@ static void test_review3(void) {
     }
 }
 
+static void test_review4(void) {
+    const char *cwd = "/tmp/sb";
+    static const char *yes[] = {
+        "mkdir -p $(pwd)/build", "cp a.txt $(pwd)/b.txt", "rm -rf $(pwd)/build", "rm -f `pwd`/x.o",
+        "touch $(dirname src/a.c)/stamp", "sed -i s/a/b/ $(pwd)/f", "cp a $(pwd)/x/$(date)/y",
+        "echo x > $(pwd)/out", "echo x > `pwd`/out", "touch $(pwd)`date`/z", "sed -n 1p \"$f\"",
+        "sed -i s/a/b/ *.c", "sed -i s/a/b/ src/*.c src/*.h", "sed -n 1p -- $a b", NULL};
+    for (int i = 0; yes[i]; i++) T(yes[i], deny_check(yes[i], cwd) == NULL);
+    static const char *no[] = {
+        "rm $(pwd)/../../x", "rm $(true) /etc/x", "rm $(true)x /etc/x", "rm `true`x /etc/x",
+        "rm $(pwd)/a/$(date)/../../../x", "touch `pwd`/../x", "echo x > $(pwd)/../x",
+        "echo x > `pwd`/../x", "touch $(pwd)/\"$(rm /etc/x)\"", "mkdir $(pwd)/b /etc/x",
+        "sed -e p $F 'w /etc/x' f", "sed -n 1p $F 'w /etc/x'", "sed -n 1p \"$f\" 'w /etc/x'",
+        "sed -n 1p x$F 'w /etc/x'", "sed -n 1p `cat s` w f", "sed -n 1p $(cat s) 'w /etc/x'",
+        "sed -n 1p *x 'w /etc/x'", "sed -e p $F -- 'w /etc/x'", NULL};
+    for (int i = 0; no[i]; i++) T(no[i], deny_check(no[i], cwd) != NULL);
+    g_cfg.outside_writes = true;
+    T("sed operand rule off with outside writes", !deny_check("sed -n 1p $F x", cwd));
+    g_cfg.outside_writes = false;
+
+    free(g_cfg.cwd);
+    g_cfg.cwd = str_dup(projdir);
+    perm_free();
+    static const char *rules_[] = {"git", "go", NULL};
+    for (int i = 0; rules_[i]; i++) perm_add_rule(rules_[i]);
+    static const char *ask[] = {
+        "git clone -c core.fsmonitor=./evil a b", "git clone -ccore.x=./evil a b", "git clone --config x=y a b",
+        "git clone --conf=x=y a b", "git clone --template=./t a b", "git clone --templ ./t a b",
+        "git clone -qc x=y a b", "git clone --recurse-submodules a b", "git ls-remote -c x=y .",
+        "git ls-remote --config=x=y .", "git -c core.x=./evil ls-remote .", "git -c core.x=./evil clone a b",
+        "git ls-remote --frob .",
+        "go build -C /etc", "go -C /etc build", "go build -debug-actiongraph=/etc/x",
+        "go build -debug-trace=/etc/x", "go build -debug-runtime-trace /etc/x",
+        "go test -test.testlogfile=/etc/x", "go test -test.gocoverdir=/etc", "go test -test.fuzzcachedir=/etc",
+        "go test --testlogfile /etc/x", "go test -args -x", "go build -frob", "go env -w X=y", NULL};
+    for (int i = 0; ask[i]; i++) T(ask[i], !perm_allowed(ask[i]));
+    static const char *fine[] = {
+        "git clone -q --depth 1 -b main a b", "git clone --depth=1 --single-branch --no-tags a b",
+        "git ls-remote --heads --tags origin", "git ls-remote -q --exit-code origin main",
+        "git log --grep clone", "git status --short",
+        "go test -v -race -run X -count=1 -short -timeout 30s ./...",
+        "go test -tags=x -bench . -benchmem -failfast -json -cover -covermode=atomic -parallel 4 ./...",
+        "go test -test.v -test.run=X", "go vet -atomic ./...", NULL};
+    for (int i = 0; fine[i]; i++) T(fine[i], perm_allowed(fine[i]));
+    char pf[1200];
+    if (perm_project_file(pf, sizeof pf)) unlink(pf);
+    perm_free();
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     memset(&g_cfg, 0, sizeof g_cfg);
@@ -1579,6 +1628,7 @@ int main(void) {
     setenv("HOME", fakehome, 1);
     test_scan_git_remote();
     test_review3();
+    test_review4();
     test_gate_approval();
 #ifdef FW_MINI_HTTP
     test_connect_timeout();

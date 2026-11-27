@@ -390,7 +390,7 @@ static const char *check_sed(char **a, int na, const char *cwd) {
     static const char *const flags[] = {"quiet", "silent", "regexp-extended", "separate", "unbuffered",
         "null-data", "zero-terminated", "posix", "debug", "follow-symlinks", "sandbox", "help",
         "version", NULL};
-    bool inplace = false, script = false, opts = true, expanded = false;
+    bool inplace = false, script = false, opts = true, expanded = false, may_opt = false;
     char **files = malloc((size_t)(na + 1) * sizeof *files);
     int nf = 0;
     const char *err = NULL;
@@ -400,7 +400,15 @@ static const char *check_sed(char **a, int na, const char *cwd) {
         /* {-e,...} turns into options of its own */
         if (expands && *o == '{') { err = E_SED; break; }
         if (opts && !strcmp(o, "--")) { opts = false; continue; }
-        if (!opts || o[0] != '-' || !o[1]) { expanded |= expands; files[nf++] = a[k]; continue; }
+        if (!opts || o[0] != '-' || !o[1]) {
+            /* an expansion that may turn into -e makes any later word a script */
+            if (may_opt) { err = E_SED; break; }
+            if (expands && opts && (strchr(o, '$') || strchr(o, '`') || (*o && strchr("{*?[", *o))))
+                may_opt = true;
+            expanded |= expands;
+            files[nf++] = a[k];
+            continue;
+        }
         /* an expanded option word may carry a script of its own */
         if (expands) { err = E_SED; break; }
         /* ...and an earlier expansion may change what a later -e/-f means */
@@ -792,7 +800,13 @@ static const char *scan_pass(const char *s, const char *cwd, int depth, bool nes
     char delim[MAXHEREDOC][64];
     bool dash[MAXHEREDOC];
     int n = 0, nd = 0;
-    int base = 0, outer[MAXNEST], level = 0;   /* current command is v[base..n) */
+    int base = 0, level = 0;   /* current command is v[base..n) */
+    /* what a substitution interrupted: the command, and the word it is part
+       of (v[ph], or a redirect target) so that a glued suffix stays in it */
+    struct { int base, ph; bool redir; } outer[MAXNEST];
+    char *joined[MAXWORDS];
+    int nj = 0, last = -1;     /* the word ending at word_end */
+    bool last_redir = false;
     bool redir_out = false, redir_in = false, tick = false;
     const char *err = NULL, *p = s, *word_end = NULL;
     static char subst[] = {'$', 0, 1};   /* stands for a `...` word */
@@ -842,28 +856,40 @@ static const char *scan_pass(const char *s, const char *cwd, int depth, bool nes
         if (c == '`') {   /* opening one: part of the current command's words */
             if (!tick && !redir_out && !redir_in) {
                 if (n && word_end == p) v[n - 1][strlen(v[n - 1]) + 1] = 1;
-                else if (n > base && n < MAXWORDS) v[n++] = subst;
+                else if (n > base && n < MAXWORDS) {
+                    v[n++] = subst;
+                    word_end = p;
+                    last = n - 1;
+                    last_redir = false;
+                }
             }
             tick = !tick;
         }
         if (!c || strchr("\n;&|()`", c)) {
+            bool glued = word_end == p, redir = glued ? last_redir : redir_out;
+            int ph = glued && !last_redir ? last : -1, closed = -1;
             redir_out = redir_in = false;
             if (nest && (c == '(' || (c == '`' && tick))) {
                 /* the outer command resumes after the substitution */
                 if (level == MAXNEST) err = E_RULE;
                 else {
-                    outer[level++] = base;
+                    outer[level].base = base;
+                    outer[level].ph = ph;
+                    outer[level++].redir = redir;
                     base = n;
                 }
             } else {
                 if (n > base) err = check_simple(v + base, n - base, cwd, depth);
                 n = base;
-                if (nest && (c == ')' || c == '`') && level) base = outer[--level];
+                if (nest && (c == ')' || c == '`') && level) {
+                    base = outer[--level].base;
+                    closed = level;
+                }
             }
             if (!c) {
                 while (!err && level) {   /* unterminated: judge what is open */
                     n = base;
-                    base = outer[--level];
+                    base = outer[--level].base;
                     if (n > base) err = check_simple(v + base, n - base, cwd, depth);
                 }
                 break;
@@ -886,6 +912,31 @@ static const char *scan_pass(const char *s, const char *cwd, int depth, bool nes
                 }
                 nd = 0;
             }
+            /* $(pwd)/build is one word: glue the suffix to its `$` */
+            if (!err && closed >= 0 && *p && !strchr(" \t\r\n;&|<>()`", *p)) {
+                int at = outer[closed].ph;
+                bool target = outer[closed].redir;
+                if (at >= 0 || target) {
+                    const char *sub;
+                    char *tail = malloc(strlen(p) + 1);
+                    read_word(&p, tail, &sub, NULL);
+                    const char *head = at >= 0 ? v[at] : "$";
+                    size_t hl = strlen(head), tl = strlen(tail);
+                    char *j = malloc(hl + tl + 2);
+                    memcpy(j, head, hl);
+                    memcpy(j + hl, tail, tl + 1);
+                    j[hl + tl + 1] = 1;   /* expands */
+                    free(tail);
+                    if (sub) err = scan_script(sub, cwd, depth + 1);
+                    if (nj == MAXWORDS) { free(j); err = E_RULE; break; }
+                    joined[nj++] = j;
+                    if (at >= 0) v[at] = j;
+                    else if (!err && !path_ok(j, cwd)) err = E_OUTSIDE;
+                    word_end = p;
+                    last = at;
+                    last_redir = at < 0;
+                }
+            }
             continue;
         }
         const char *sub;
@@ -893,6 +944,8 @@ static const char *scan_pass(const char *s, const char *cwd, int depth, bool nes
         char *w = top;
         read_word(&p, w, &sub, &expands);
         word_end = p;
+        last = -1;
+        last_redir = redir_out;
         top += strlen(w) + 2;
         top[-1] = expands;
         if (sub) err = scan_script(sub, cwd, depth + 1);
@@ -901,12 +954,13 @@ static const char *scan_pass(const char *s, const char *cwd, int depth, bool nes
         } else if (!redir_in) {
             bool fd = *p == '>' && *w && strspn(w, "0123456789") == strlen(w);
             if (!fd) {
-                if (n < MAXWORDS) v[n++] = w;
+                if (n < MAXWORDS) { last = n; v[n++] = w; }
                 else err = E_RULE;
             }
         }
         redir_out = redir_in = false;
     }
+    while (nj) free(joined[--nj]);
     free(arena);
     return err;
 }
@@ -1274,6 +1328,43 @@ static bool has_letter(const char *a, const char *want, const char *valued) {
     return false;
 }
 
+/* git ls-remote/clone take flags that run programs (-c, --config, --template,
+   -u ...): only the exact ones listed here go unasked */
+static bool git_remote_unsafe(char **v, int n) {
+    int k = 1;
+    bool global = false;
+    for (; k < n && v[k][0] == '-'; k++) {
+        global = true;
+        if (!strcmp(v[k], "-c") || !strcmp(v[k], "-C")) k++;
+    }
+    if (k >= n) return false;
+    bool clone = !strcmp(v[k], "clone");
+    if (!clone && strcmp(v[k], "ls-remote")) return false;
+    if (global) return true;
+    const char *flags = clone ? "-q --quiet -v --verbose --progress -n --no-checkout --bare "
+                                "--single-branch --no-single-branch --no-tags"
+                              : "-h --heads -t --tags --branches --refs -q --quiet --exit-code "
+                                "--get-url --symref";
+    const char *valued = clone ? "--depth -b --branch -o --origin" : "--sort";
+    for (k++; k < n; k++) {
+        const char *a = v[k], *eq = strchr(a, '=');
+        if (!strcmp(a, "--")) break;
+        if (a[0] != '-') continue;
+        if (word_in(flags, a, strlen(a))) continue;
+        if (!word_in(valued, a, strcspn(a, "="))) return true;
+        if (!eq) k++;
+    }
+    return false;
+}
+
+/* go flags write files and run programs under many names: only these pass */
+static bool go_flag_ok(const char *a) {
+    const char *name = a + (a[1] == '-' ? 2 : 1);
+    if (!strncmp(name, "test.", 5)) name += 5;
+    return word_in("v race run count short timeout tags bench benchmem failfast json cover covermode "
+                   "parallel atomic", name, strcspn(name, "="));
+}
+
 /* read-only-looking commands whose flags can write or execute */
 static bool has_mutating_args(const char *cmd) {
     char *arena = malloc(2 * strlen(cmd) + 2), *top = arena;
@@ -1295,9 +1386,8 @@ static bool has_mutating_args(const char *cmd) {
     bool file = !strcmp(c, "file"), pf = !strcmp(c, "printf");
     bool tst = !strcmp(c, "test") || !strcmp(c, "[");
     bool tsc = !strcmp(c, "npx") && n > 1 && !strcmp(v[1], "tsc"), noemit = false;
-    bool go = !strcmp(c, "go"), remote = false;
-    for (int i = 1; git && i < n; i++)   /* here -u names the program to run */
-        if (!strcmp(v[i], "ls-remote") || !strcmp(v[i], "clone")) remote = true;
+    bool go = !strcmp(c, "go");
+    if (git && git_remote_unsafe(v, n)) bad = true;
     bool grep = !strcmp(c, "grep"), ls = !strcmp(c, "ls"), perl = !strncmp(c, "perl", 4);
     bool opts = true;
     int plain = 0;
@@ -1325,14 +1415,7 @@ static bool has_mutating_args(const char *cmd) {
                     abbrev(a, "--show-signature", 8) || strstr(a, "signature") || has_sig_format(a))) bad = true;
         if (git && (abbrev(a, "--upload-pack", 3) || abbrev(a, "--receive-pack", 5) ||
                     abbrev(a, "--exec", 3))) bad = true;   /* runs a program */
-        if (remote && shortopt && strchr(a, 'u')) bad = true;
-        if (go && a[0] == '-') {   /* run another program or write any file */
-            const char *name = a + (a[1] == '-' ? 2 : 1);
-            if (!strncmp(name, "test.", 5)) name += 5;
-            if (word_in("exec toolexec vettool o ldflags gcflags asmflags gccgoflags coverprofile "
-                        "cpuprofile memprofile blockprofile mutexprofile trace outputdir overlay modfile "
-                        "pkgdir", name, strcspn(name, "="))) bad = true;
-        }
+        if (go && a[0] == '-' && a[1] && !go_flag_ok(a)) bad = true;
         if (uniq) {   /* a second operand is the output file; "-" is an operand */
             if (opts && !strcmp(a, "--")) opts = false;
             else if (!opts || a[0] != '-' || !a[1]) {
