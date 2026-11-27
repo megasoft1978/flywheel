@@ -1447,10 +1447,16 @@ static bool data_volume(const char *path, const struct stat *st) {
         || (st && !stat(data, &d) && d.st_dev == st->st_dev && d.st_ino == st->st_ino);
 }
 
+/* nor through the other root prefixes that spell a path again */
+static bool alias_root(const char *path) {
+    return !strcasecmp(path, "/.nofollow") || !strcasecmp(path, "/.vol")
+        || !strcasecmp(path, "/.resolve");
+}
+
 /* Follow the absolute path one component at a time, reporting every step. A
    final directory is only pinned unless `closed`. False, naming the place, for
-   a loop, the data volume and anything that cannot be looked at. out: where it leads,
-   PATH_MAX bytes. */
+   a loop, a second spelling and anything that cannot be looked at. out: where it
+   leads, PATH_MAX bytes. */
 static bool walk(const char *path, bool closed, char *out, NodeFn fn, void *arg) {
     char rest[PATH_MAX], next[PATH_MAX], link[PATH_MAX];
     if (snprintf(rest, sizeof rest, "%s", path) >= (int)sizeof rest) return cannot(path);
@@ -1476,7 +1482,7 @@ static bool walk(const char *path, bool closed, char *out, NodeFn fn, void *arg)
             if (!absent()) return cannot(out);
             there = false;
         }
-        if (data_volume(out, there ? &st : NULL)) return cannot(path);
+        if (alias_root(out) || data_volume(out, there ? &st : NULL)) return cannot(path);
         if (there && S_ISLNK(st.st_mode)) {
             ssize_t n = readlink(out, link, sizeof link - 1);
             if (n < 0 || ++hops > 32) return cannot(out);

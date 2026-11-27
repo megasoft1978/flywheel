@@ -2983,6 +2983,10 @@ static void test_data_volume(void) {
         {"data volume: commondir", "mv .git real && mkdir g && cp real/HEAD g/"
          " && echo \"/System/Volumes/Data$(pwd -P)/real\" > g/commondir && echo 'gitdir: g' > .git",
          "real/config"},
+        {"alias: nofollow gitdir", "mv .git gd && echo \"gitdir: /.nofollow$(pwd -P)/gd\" > .git", "gd/config"},
+        {"alias: nofollow link", "mv .git gd && ln -s \"/.nofollow$(pwd -P)/gd\" .git", "gd/config"},
+        {"alias: vol gitdir", "mv .git gd && echo \"gitdir: /.VOL$(pwd -P)/gd\" > .git", "gd/config"},
+        {"alias: resolve link", "mv .git gd && ln -s \"/.resolve$(pwd -P)/gd\" .git", "gd/config"},
     };
     struct stat st;
     if (stat("/System/Volumes/Data", &st)) { setenv("HOME", old, 1); free(old); return; }

@@ -138,8 +138,8 @@ untrusted repository or task in a VM.
   repository (or has a `HEAD` file), the same names are closed there. Every link and `gitdir:` or
   `commondir` file on the way to the project's protected files is closed too, so none can be pointed
   elsewhere, and so is whatever a linked hook in a protected hooks directory leads to. A path
-  through `/System/Volumes/Data` (a second spelling the rules would miss) is refused. If the rules
-  cannot be built, a store is a link that cannot be followed (a loop), or a protected file or git
+  through `/System/Volumes/Data`, `/.nofollow`, `/.vol` or `/.resolve` (second spellings the rules
+  would miss) is refused. If the rules cannot be built, a store is a link that cannot be followed (a loop), or a protected file or git
   directory cannot be followed or read (a loop, or no permission), the command is not run and the
   file tools do not write; the message names the path.
 - A command that was given the network has all its processes killed when it ends, detached ones
@@ -196,9 +196,10 @@ Where it does not protect you:
 - Only a `.git` and what is under it is recognized by name. A bare repository under another name,
   existing or written by hand (`HEAD`, `objects`, `refs`, `config`), can be created and changed
   by commands (and assembled with the file tools), and git run later inside it obeys it; the same holds for the target of a `.git`
-  link file that points outside any `.git`, for what a nested config, hook or `.envrc` symlink
-  points to, for hard links that already exist, and for new directories under a
-  `.git/modules/<group>/` of submodules with a `/` in their name.
+  link file that points outside any `.git`, for what a nested config or `.envrc` symlink, or nested
+  or submodule hook links, point to, for hard links that already exist, and for new directories
+  under a `.git/modules/<group>/` of submodules with a `/` in their name.
+- Links in subdirectories of a hooks directory are not followed: what they point to can be changed.
 - Files that git config pulls in through `include.path` or `includeIf`: if one is inside the
   project (or `$TMPDIR`), commands can change it, and git outside the sandbox obeys it.
 - Started in your home directory (or above it), the sandbox makes all of it writable, except the
