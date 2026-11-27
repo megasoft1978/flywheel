@@ -240,7 +240,8 @@ untrusted repository or task in a VM.
 - Environment: only `PATH`, `HOME`, `LANG` and `TERM` are passed on; `TMPDIR`, `XDG_CACHE_HOME`,
   `GOCACHE` and `npm_config_cache` point into the private temporary directory. A `PATH` entry that
   passes through a link and is, or leads, under your home is passed on as where it leads; entries
-  inside the project or `TMPDIR` are passed on unchanged.
+  whose way touches a place commands may write (the project, `TMPDIR`, a linked worktree's
+  repository folders) are passed on unchanged.
 
 What stops working inside it:
 

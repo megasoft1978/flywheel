@@ -2809,6 +2809,37 @@ static void test_home_path(void) {
     snprintf(want, sizeof want, "[%s/work/proj/inlink:%s/.closed/bin:/usr/bin:/bin]", real, real);
     setenv("PATH", set, 1);
     shown("printf '[%s]' \"$PATH\"", want);
+    /* outside the project, but by way of a place commands may write: a link in
+       the project, or in TMPDIR */
+    host(proj, "ln -s ../../.closed/bin hop");
+    host(base, "ln -s \"$HOME/work/proj/hop\" viaproj");
+    snprintf(set, sizeof set, "%s/viaproj:/usr/bin:/bin", base);
+    snprintf(want, sizeof want, "[%s]", set);
+    setenv("PATH", set, 1);
+    shown("printf '[%s]' \"$PATH\"", want);
+    quiet("ln -s \"$HOME/.closed/bin\" \"$TMPDIR/hop\"");
+    char *t = run_bash("printf %s \"$TMPDIR\"", proj, 30);
+    snprintf(set, sizeof set, "ln -s '%s/hop' viatmp", t);
+    free(t);
+    setenv("PATH", path, 1);
+    host(base, set);
+    snprintf(set, sizeof set, "%s/viatmp:/usr/bin:/bin", base);
+    snprintf(want, sizeof want, "[%s]", set);
+    setenv("PATH", set, 1);
+    shown("printf '[%s]' \"$PATH\"", want);
+    /* and in a linked worktree, by way of the repository's refs */
+    setenv("PATH", path, 1);
+    host(proj, "git init -q . && git add f && git -c user.name=t -c user.email=t@t commit -qm one"
+               " && git worktree add -q ../wt -b wt && ln -s ../../../../.closed/bin .git/refs/hop");
+    host(base, "ln -s \"$HOME/work/proj/.git/refs/hop\" viarefs");
+    char wt[PATH_MAX + 16];
+    snprintf(wt, sizeof wt, "%s/work/wt", home);
+    in_dir(wt);
+    snprintf(set, sizeof set, "%s/viarefs:%s/outlink:/usr/bin:/bin", base, base);
+    snprintf(want, sizeof want, "[%s/viarefs:%s/.closed/bin:/usr/bin:/bin]", base, real);
+    setenv("PATH", set, 1);
+    shown("printf '[%s]' \"$PATH\"", want);
+    in_dir(proj);
     setenv("PATH", path, 1);
 
     if (!system("node -e 0 >/dev/null 2>&1")) {

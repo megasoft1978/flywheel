@@ -2620,14 +2620,39 @@ static bool through_link(const char *path) {
     }
 }
 
+/* any step of the way, or its end, in a place a command may write */
+static void see_open(Node kind, const char *path, void *arg) {
+    (void)kind;
+    Planted *p = arg;
+    if (in_areas(p->areas, path)) p->found = true;
+}
+
+/* False also for what cannot be followed. */
+static bool fixed_way(const char *path, const Areas *areas) {
+    char at[PATH_MAX];
+    Planted p = {.areas = areas};
+    if (!walk(path, true, at, see_open, &p)) {
+        *sbx_blocked = 0;
+        return false;
+    }
+    return !p.found;
+}
+
 /* "PATH=..." with each entry that passes through a link, and is or leads under a
-   home, replaced by where it leads: the link may not be readable in the sandbox,
-   and a PATH search that cannot read it can stop there. Entries in the project or
-   TMPDIR stay as they are: a command could repoint one to learn where a link it
-   cannot read leads. Closed entries stay: programs in them run. */
+   home, replaced by where it leads: a link there cannot be read, and a PATH
+   search that fails on it gives up (libuv). An entry whose way touches a place
+   commands may write stays as it is: a command could repoint a link there to
+   learn where a link it cannot read leads. Closed entries stay: programs in
+   them run. */
 static char *sbx_path(const char *v, const char *cwd, const char *tmp) {
     char home[4][PATH_MAX], one[PATH_MAX], to[PATH_MAX];
     int n = homes(home);
+    char proj[PATH_MAX], rtmp[PATH_MAX];
+    Linked w;
+    Areas areas = {.n = 0};
+    bool known = realpath(cwd, proj) && realpath(tmp, rtmp);
+    if (known) writable(&areas, proj, rtmp, linked_worktree(proj, &w) ? &w : NULL);
+    *sbx_blocked = 0;
     size_t entries = 1;
     for (const char *p = v; *p; p++) entries += *p == ':';
     size_t cap = strlen(v) + entries * PATH_MAX + 6, len = 5;
@@ -2640,8 +2665,8 @@ static char *sbx_path(const char *v, const char *cwd, const char *tmp) {
         if (*v == '/' && k < sizeof one) {
             memcpy(one, v, k);
             one[k] = 0;
-            if (!path_under(cwd, one) && !path_under(tmp, one)
-                && through_link(one) && realpath(one, to) && !strchr(to, ':')) {
+            if (known && through_link(one) && fixed_way(one, &areas)
+                && realpath(one, to) && !strchr(to, ':')) {
                 bool under = false;
                 for (int i = 0; i < n; i++)
                     under = under || path_under(home[i], one) || path_under(home[i], to);
