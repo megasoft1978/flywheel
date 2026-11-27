@@ -31,13 +31,13 @@ CONTEXT_OVERFLOW = re.compile(
     r"context.{0,24}(length|window|size|limit)|maximum context|prompt is too long|exceeds? the context",
     re.IGNORECASE,
 )
-# flywheel's -W is checked only at the start of each turn and inside model requests (src/agent.c:106,
-# 123), so a command started just before it can run up to -t more. The margin is not a guarantee;
-# Harbor's kill (asyncio.wait_for) is the only hard cap. Open blocker in bench/PROTOCOL.md.
+# flywheel stops itself at -W: requests, commands and gates are cut to the time left (src/agent.c).
+# The margin leaves time to write the logs before Harbor's kill (asyncio.wait_for), which is still
+# the hard cap. Not yet smoke-tested: see bench/PROTOCOL.md.
 WALL_MARGIN_SEC = 60
 # per-command limit (-t), a flywheel setting chosen in FW-TBTIME. It is not matched to Terminus 2:
 # Terminus 2 sends commands non-blocking and waits min(duration, 60) s without killing them
-# (terminus_2.py:1400, :1434). flywheel gates get 2x -t (src/agent.c:39).
+# (terminus_2.py:1400, :1434). flywheel gates get 2x -t. -W cuts both to the time left.
 CMD_TIMEOUT_SEC = 180
 # -T must not bind before -W; the largest tb21 budget is 12000 s and a model turn takes >1 s
 MAX_TURNS = 20000

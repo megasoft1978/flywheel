@@ -220,12 +220,16 @@ static bool downscale(unsigned char **d, size_t *n, const char *mime, char *err,
     }
     char *argv[] = {"/usr/bin/sips", "-s", "format", jpeg ? "jpeg" : "png",
                     "-Z", max, in, "--out", out, NULL};
-    if (!ok || !run_quiet(argv)) ok = fail(err, errcap, "could not downscale the image (sips failed)");
+    if (!ok) fail(err, errcap, "could not write the temporary copy to downscale");
+    else if (!run_quiet(argv))
+        ok = fail(err, errcap, g_abort ? "cancelled" : "could not downscale the image (sips failed)");
     else {
         size_t sn;
-        unsigned char *s = load(out, &sn, err, errcap);
+        char why[128];
+        unsigned char *s = load(out, &sn, why, sizeof why);
         if ((ok = s != NULL)) { free(*d); *d = s; *n = sn; }
-        else fail(err, errcap, "could not downscale the image (sips failed)");
+        else if (err && errcap)
+            snprintf(err, errcap, "could not downscale the image (sips output: %s)", why);
     }
     unlink(in);
     unlink(out);
@@ -376,6 +380,141 @@ bool image_from_file(const char *cwd, const char *spec, ImagePart *out, char *er
     return ok;
 }
 
+/* ---------- references in a message ---------- */
+
+static bool image_ext(const char *s, size_t n) {
+    static const char *const EXT[] = {".png", ".jpg", ".jpeg", ".gif", ".webp"};
+    for (size_t i = 0; i < sizeof EXT / sizeof *EXT; i++) {
+        size_t l = strlen(EXT[i]);
+        if (n > l && !strncasecmp(s + n - l, EXT[i], l)) return true;
+    }
+    return false;
+}
+
+static bool path_like(const char *s) {
+    return *s == '/' || !strncmp(s, "~/", 2) || !strncmp(s, "./", 2) ||
+           !strncmp(s, "../", 3) || !strncasecmp(s, "file://", 7);
+}
+
+/* end of the shell word starting at s. Quotes count only in a word that starts
+   with one, so an apostrophe in prose does not swallow what follows. */
+static const char *word_end(const char *s) {
+    bool quoted = *s == '"' || *s == '\'';
+    const char *p = s;
+    char q = 0;
+    for (; *p; p++) {
+        if (q) {
+            if (q == '"' && *p == '\\' && p[1]) p++;
+            else if (*p == q) q = 0;
+        } else if (is_blank(*p)) break;
+        else if (*p == '\\' && p[1]) p++;
+        else if (quoted && (*p == '"' || *p == '\'')) q = *p;
+    }
+    if (q) for (p = s; *p && !is_blank(*p); p++) {}
+    return p;
+}
+
+static bool regular(const char *path) {
+    struct stat st;
+    return path && !stat(path, &st) && S_ISREG(st.st_mode);
+}
+
+/* the reference one parsed word names, trailing punctuation dropped; NULL if
+   none. Consumes p. */
+static char *as_ref(const char *cwd, char *p, bool url) {
+    if (!p) return NULL;
+    for (size_t n = strlen(p); n; p[--n] = 0) {
+        bool punct = strchr(".,;:!?)]}>", p[n - 1]) != NULL;
+        if (url) {
+            const char *host = strstr(p, "//");
+            const char *path = host ? strchr(host + 2, '/') : NULL;
+            if (!punct && path && image_ext(path, strcspn(path, "?#"))) return p;
+        } else if (image_ext(p, n)) {
+            char *full = under(cwd, str_dup(p));
+            if (regular(full)) { free(p); return full; }
+            free(full);
+        }
+        if (!punct) break;
+    }
+    free(p);
+    return NULL;
+}
+
+/* blank out code spans and fences: what they quote is only mentioned. A run of
+   backticks is closed by the next run of the same length (a fence of three or
+   more also by a longer one). A fence opened at the start of a line and never
+   closed runs to the end; any other unclosed or escaped run is plain text. True
+   if anything was blanked. */
+static bool blank_code(char *s) {
+    const char *text = s;
+    bool any = false;
+    while (*s) {
+        if (*s == '\\' && s[1]) { s += 2; continue; }
+        if (*s != '`') { s++; continue; }
+        size_t n = strspn(s, "`"), m = 0;
+        char *p = s + n;
+        for (; (p = strchr(p, '`')); p += m) {
+            m = strspn(p, "`");
+            if (m == n || (n >= 3 && m > n)) break;
+        }
+        if (!p) {
+            const char *b = s;
+            while (b > text && (b[-1] == ' ' || b[-1] == '\t')) b--;
+            if (n < 3 || (b > text && b[-1] != '\n')) { s += n; continue; }
+            memset(s, ' ', strlen(s));
+            return true;
+        }
+        memset(s, ' ', (size_t)(p + m - s));
+        s = p + m;
+        any = true;
+    }
+    return any;
+}
+
+int image_find_refs(const char *cwd, const char *msg, char **refs, int max, bool *only) {
+    *only = false;
+    if (max <= 0) return 0;
+    /* the whole message as one unescaped path, spaces and all */
+    char *t = trimmed(msg);
+    if (path_like(t) && image_ext(t, strlen(t))) {
+        char *full = under(cwd, expand_path(str_dup(t)));
+        if (regular(full)) {
+            free(t);
+            refs[0] = full;
+            *only = true;
+            return 1;
+        }
+        free(full);
+    }
+    free(t);
+
+    char *text = str_dup(msg);
+    if (!text) return 0;
+    int n = 0;
+    bool other = blank_code(text);
+    for (const char *s = text; *s;) {
+        if (is_blank(*s)) { s++; continue; }
+        const char *e = word_end(s);
+        char *word = str_ndup(s, (size_t)(e - s));
+        const char *head = word + (*word == '"' || *word == '\'');
+        char *ref = NULL;
+        if (!strncasecmp(head, "http://", 7) || !strncasecmp(head, "https://", 8))
+            ref = as_ref(cwd, image_path_parse(word), true);
+        else if (path_like(head))
+            ref = as_ref(cwd, image_path_parse(word), false);
+        free(word);
+        s = e;
+        if (!ref) { other = true; continue; }
+        int i = 0;
+        while (i < n && strcmp(refs[i], ref)) i++;
+        if (i < n || n == max) free(ref);
+        else refs[n++] = ref;
+    }
+    free(text);
+    *only = n && !other;
+    return n;
+}
+
 /* ---------- URLs ---------- */
 
 #ifdef FW_IMAGE_TEST
@@ -388,6 +527,7 @@ static bool v4_blocked(uint32_t a) {
         {0xA9FE0000, 16}, {0xAC100000, 12}, {0xC0000000, 24}, {0xC0000200, 24},
         {0xC0586300, 24}, {0xC0A80000, 16}, {0xC6120000, 15}, {0xC6336400, 24},
         {0xCB007100, 24}, {0xE0000000, 4},  {0xF0000000, 4},
+        {0xA83F8110, 32},   /* 168.63.129.16, Azure's host service address */
     };
     for (size_t i = 0; i < sizeof B / sizeof *B; i++)
         if (!((a ^ B[i].net) >> (32 - B[i].bits))) return true;

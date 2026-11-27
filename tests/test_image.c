@@ -77,6 +77,69 @@ static void test_paths(void) {
     parses("$HOME/`id`.png", "$HOME/`id`.png");
 }
 
+/* msg (with %s = dir) names exactly the references in want, in order */
+static void finds(const char *name, const char *fmt, const char *want1, const char *want2, bool only_want) {
+    char msg[2000], w[2][800], *refs[4];
+    bool only;
+    snprintf(msg, sizeof msg, fmt, dir, dir);
+    const char *want[2] = {want1, want2};
+    int expect = !!want1 + !!want2;
+    int n = image_find_refs(dir, msg, refs, 4, &only);
+    bool ok = n == expect && only == only_want;
+    for (int i = 0; ok && i < n; i++) {
+        snprintf(w[i], sizeof w[i], want[i], dir);
+        ok = !strcmp(refs[i], w[i]);
+    }
+    T(name, ok);
+    for (int i = 0; i < n; i++) free(refs[i]);
+}
+
+static void test_refs(void) {
+    put("a b.png", TINY, sizeof TINY);
+    put("c.JPG", TINY, sizeof TINY);
+    put("it's.png", TINY, sizeof TINY);
+    put("t.txt", TINY, sizeof TINY);
+    finds("escaped path in prose", "look at %s/a\\ b.png please", "%s/a b.png", NULL, false);
+    finds("dragged escaped path", "%s/a\\ b.png ", "%s/a b.png", NULL, true);
+    finds("quoted path", "'%s/a b.png'", "%s/a b.png", NULL, true);
+    finds("double-quoted path", "what is \"%s/a b.png\"?", "%s/a b.png", NULL, false);
+    finds("quote inside a quoted word", "'%s/it'\\''s.png'", "%s/it's.png", NULL, true);
+    finds("whole message with raw spaces", "%s/a b.png", "%s/a b.png", NULL, true);
+    finds("two files", "%s/a\\ b.png %s/c.JPG", "%s/a b.png", "%s/c.JPG", true);
+    finds("duplicates collapse", "%s/c.JPG %s/c.JPG", "%s/c.JPG", NULL, true);
+    finds("file url", "file://%s/a%%20b.png", "%s/a b.png", NULL, true);
+    finds("relative and punctuation", "compare ./c.JPG.", "%s/./c.JPG", NULL, false);
+    finds("apostrophe in prose", "don't skip %s/c.JPG", "%s/c.JPG", NULL, false);
+    finds("image url", "see https://example.invalid/p/a.PNG?x=1, thanks",
+          "https://example.invalid/p/a.PNG?x=1", NULL, false);
+    finds("quoted url", "'http://example.invalid/a.webp'", "http://example.invalid/a.webp", NULL, true);
+    finds("url that is no image", "https://example.invalid/page https://example.png", NULL, NULL, false);
+    finds("bare name is text", "rename c.JPG to d.png", NULL, NULL, false);
+    finds("missing file is text", "write %s/new.png for me", NULL, NULL, false);
+    finds("not an image name", "%s/t.txt", NULL, NULL, false);
+    finds("directory is text", "%s/", NULL, NULL, false);
+    finds("inline code span", "run `cat ./c.JPG | wc` now", NULL, NULL, false);
+    finds("code fence", "```\nopen ./c.JPG\n```", NULL, NULL, false);
+    finds("url in a code span", "try `curl https://example.invalid/a.png -o x`", NULL, NULL, false);
+    finds("url in a fence", "```sh\ncurl https://example.invalid/a.png\n```\n", NULL, NULL, false);
+    finds("double backticks hold single ones", "``a ` ./c.JPG ` b``", NULL, NULL, false);
+    finds("longer run closes a fence", "```\n./c.JPG\n````", NULL, NULL, false);
+    finds("span beside a path", "`ls -l` %s/c.JPG", "%s/c.JPG", NULL, false);
+    finds("unmatched backtick", "a ` %s/c.JPG", "%s/c.JPG", NULL, false);
+    finds("escaped backticks", "\\` %s/c.JPG \\`", "%s/c.JPG", NULL, false);
+    finds("unclosed fence", "see\n```\nopen ./c.JPG\n", NULL, NULL, false);
+    finds("unclosed indented fence", "  ```sh\ncurl https://example.invalid/a.png", NULL, NULL, false);
+    finds("unclosed run inside a line", "a ``` %s/c.JPG", "%s/c.JPG", NULL, false);
+    char *one[1];
+    bool only;
+    char msg[2000];
+    snprintf(msg, sizeof msg, "%s/c.JPG %s/it\\'s.png", dir, dir);
+    int n = image_find_refs(dir, msg, one, 1, &only);
+    T("max respected", n == 1);
+    if (n == 1) free(one[0]);
+    drop("a b.png"); drop("c.JPG"); drop("it's.png"); drop("t.txt");
+}
+
 static void test_load(void) {
     ImagePart p;
     char err[256];
@@ -168,6 +231,25 @@ static size_t head_of(const char *url, unsigned char *out, size_t cap) {
     return n;
 }
 
+static size_t solid_webp(unsigned char *b, int w, int h) {
+    memset(b, 0, 40);
+    memcpy(b, "RIFF\0\0\0\0WEBPVP8L", 16);
+    b[20] = 0x2F;
+    size_t bit = 21 * 8;
+#define BITS(v, n) for (int k_ = 0; k_ < (n); k_++, bit++) b[bit / 8] |= (unsigned char)((((v) >> k_) & 1) << (bit % 8))
+    BITS(w - 1, 14); BITS(h - 1, 14); BITS(0, 4);     /* size, no alpha, version 0 */
+    BITS(0, 3);                                       /* no transform, cache or meta codes */
+    for (int code = 0; code < 5; code++) {            /* green, red, blue, alpha, distance */
+        BITS(1, 1); BITS(0, 1); BITS(1, 1);           /* simple, one symbol, 8 bits */
+        BITS(code == 3 ? 255 : code == 4 ? 0 : 128, 8);
+    }
+#undef BITS
+    size_t data = (bit + 7) / 8 - 20, n = 20 + data + (data & 1);
+    b[16] = (unsigned char)data;
+    b[4] = (unsigned char)(n - 8);
+    return n;
+}
+
 static void test_downscale(void) {
     ImagePart p;
     char err[256], cmd[2000];
@@ -200,6 +282,23 @@ static void test_downscale(void) {
     image_part_free(&p);
     put("broken.png", "\x89PNG\r\n\x1a\n\0\0\0\15IHDR\0\0\x10\0\0\0\x10\0", 24);
     T("sips failure reported", !image_from_file(dir, "broken.png", &p, err, sizeof err) && strstr(err, "sips"));
+    g_abort = 1;
+    T("abort is not reported as a sips failure",
+      !image_from_file(dir, "wide.png", &p, err, sizeof err) && !strcmp(err, "cancelled"));
+    g_abort = 0;
+    /* lossless WebP of one colour: every pixel code is zero bits long */
+    unsigned char webp[40];
+    size_t wn = solid_webp(webp, 2000, 20);
+    put("wide.webp", webp, wn);
+    long ww, wh;
+    T("webp fixture is oversized", image_dims(webp, wn, &ww, &wh) && ww == 2000 && wh == 20);
+    static unsigned char whead[65536];
+    bool wok = image_from_file(dir, "wide.webp", &p, err, sizeof err);
+    if (!wok) printf("  webp: %s\n", err);
+    T("oversized webp scaled to a 1568 PNG", wok && !strncmp(p.url, "data:image/png;", 15) &&
+      image_dims(whead, head_of(p.url, whead, sizeof whead), &ww, &wh) && ww == IMG_MAX_DIM && wh < 20);
+    image_part_free(&p);
+    drop("wide.webp");
     drop("wide.png"); drop("wide.jpg"); drop("wide.gif"); drop("small.png"); drop("broken.png");
 }
 #endif
@@ -215,12 +314,12 @@ static bool blocked(const char *ip) {
 static void test_addresses(void) {
     const char *bad[] = {"0.0.0.0", "10.1.2.3", "100.64.0.1", "100.127.255.255", "127.0.0.1",
         "127.9.9.9", "169.254.169.254", "172.16.0.1", "172.31.255.255", "192.168.1.1",
-        "198.18.0.1", "224.0.0.1", "239.255.255.250", "255.255.255.255",
+        "168.63.129.16", "198.18.0.1", "224.0.0.1", "239.255.255.250", "255.255.255.255",
         "::", "::1", "::ffff:127.0.0.1", "::ffff:8.8.8.8", "::127.0.0.1", "64:ff9b::7f00:1",
         "fc00::1", "fd12::1", "fe80::1", "fec0::1", "ff02::1", "2001::1", "2001:db8::1",
         "2002:7f00:1::1"};
     for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) T(bad[i], blocked(bad[i]));
-    const char *good[] = {"8.8.8.8", "1.1.1.1", "100.128.0.1", "172.32.0.1", "172.15.0.1",
+    const char *good[] = {"8.8.8.8", "1.1.1.1", "100.128.0.1", "172.32.0.1", "172.15.0.1", "168.63.129.17",
         "2606:4700:4700::1111", "2001:4860:4860::8888"};
     for (size_t i = 0; i < sizeof good / sizeof *good; i++) T(good[i], !blocked(good[i]));
 }
@@ -402,6 +501,7 @@ int main(void) {
     if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
     test_magic();
     test_paths();
+    test_refs();
     test_load();
 #ifdef __APPLE__
     test_downscale();
