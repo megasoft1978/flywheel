@@ -2620,10 +2620,12 @@ static bool through_link(const char *path) {
     }
 }
 
-/* "PATH=..." with each entry under a home that passes through a link replaced by
-   where it leads: the link may not be readable in the sandbox, and a PATH search
-   that cannot read it can stop there. Closed entries stay: programs in them run. */
-static char *sbx_path(const char *v) {
+/* "PATH=..." with each entry that passes through a link, and is or leads under a
+   home, replaced by where it leads: the link may not be readable in the sandbox,
+   and a PATH search that cannot read it can stop there. Entries in the project or
+   TMPDIR stay as they are: a command could repoint one to learn where a link it
+   cannot read leads. Closed entries stay: programs in them run. */
+static char *sbx_path(const char *v, const char *cwd, const char *tmp) {
     char home[4][PATH_MAX], one[PATH_MAX], to[PATH_MAX];
     int n = homes(home);
     size_t entries = 1;
@@ -2638,11 +2640,12 @@ static char *sbx_path(const char *v) {
         if (*v == '/' && k < sizeof one) {
             memcpy(one, v, k);
             one[k] = 0;
-            bool under = false;
-            for (int i = 0; i < n; i++) under = under || path_under(home[i], one);
-            if (under && through_link(one) && realpath(one, to) && !strchr(to, ':')) {
-                use = to;
-                used = strlen(to);
+            if (!path_under(cwd, one) && !path_under(tmp, one)
+                && through_link(one) && realpath(one, to) && !strchr(to, ':')) {
+                bool under = false;
+                for (int i = 0; i < n; i++)
+                    under = under || path_under(home[i], one) || path_under(home[i], to);
+                if (under) { use = to; used = strlen(to); }
             }
         }
         memcpy(out + len, use, used);
@@ -2657,7 +2660,7 @@ static char *sbx_path(const char *v) {
 
 /* the whole environment of a command: nothing else is inherited (tokens, agent
    sockets). The cache variables keep build tools out of the home directory. */
-static void sbx_env(char **env, const char *tmp) {
+static void sbx_env(char **env, const char *cwd, const char *tmp) {
     static const char *const keep[] = {"PATH", "HOME", "LANG", "TERM", NULL};
     static const char *const redirect[][2] = {{"TMPDIR", ""}, {"XDG_CACHE_HOME", "/cache"},
         {"GOCACHE", "/go-build"}, {"npm_config_cache", "/npm"}, {NULL, NULL}};
@@ -2665,7 +2668,7 @@ static void sbx_env(char **env, const char *tmp) {
     for (int i = 0; keep[i]; i++) {
         const char *v = getenv(keep[i]);
         if (!v) continue;
-        if (!strcmp(keep[i], "PATH")) { env[n++] = sbx_path(v); continue; }
+        if (!strcmp(keep[i], "PATH")) { env[n++] = sbx_path(v, cwd, tmp); continue; }
         size_t len = strlen(keep[i]) + strlen(v) + 2;
         env[n] = malloc(len);
         snprintf(env[n++], len, "%s=%s", keep[i], v);
@@ -2751,7 +2754,7 @@ static char *run_command(const char *cmd, const char *cwd, int timeout_s, int *c
                 return str_dup(why);
             }
         }
-        sbx_env(env, tmp);
+        sbx_env(env, cwd, tmp);
     }
     int fds[2];
     pid_t pid = -1;

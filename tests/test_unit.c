@@ -2673,16 +2673,23 @@ static void test_home_path(void) {
     host(home, "mkdir .slot plaindir && ln -s ../.closed/bin .slot/bin && ln -s co:lon colon"
                " && ln -s nowhere dangling");
     T("home resolves", realpath(home, real) != NULL);
+    /* a link inside the project, and one outside home leading back into it */
+    host(proj, "ln -s ../../.closed/bin inlink");
+    host(base, "ln -s \"$HOME/.slot/bin\" outlink");
 
     /* entries kept as they are: not under a home, relative, empty, unresolvable,
        or leading to a name PATH cannot hold */
-    char set[8 * PATH_MAX], want[8 * PATH_MAX];
+    char set[12 * PATH_MAX], want[12 * PATH_MAX];
     snprintf(set, sizeof set, "%s/.slot/bin::rel:%s/plaindir:%s/colon:%s/dangling:/tmp:/usr/bin:/bin:",
              real, real, real, real);
     snprintf(want, sizeof want, "[%s/.closed/bin::rel:%s/plaindir:%s/colon:%s/dangling:/tmp:/usr/bin:/bin:]",
              real, real, real, real);
     setenv("PATH", set, 1);
     in_dir(proj);
+    shown("printf '[%s]' \"$PATH\"", want);
+    snprintf(set, sizeof set, "%s/work/proj/inlink:%s/outlink:/usr/bin:/bin", real, base);
+    snprintf(want, sizeof want, "[%s/work/proj/inlink:%s/.closed/bin:/usr/bin:/bin]", real, real);
+    setenv("PATH", set, 1);
     shown("printf '[%s]' \"$PATH\"", want);
     setenv("PATH", path, 1);
 

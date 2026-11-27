@@ -211,8 +211,9 @@ untrusted repository or task in a VM.
   command; you are asked every time, whatever your "always allow" rules say. One-shot and `bench`
   cannot grant it. Allowed network is any IP address, not one host.
 - Environment: only `PATH`, `HOME`, `LANG` and `TERM` are passed on; `TMPDIR`, `XDG_CACHE_HOME`,
-  `GOCACHE` and `npm_config_cache` point into the private temporary directory. A `PATH` entry under
-  your home that passes through a link is passed on as where it leads.
+  `GOCACHE` and `npm_config_cache` point into the private temporary directory. A `PATH` entry that
+  passes through a link and is, or leads, under your home is passed on as where it leads; entries
+  inside the project or `TMPDIR` are passed on unchanged.
 
 What stops working inside it:
 
