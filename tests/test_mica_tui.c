@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -421,6 +422,11 @@ static void handle_client(int cfd) {
         send_sse_chunk(cfd, "{\"choices\":[{\"delta\":{\"content\":\"DONE\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":40}}");
         send_all(cfd, "data: [DONE]\n\n", 14);
         close(cfd);
+        return;
+    }
+
+    if (strstr(last_msg, "SIG_TOOL")) {        /* a command that outlives the TUI unless swept */
+        reply(cfd, "content", "echo $$ > sig.child; exec sleep 30", true);
         return;
     }
 
@@ -1443,6 +1449,146 @@ static void image_tests(const char *cmd) {
     system(rm);
 }
 
+/* ---------- death by signal: the terminal must come back (own session each) ---------- */
+
+static long read_num(const char *dir, const char *name) {
+    char p[1400];
+    snprintf(p, sizeof p, "%s/%s", dir, name);
+    FILE *f = fopen(p, "r");
+    long v = -1;
+    if (f) { if (fscanf(f, "%ld", &v) != 1) v = -1; fclose(f); }
+    return v;
+}
+
+static void read_line(const char *dir, const char *name, char *out, size_t cap) {
+    char p[1400];
+    snprintf(p, sizeof p, "%s/%s", dir, name);
+    FILE *f = fopen(p, "r");
+    out[0] = 0;
+    if (f) { if (!fgets(out, (int)cap, f)) out[0] = 0; fclose(f); }
+}
+
+/* PENDIN is a state bit the kernel raises on its own when canonical mode comes
+   back, not a setting; BSD `stty -g` carries it in lflag= */
+static void drop_pendin(char *st, size_t cap) {
+    char *p = strstr(st, "lflag="), *end = NULL;
+    if (!p) return;
+    unsigned long v = strtoul(p + 6, &end, 16);
+    char tail[512];
+    snprintf(tail, sizeof tail, "%s", end);
+    snprintf(p, cap - (size_t)(p - st), "lflag=%lx%s", v & ~(unsigned long)PENDIN, tail);
+}
+
+static void write_file(const char *dir, const char *name, const char *body) {
+    char p[1400];
+    snprintf(p, sizeof p, "%s/%s", dir, name);
+    FILE *f = fopen(p, "w");
+    assert(f != NULL);
+    fputs(body, f);
+    fclose(f);
+}
+
+static bool gone(pid_t p) {
+    for (int i = 0; i < 100; i++) {
+        if (kill(p, 0) < 0 && errno == ESRCH) return true;
+        usleep(20000);
+    }
+    return false;
+}
+
+enum sig_state { AT_IDLE, AT_DIALOG, AT_TOOL, AT_REQUEST };
+
+static void signal_case(const char *dir, int sig, const char *signame, enum sig_state st) {
+    static const char *const where[] = {"idle", "dialog", "tool", "request"};
+    static const char *const stale[] = {"sig.pid", "sig.rc", "sig.before", "sig.after", "sig.child"};
+    for (size_t i = 0; i < sizeof stale / sizeof *stale; i++) {
+        char p[1400];
+        snprintf(p, sizeof p, "%s/%s", dir, stale[i]);
+        unlink(p);
+    }
+    char label[128];
+#define SCHECK(what, cond) do { \
+        snprintf(label, sizeof label, "%s at %s: %s", signame, where[st], what); \
+        CHECK(s, label, cond); \
+    } while (0)
+
+    /* no `exec` and no job control: the wrapper sees the status and the tty flywheel left */
+    MicaSession *s = mica_session_create(dir, "exec /bin/sh ./sig.sh", 24, 80);
+    assert(s != NULL);
+    SCHECK("ready", wait_for_text(s, "ready", 3000));
+    pump(s, 150);
+    long fw = read_num(dir, "sig.pid"), child = -1;
+    SCHECK("modes on before the signal", mica_session_reports_mouse(s) && mica_session_bracketed_paste(s));
+
+    if (st == AT_DIALOG) SCHECK("dialog open", open_modal(s, "SEC_EARLY"));
+    if (st == AT_REQUEST) {
+        submit(s, "SLOW_TEST");
+        SCHECK("reply streaming", wait_for_text(s, "tick-1", 3000));
+    }
+    if (st == AT_TOOL) {
+        SCHECK("approval", open_modal(s, "SIG_TOOL"));
+        pump(s, 700);
+        type_str(s, "y");
+        for (int i = 0; i < 150 && child < 0; i++) { pump(s, 20); child = read_num(dir, "sig.child"); }
+        SCHECK("command running in its own group", child > 1 && getpgid((pid_t)child) == (pid_t)child);
+    }
+
+    assert(fw > 1);
+    kill((pid_t)fw, sig);
+    SCHECK("process ended", wait_for_text(s, "SIG_DONE", 4000));
+    pump(s, 100);
+    SCHECK("died by that signal", read_num(dir, "sig.rc") == 128 + sig);
+    char before[512], after[512];
+    read_line(dir, "sig.before", before, sizeof before);
+    read_line(dir, "sig.after", after, sizeof after);
+    drop_pendin(before, sizeof before);
+    drop_pendin(after, sizeof after);
+    SCHECK("termios restored", before[0] && !strcmp(before, after));
+    SCHECK("mouse reporting off", !mica_session_reports_mouse(s));
+    SCHECK("bracketed paste off", !mica_session_bracketed_paste(s));
+    SCHECK("sync output off", !mica_session_sync_output_active(s));
+    SCHECK("cursor visible, main screen", mica_session_cursor_visible(s) && !mica_session_alt_screen(s));
+    int hi = find_row(s, "FILL39"), lo = find_row(s, "FILL18");
+    SCHECK("scroll region reset", lo >= 0 && hi - lo == 21);
+    if (child > 1) {
+        if (sig == SIGTERM || sig == SIGHUP) SCHECK("running command killed", gone((pid_t)child));
+        kill(-(pid_t)child, SIGKILL);   /* never leave the sleep behind */
+    }
+    mica_session_destroy(s);
+#undef SCHECK
+}
+
+static void signal_tests(const char *dir, const char *cmd) {
+    char run[2200];
+    snprintf(run, sizeof run, "echo $$ > sig.pid\n%s\n", cmd);
+    write_file(dir, "sig.run", run);
+    write_file(dir, "sig.sh",
+               "stty -g > sig.before\n"
+               "/bin/sh ./sig.run\n"
+               "echo $? > sig.rc\n"
+               "stty -g > sig.after\n"
+               "i=0; while [ $i -lt 40 ]; do echo FILL$i; i=$((i+1)); done\n"
+               "echo SIG_DONE\n"
+               "exec sleep 30\n");
+
+#define SIG(x) x, #x
+    signal_case(dir, SIG(SIGTERM), AT_IDLE);
+    signal_case(dir, SIG(SIGHUP), AT_IDLE);
+    signal_case(dir, SIG(SIGQUIT), AT_IDLE);
+    signal_case(dir, SIG(SIGSEGV), AT_IDLE);
+    signal_case(dir, SIG(SIGBUS), AT_IDLE);
+    signal_case(dir, SIG(SIGABRT), AT_IDLE);
+    signal_case(dir, SIG(SIGFPE), AT_IDLE);
+    signal_case(dir, SIG(SIGILL), AT_IDLE);
+    signal_case(dir, SIG(SIGTERM), AT_DIALOG);
+    signal_case(dir, SIG(SIGSEGV), AT_DIALOG);
+    signal_case(dir, SIG(SIGTERM), AT_REQUEST);
+    signal_case(dir, SIG(SIGHUP), AT_REQUEST);
+    signal_case(dir, SIG(SIGTERM), AT_TOOL);
+    signal_case(dir, SIG(SIGHUP), AT_TOOL);
+#undef SIG
+}
+
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     const char *fw_bin = (argc > 1) ? argv[1] : "./flywheel";
@@ -1821,6 +1967,7 @@ int main(int argc, char **argv) {
     input_tests(testdir, cmd);
     copy_tests(testdir, cmd);
     image_tests(cmd);
+    signal_tests(testdir, cmd);
     stop_mock_server(srv_th);
 
     char rm[1200];

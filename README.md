@@ -120,6 +120,9 @@ Project instructions come from the first of `.flywheel.md`, `AGENTS.md` or `CLAU
   turn reporting off. While it is off, scroll with `PgUp`/`PgDn` and expand the latest block with
   `^O`; `/mouse` turns it back on.
 - Live tokens per second (end to end), context gauge and completion summary.
+- If `SIGTERM`, `SIGHUP`, `SIGQUIT` or a crash ends flywheel, it puts the terminal back first and
+  then dies of that signal. On macOS, `SIGTERM` and `SIGHUP` also kill the running command's
+  process group.
 
 ## Images
 
