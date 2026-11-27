@@ -168,14 +168,31 @@ untrusted repository or task in a VM.
   running, still inside the sandbox.
 - In a linked git worktree, also its own git directory and the main repository's `objects`, `refs`
   and `logs`, so commits work. Config and hooks there stay closed.
-- Reads: everything you can read, except these credential stores in your home directory, which are
-  neither readable nor writable, also through the file tools and where they are symlinks:
-  `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.docker`, `~/.azure`, `~/.netrc`,
-  `~/.git-credentials`, `~/.config/{gh,flywheel,gcloud}`, `~/.npmrc`, `~/.pypirc`,
+- Reads: **nothing under your home directory** (`$HOME` and the account's home), except:
+  - the project (the working directory) and `$TMPDIR`;
+  - for a linked git worktree, its git directory and the main repository's git directory;
+  - git's global configs, every file they include, and `core.excludesfile` and
+    `core.attributesfile` when they name a file; `~/.config/git/{ignore,attributes}`;
+  - toolchains and downloaded dependencies: `~/.cargo/{bin,registry,git}`, `~/.rustup`,
+    `~/go/{bin,pkg/mod}`, `~/.nvm/versions`, `~/.bun/bin`, `~/.pyenv`, `~/.rbenv`,
+    `~/Library/Python`, `~/.local/{bin,lib}`, `~/.local/share/uv/{python,tools}`,
+    `~/.local/share/pipx/venvs`, `~/.sdkman/candidates`, `~/.m2/repository`,
+    `~/.gradle/{caches,wrapper/dists,jdks}`. One that is a symlink opens its target, unless the
+    target is or holds a home directory. The list is fixed.
+
+  Names and contents of everything else there are closed, also through other spellings and
+  symlinks. Of the directories and links on the way to the readable places, only metadata can be
+  read. If `$HOME` is itself a second spelling (`/System/Volumes/Data/...`), no command runs.
+- Credential stores in your home directory are neither readable nor writable, also inside the
+  places above, through the file tools and where they are symlinks: `~/.ssh`, `~/.aws`,
+  `~/.gnupg`, `~/.kube`, `~/.docker`, `~/.azure`, `~/.netrc`, `~/.git-credentials`,
+  `~/.config/{gh,flywheel,gcloud,git/credentials}`, `~/.npmrc`, `~/.pypirc`,
   `~/.cargo/credentials*`, `~/.gem/credentials`, `~/.pgpass`, `~/.vault-token`,
   `~/.m2/settings.xml`, `~/.gradle/gradle.properties`, shell and REPL history files, keychains,
-  cookies and the common browser profiles. **Any file not on that list stays readable**, including
-  other tokens and `.env` files, and its contents can reach the model.
+  cookies and the common browser profiles.
+- **Outside your home directory everything you can read stays readable**, and so does every file in
+  the places above that is not on the store list (`.env` files in the project, tokens written into
+  a git config or a dependency's clone URL). Its contents can reach the model.
 - Network: none, not even localhost. In an interactive session the model can ask for it for one
   command; you are asked every time, whatever your "always allow" rules say. One-shot and `bench`
   cannot grant it. Allowed network is any IP address, not one host.
@@ -186,6 +203,14 @@ What stops working inside it:
 
 - Tools that write under `$HOME`: package caches and global installs (`cargo`, `pip --user`,
   Gradle and the like). Fetch dependencies yourself first.
+- Anything that reads under `$HOME` outside the places listed above: programs installed elsewhere
+  there (also when on your `PATH`), configs such as `~/.cargo/config.toml`, sibling projects and
+  path dependencies, shell startup files. Toolchains moved with `CARGO_HOME`, `RUSTUP_HOME` and
+  the like are not found.
+- git when the project is a subdirectory of a repository under `$HOME`, a submodule or a
+  `--separate-git-dir` checkout: its git directory is outside the project and unreadable. Start
+  flywheel at the repository root. Hooks, `core.hooksPath` directories and object alternates under
+  `$HOME` outside the project cannot be read either.
 - `git init`, and anything that writes `.git/config` or hooks: `git config`, `git remote add`,
   `git push -u`, `git branch -u`, hook installers such as husky or `pre-commit install`.
   Neither can anything that changes a `core.hooksPath` directory, such as editing `.husky/` or a
@@ -231,8 +256,10 @@ Where it does not protect you:
 - For a linked worktree whose directory is missing, a relative `core.hooksPath` containing `..` is
   resolved by name and the missing directory itself is not closed: a command may be able to create
   it as a link and redirect that worktree's hooks. `git worktree prune` removes the stale entry.
-- Started in your home directory (or above it), the sandbox makes all of it writable, except the
-  stores listed above.
+- Started in your home directory (or above it), the sandbox makes all of it readable and
+  writable, except the stores listed above. Start it in a project directory.
+- Metadata (existence, size, dates) of the directories above the project and the other readable
+  places can be read, and a missing path is reported as missing rather than denied.
 - A store reached through a chain of several symlinks is protected at both ends, but a link in the
   middle of the chain can be renamed.
 - File tools do not go through the sandbox; they have their own project confinement and refuse the

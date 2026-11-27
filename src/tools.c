@@ -1150,9 +1150,11 @@ static bool drain_pipe(int fd, char *buf, size_t *len, int max_reads) {
 
 /* ---------- sandbox for model-run commands ----------
    macOS Seatbelt through sandbox-exec, deny by default: writes only inside the
-   working directory and a private TMPDIR, no reads of credential stores, no
-   writes to project files that later run outside the sandbox, no network unless the user approved it for that one command. Elsewhere there is
-   no sandbox yet, which callers must treat as unavailable. */
+   working directory and a private TMPDIR, no reads under the home directory
+   but the project, git's files and the toolchain folders, no reads of
+   credential stores anywhere, no writes to project files that later run outside
+   the sandbox, no network unless the user approved it for that one command.
+   Elsewhere there is no sandbox yet, which callers must treat as unavailable. */
 
 #define SBX_EXEC "/usr/bin/sandbox-exec"
 #define SBX_CAP (256 * 1024)
@@ -1186,7 +1188,25 @@ static const char *const SBX_PROJ[] = {
     ".git/rebase-merge", ".git/rebase-apply", ".git/sequencer", NULL
 };
 
-typedef struct { char *s; size_t n; bool full; } Sb;
+/* what stays readable under home besides the project: where toolchains and
+   their downloaded dependencies live by default. The sandbox environment passes
+   none of the variables that move them. The secrets above stay closed inside
+   them. */
+static const char *const SBX_TOOLS[] = {
+    ".cargo/bin", ".cargo/registry", ".cargo/git", ".rustup",
+    "go/bin", "go/pkg/mod",
+    ".nvm/versions", ".bun/bin",
+    ".pyenv", "Library/Python", ".local/bin", ".local/lib",
+    ".local/share/uv/python", ".local/share/uv/tools", ".local/share/pipx/venvs",
+    ".rbenv",
+    ".sdkman/candidates", ".m2/repository", ".gradle/caches", ".gradle/wrapper/dists",
+    ".gradle/jdks",
+    ".config/git/ignore", ".config/git/attributes",   /* the configs: see cfg_global */
+    NULL
+};
+
+/* pins are written once per section: `from` is where the current one starts */
+typedef struct { char *s; size_t n; bool full; size_t from; } Sb;
 
 static void sb_add(Sb *b, const char *s) {
     size_t n = strlen(s);
@@ -1216,7 +1236,7 @@ static void sb_path(Sb *b, const char *path) {
 static void sb_pin(Sb *b, const char *path) {
     size_t at = b->n;
     sb_filter(b, "literal", path);
-    if (!b->full && strstr(b->s, b->s + at) < b->s + at) b->s[b->n = at] = 0;
+    if (!b->full && strstr(b->s + b->from, b->s + at) < b->s + at) b->s[b->n = at] = 0;
 }
 
 /* a rule on a path means nothing once a directory above it can be moved */
@@ -1628,12 +1648,18 @@ static bool each_gitfile(const char *proj, NodeFn fn, void *arg) {
 #define CFG_FILES 64
 
 typedef struct { char *v[CFG_VALUES]; int n; } Values;
+/* the places left readable under a closed home, written in two passes: their
+   contents, then with `meta` the way to them, which may only be looked up */
+typedef struct { Sb *b; bool meta; } Reads;
+static void sb_read(const Reads *r, const char *path, bool keep);
+
 typedef struct {
     const char *proj;
     NodeFn fn;
     void *arg;
     Values hooks, tree;     /* core.hooksPath, core.worktree */
     int files;              /* read for the current repository */
+    const Reads *reads;     /* the files a global config sends git to, or NULL */
 } Hooks;
 
 static void values_cut(Values *v, int n) {
@@ -1675,6 +1701,14 @@ static bool cfg_key(Hooks *h, const char *path, const char *sec, bool sub, const
     bool hooks = core && !strcmp(key, "hookspath"), tree = core && !strcmp(key, "worktree");
     bool inc = !strcmp(key, "path")
         && (sub ? !strcmp(sec, "includeif") : !strcmp(sec, "include"));
+    if (h->reads && core && val
+        && (!strcmp(key, "excludesfile") || !strcmp(key, "attributesfile"))) {
+        char file[PATH_MAX], full[PATH_MAX];
+        struct stat st;
+        /* a file only: a directory named here stays closed */
+        if (*val && cfg_expand(val, file) && join(full, h->proj, file)
+            && !stat(full, &st) && S_ISREG(st.st_mode)) sb_read(h->reads, full, false);
+    }
     if (!hooks && !tree && !inc) return true;
     if (!val) return cannot(path);
     if (!inc) return values_add(hooks ? &h->hooks : &h->tree, val) || cannot(path);
@@ -1768,6 +1802,7 @@ static bool cfg_file(Hooks *h, const char *path, int depth) {
     if (stat(at, &st)) return absent() || cannot(at);
     if (S_ISCHR(st.st_mode)) return true;   /* /dev/null */
     if (!S_ISREG(st.st_mode) || depth > 10 || ++h->files > CFG_FILES) return cannot(at);
+    if (h->reads) sb_read(h->reads, path, false);
     char *buf = malloc(CFG_MAX);
     ssize_t n = read_small(at, buf, CFG_MAX);
     bool ok = n >= 0 && n == (ssize_t)strlen(buf) ? cfg_parse(h, path, buf, depth) : cannot(at);
@@ -2052,6 +2087,79 @@ static bool walk_linked(const Linked *w, NodeFn fn, void *arg) {
     return true;
 }
 
+/* ---------- reads under a home: closed unless listed ---------- */
+
+/* $HOME and the account's home, each as spelled and as resolved */
+static int homes(char out[4][PATH_MAX]) {
+    const struct passwd *pw = getpwuid(getuid());
+    const char *from[2] = {getenv("HOME"), pw ? pw->pw_dir : NULL};
+    int n = 0;
+    for (int i = 0; i < 2; i++) {
+        if (!from[i] || *from[i] != '/') continue;
+        /* a home reached by a second spelling would not match its rule */
+        char at[PATH_MAX];
+        if (!walk(from[i], true, at, no_node, NULL)) return -1;
+        if (!lex_normalize(from[i], out[n], PATH_MAX)) return -1;
+        n++;
+        if (strcmp(at, out[n - 1])) snprintf(out[n++], PATH_MAX, "%s", at);
+    }
+    return n;
+}
+
+static void sb_way(Node kind, const char *path, void *b) {
+    (void)kind;
+    if (strncmp(path, "/dev/", 5)) sb_pin(b, path);
+}
+
+/* one place that stays readable. keep: the project and TMPDIR are what was
+   asked for; anything else that turns out to hold a home stays closed, and so
+   does what cannot be followed */
+static void sb_read(const Reads *r, const char *path, bool keep) {
+    char at[PATH_MAX], home[4][PATH_MAX];
+    if (!walk(path, true, at, r->meta ? sb_way : no_node, r->b)) { *sbx_blocked = 0; return; }
+    if (r->meta) return;
+    int n = keep ? 0 : homes(home);
+    for (int i = 0; i < n; i++)
+        if (covers(at, home[i])) return;
+    if (n >= 0) sb_path(r->b, at);
+}
+
+static bool sb_home_reads(Sb *b, const char *proj, const char *tmp, const Linked *linked) {
+    char home[4][PATH_MAX], p[PATH_MAX];
+    int n = homes(home);
+    if (n < 0) return false;
+    if (n) {
+        sb_add(b, "(deny file-read*");
+        for (int i = 0; i < n; i++) sb_path(b, home[i]);
+        sb_add(b, ")");
+    }
+    for (int meta = 0; meta < 2; meta++) {
+        Reads r = {b, meta};
+        sb_add(b, meta ? "(allow file-read-metadata" : "(allow file-read*");
+        b->from = b->n;
+        sb_read(&r, proj, true);
+        if (tmp) sb_read(&r, tmp, true);
+        if (linked) {
+            sb_read(&r, linked->dir, false);
+            sb_read(&r, linked->common, false);
+        }
+        for (int i = 0; i < n; i++) {
+            sb_read(&r, home[i], false);        /* itself only ever looked up */
+            for (int t = 0; SBX_TOOLS[t]; t++)
+                if (snprintf(p, sizeof p, "%s/%s", home[i], SBX_TOOLS[t]) < (int)sizeof p)
+                    sb_read(&r, p, false);
+        }
+        Hooks h = {.proj = proj, .fn = no_node, .reads = &r};
+        bool ok = cfg_global(&h);
+        values_cut(&h.hooks, 0);
+        values_cut(&h.tree, 0);
+        if (!ok) return false;
+        sb_add(b, ")");
+    }
+    b->from = b->n;
+    return true;
+}
+
 typedef struct { Sb *b; bool pins; } Rules;
 
 static void sb_node(Node kind, const char *path, void *arg) {
@@ -2265,6 +2373,12 @@ static char *sbx_profile(const char *cwd, const char *tmp, bool net, const char 
     bool linked = linked_worktree(proj, &w);
     if (linked) sb_linked_allow(&b, &w);
     sb_add(&b, ")");
+    /* the probe runs a system binary: a home that cannot be ruled on must stop
+       commands, not make the sandbox count as unavailable */
+    if (!sbx_probing && !sb_home_reads(&b, proj, tmp ? rtmp : NULL, linked ? &w : NULL)) {
+        free(b.s);
+        return NULL;
+    }
     /* the last matching rule wins: secrets stay closed even inside the project */
     sb_add(&b, "(deny file-read* file-write*");
     each_secret(sb_deny_secret, &b);
