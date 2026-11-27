@@ -86,8 +86,8 @@ Project instructions come from the first of `.flywheel.md`, `AGENTS.md` or `CLAU
 - **Tool-call repair.** Recovers shell commands from JSON containing raw control characters.
   Truncated or auto-closed arguments are rejected, never executed.
 - **File tools.** `write_file` and `edit_file` with unique-match edits and atomic replacement, confined to the project.
-  A file with hard links, an owner or group that cannot be kept, or a directory that refuses new files
-  is written in place instead, which is not atomic.
+  A file with several hard links is not written. A file whose owner or group cannot be kept, or in a
+  directory that refuses new files, is written in place instead, which is not atomic.
 - **Verification gate.** A per-language check (`tsc --noEmit`, `python3 -I -m compileall`,
   `go vet`, `cargo check`) and one requirement-by-requirement pass before finishing. A passing
   check means the code type-checks or compiles, not that it is correct. A run whose last check

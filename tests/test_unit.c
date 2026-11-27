@@ -1309,30 +1309,22 @@ static void test_atomic(void) {
     T("new file follows umask", !stat(l, &a) && a.st_size == 0 && (a.st_mode & 07777) == (0666 & ~um));
     free(r);
 
-    /* where replacing the file would lose something, it is written in place */
-    char h[256];
-    snprintf(p, sizeof p, "%s/one", dir);
-    snprintf(h, sizeof h, "%s/two", dir);
-    put(p, "shared");
-    T("hard link made", !link(p, h));
-    r = tool_write_file(dir, "one", "both see this");
-    stat(p, &a);
-    stat(h, &b);
-    T("hard-linked pair stays linked", !strncmp(r, "ok:", 3) && a.st_ino == b.st_ino && a.st_nlink == 2);
-    T("hard-linked pair shows the new content", holds(p, "both see this") && holds(h, "both see this"));
+    /* a hard link can name a file outside the project: never write through it */
+    char h[256], out_[] = "/tmp/fwoutXXXXXX";
+    int ofd = mkstemp(out_);
+    T("outside file made", ofd >= 0 && write(ofd, "outside", 7) == 7);
+    close(ofd);
+    snprintf(h, sizeof h, "%s/inside", dir);
+    T("hard link made", !link(out_, h));
+    r = tool_write_file(dir, "inside", "overwritten");
+    T("write refuses a hard-linked file", !strncmp(r, "error:", 6) && strstr(r, "hard links"));
+    T("write leaves the outside content", holds(out_, "outside"));
     free(r);
-    fflush(stdout);
-    pid = fork();
-    if (pid == 0) {
-        signal(SIGXFSZ, SIG_IGN);
-        struct rlimit lim = {4, 4};
-        setrlimit(RLIMIT_FSIZE, &lim);
-        char *w = tool_write_file(dir, "one", "much longer than the limit\n");
-        _exit(strncmp(w, "error:", 6) || strstr(w, "nothing was changed") ? 1 : 0);
-    }
-    st = 0;
-    waitpid(pid, &st, 0);
-    T("failed in-place write does not claim nothing changed", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    r = tool_edit_file(dir, "inside", "out", "in");
+    T("edit refuses a hard-linked file", !strncmp(r, "error:", 6) && strstr(r, "hard links"));
+    T("edit leaves the outside content", holds(out_, "outside"));
+    free(r);
+    unlink(out_);
 
     gid_t groups[64];
     int ng = getgroups(64, groups);
@@ -1358,6 +1350,18 @@ static void test_atomic(void) {
         r = tool_write_file(dir, "ro/f", "new");
         T("writable file in a read-only directory is written", !strncmp(r, "ok:", 3) && holds(p, "new"));
         free(r);
+        fflush(stdout);
+        pid = fork();
+        if (pid == 0) {
+            signal(SIGXFSZ, SIG_IGN);
+            struct rlimit lim = {4, 4};
+            setrlimit(RLIMIT_FSIZE, &lim);
+            char *w = tool_write_file(dir, "ro/f", "much longer than the limit\n");
+            _exit(strncmp(w, "error:", 6) || strstr(w, "nothing was changed") ? 1 : 0);
+        }
+        st = 0;
+        waitpid(pid, &st, 0);
+        T("failed in-place write does not claim nothing changed", WIFEXITED(st) && WEXITSTATUS(st) == 0);
         chmod(sub_, 0755);
     }
     snprintf(p, sizeof p, "%s/run.sh", dir);

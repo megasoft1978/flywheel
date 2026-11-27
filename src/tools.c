@@ -1762,20 +1762,31 @@ static int write_all(int fd, const char *data, size_t len) {
     return 0;
 }
 
-/* not atomic: *inplace says the file may be partly written on error */
-static int write_in_place(const char *path, const char *data, size_t len, bool *inplace) {
-    int fd = open(path, O_WRONLY | O_TRUNC | O_NOFOLLOW);
+/* not atomic: *inplace says the file may be partly written on error. Nothing
+   is touched unless the opened file is still `was` and has no other name. */
+static int write_in_place(const char *path, const struct stat *was,
+                          const char *data, size_t len, bool *inplace) {
+    int fd = open(path, O_WRONLY | O_NOFOLLOW);
     if (fd < 0) return errno;
-    *inplace = true;
-    int err = write_all(fd, data, len);
+    struct stat now;
+    int err = 0;
+    if (fstat(fd, &now)) err = errno;
+    else if (now.st_nlink > 1) err = EMLINK;
+    else if (!S_ISREG(now.st_mode) || now.st_nlink != 1
+             || now.st_dev != was->st_dev || now.st_ino != was->st_ino) err = EINVAL;
+    else {
+        *inplace = true;
+        err = ftruncate(fd, 0) ? errno : write_all(fd, data, len);
+    }
     if (close(fd) && !err) err = errno;
     return err;
 }
 
 /* Replace `path` through a temp file in the same directory and rename, so a
    failed write leaves the old file. Falls back to writing in place where a
-   rename cannot keep hard links or ownership, or the directory refuses a new
-   file. Returns 0, or the errno of the failure. */
+   rename cannot keep ownership, or the directory refuses a new file. A file
+   with several hard links is refused (EMLINK): another name may be outside the
+   project. Returns 0, or the errno of the failure. */
 static int write_atomic(const char *path, const char *data, size_t len, bool *inplace) {
     *inplace = false;
     struct stat st;
@@ -1787,8 +1798,7 @@ static int write_atomic(const char *path, const char *data, size_t len, bool *in
         if (S_ISDIR(st.st_mode)) return EISDIR;
         if (!S_ISREG(st.st_mode)) return EINVAL;
         if (access(path, W_OK)) return errno;
-        /* a rename would detach the other names */
-        if (st.st_nlink > 1) return write_in_place(path, data, len, inplace);
+        if (st.st_nlink > 1) return EMLINK;
     }
     char tmp[PATH_MAX];
     const char *slash = strrchr(path, '/');
@@ -1800,7 +1810,7 @@ static int write_atomic(const char *path, const char *data, size_t len, bool *in
         fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, had ? 0600 : 0666);
         if (fd < 0 && errno != EEXIST) {
             if (had && (errno == EACCES || errno == EPERM))
-                return write_in_place(path, data, len, inplace);
+                return write_in_place(path, &st, data, len, inplace);
             return errno;
         }
     }
@@ -1810,7 +1820,7 @@ static int write_atomic(const char *path, const char *data, size_t len, bool *in
                                    && fchown(fd, st.st_uid, st.st_gid)))) {
         close(fd);
         unlink(tmp);
-        return write_in_place(path, data, len, inplace);
+        return write_in_place(path, &st, data, len, inplace);
     }
     int err = write_all(fd, data, len);
     if (!err && had && fchmod(fd, st.st_mode & 07777)) err = errno;
@@ -1818,6 +1828,10 @@ static int write_atomic(const char *path, const char *data, size_t len, bool *in
     if (!err && rename(tmp, path)) err = errno;
     if (err) unlink(tmp);
     return err;
+}
+
+static const char *write_why(int err) {
+    return err == EMLINK ? "file has several hard links" : strerror(err);
 }
 
 char *tool_write_file(const char *cwd, const char *path, const char *content) {
@@ -1832,7 +1846,7 @@ char *tool_write_file(const char *cwd, const char *path, const char *content) {
     int werr = write_atomic(abs, content, len, &inplace);
     if (werr) {
         char buf[300];
-        snprintf(buf, sizeof buf, "error: cannot write %s: %s — %s", path, strerror(werr),
+        snprintf(buf, sizeof buf, "error: cannot write %s: %s — %s", path, write_why(werr),
                  inplace ? "written in place, the file may be incomplete" : "nothing was changed");
         return str_dup(buf);
     }
@@ -1908,7 +1922,7 @@ char *tool_edit_file(const char *cwd, const char *path, const char *old_str, con
     free(out);
     if (werr) {
         char buf[300];
-        snprintf(buf, sizeof buf, "error: cannot write %s: %s — %s", path, strerror(werr),
+        snprintf(buf, sizeof buf, "error: cannot write %s: %s — %s", path, write_why(werr),
                  inplace ? "written in place, the file may be incomplete" : "nothing was changed");
         return str_dup(buf);
     }
