@@ -6,6 +6,9 @@ stdlib only; run as: python3 -I harvest_tb21.py JOB_DIR [JOB_DIR ...] [--tasks F
 
 Reads every <job>/<trial>/result.json. Task names are compared without
 the "terminal-bench/" namespace. Per task:
+  First, flywheel and opencode run inside the task container, so their evidence of a model API or
+  transport error is agent-writable: without a model server outage in <job>/outages.jsonl that
+  overlaps the trial, such a trial is a fail, whatever reward was written. With one it is an error.
   error    Harbor marks the reward invalid for the exception (checked first, any reward ignored),
            or OpenCode's event log has an API or transport error (and no context overflow);
            or no reward after an infrastructure (or unknown) exception, after verification ran
@@ -28,7 +31,9 @@ dataset, dataset digest, timeout overrides), or the list is not the 89-task list
 Result fields used (harbor 0.27.0 TrialResult): task_name, trial_name, agent_info.name,
 config.{task.source, agent, verifier, *timeout_multiplier}, verifier_result.rewards.reward,
 exception_info.{exception_type, policy}, verifier.started_at, started_at, finished_at;
-job config.json datasets[0].ref; for OpenCode, <trial>/agent/opencode.txt error events.
+job config.json datasets[0].ref; for OpenCode, <trial>/agent/opencode.txt error events;
+agent_setup, agent_execution, step_results; <job>/outages.jsonl (start, end).
+An outages.jsonl that cannot be read is a harvest problem.
 
 Outputs (in --out, default ./harvest-out): results.json, report.md,
   chart_rates.svg (bars + 95% Wilson whiskers), chart_grid.svg (task x harness pass/fail grid),
@@ -84,12 +89,28 @@ INVALID_REWARD_EXCEPTIONS = {
     "ServiceOperationsUnsupportedError", "VercelScopeError", "DspyImportError", "MissingExtraError",
     "RegradeError", "CancelledError",
 }
+# These harnesses run inside the task container; Terminus 2 runs on the host.
+IN_CONTAINER = {"flywheel", "opencode"}
+# Model API and transport errors among the above. The in-container harnesses raise them from what
+# they read in the container, and Harbor derives many from the agent's own command output.
+API_EXCEPTIONS = {
+    "ApiError", "ApiRateLimitError", "ApiInternalServerError", "ApiOverloadedError",
+    "ApiConnectionClosedError", "ApiResponseStalledError", "UnknownApiError",
+    "NetworkConnectionError", "ApiConnectionError", "ApiUsageLimitError", "RateLimitError",
+    "InternalServerError", "ServiceUnavailableError", "APIConnectionError", "APIError", "Timeout",
+    "UnsupportedModelParametersError", "BadRequestError", "UnprocessableEntityError",
+    "UnsupportedParamsError", "APIResponseValidationError", "BudgetExceededError",
+    "AgentAuthenticationError", "ModelNotFoundError", "ApiProviderResourceNotFoundError",
+    "AgentVersionTooOldError", "AuthenticationError", "PermissionDeniedError", "NotFoundError",
+}
 # OpenCode failures reach Harbor as NonZeroAgentExitCodeError whose message holds the command, so
 # the task text: the cause is read only from the error events in its `run --format=json` log. API or
 # transport causes are infra errors like flywheel's ApiError; a context-size rejection stays a fail.
 # Each event is one line, JSON.stringify({type, timestamp, sessionID, error: {name, data}}).
 OPENCODE_ERROR_PREFIX = '{"type":"error","timestamp":'
 OPENCODE_API_NAMES = {"APIError", "ProviderAuthError"}
+OPENCODE_RUN_EVENTS = {"step_start", "text", "tool_use"}
+MD_SPECIAL = re.compile(r"([\\`*_\[\]<>|#!~])")
 OPENCODE_API_ERROR = re.compile(
     r"cannot connect to api|\b5\d\d\b|internal server error|connection ?(reset|refused|closed|error)"
     r"|econnreset|econnrefused|socket hang up|transport|api ?(error|connection)", re.IGNORECASE)
@@ -112,12 +133,14 @@ def wilson(k, n):
 
 
 def parse_iso(s):
-    if not s:
+    """An aware datetime, or None. Harbor writes UTC; no zone is taken as UTC."""
+    if not s or not isinstance(s, str):
         return None
     try:
-        return datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+        t = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
     except ValueError:
         return None
+    return t.replace(tzinfo=t.tzinfo or datetime.timezone.utc)
 
 
 def bare(name):
@@ -162,54 +185,111 @@ def provenance(harness, d):
 
 
 def opencode_errors(trial_dir):
-    """The error objects of the error events in a trial's OpenCode log. The log is model-influenced:
-    only a whole line with the event envelope counts."""
+    """The error objects that end a trial's OpenCode run. The log is written by the agent under
+    test, so only a whole event line counts: its sessionID must be the run's first event's, and no
+    step_start, text or tool_use line may follow it (a fatal API error ends the run)."""
     path = os.path.join(trial_dir, "agent", "opencode.txt")
     found = []
     if os.path.islink(path) or not os.path.isfile(path):
         return found
+    events = []
     with open(path, "rb") as fh:
         for raw in fh:
             line = raw.decode("utf-8", "replace").strip()
-            if not line.startswith(OPENCODE_ERROR_PREFIX):
+            if not line.startswith("{"):
                 continue
             try:
                 event = json.loads(line)
             except (ValueError, RecursionError):
                 continue
-            error = event.get("error")
-            if (event.get("type") == "error" and str(event.get("sessionID", "")).startswith("ses")
-                    and isinstance(error, dict)):
-                found.append(error)
+            if isinstance(event, dict):
+                events.append((line, event))
+    if not events:
+        return found
+    session = events[0][1].get("sessionID")
+    last_run = max((i for i, (_, e) in enumerate(events) if e.get("type") in OPENCODE_RUN_EVENTS),
+                   default=-1)
+    for i, (line, event) in enumerate(events):
+        error = event.get("error")
+        if (line.startswith(OPENCODE_ERROR_PREFIX) and event.get("type") == "error" and session
+                and event.get("sessionID") == session and isinstance(error, dict) and i > last_run):
+            found.append(error)
     return found
 
 
 def opencode_api_failure(errors):
-    api = False
+    """The first error that is an API or transport failure, or None. A context-size rejection in
+    the log makes the run a scored fail, so it returns None."""
+    api = None
     for error in errors:
         name = str(error.get("name") or "")
         data = error.get("data") if isinstance(error.get("data"), dict) else {}
         message = str(data.get("message") or "")
         code = data.get("statusCode")
         if name == "ContextOverflowError" or CONTEXT_OVERFLOW.search(message):
-            return False
-        api = api or (name in OPENCODE_API_NAMES or bool(OPENCODE_API_ERROR.search(message))
-                      or (isinstance(code, int) and (code == 429 or 500 <= code < 600)))
+            return None
+        if api is None and (name in OPENCODE_API_NAMES or bool(OPENCODE_API_ERROR.search(message))
+                            or (isinstance(code, int) and (code == 429 or 500 <= code < 600))):
+            api = error
     return api
 
 
-def classify(d, trial_dir=None):
-    """trial_dir defaults to the result's trial_uri."""
+def md_safe(text, limit=120):
+    """One line of text, truncated, with markdown syntax escaped."""
+    text = " ".join(str(text).split())
+    if len(text) > limit:
+        text = text[:limit - 3] + "..."
+    return MD_SPECIAL.sub(r"\\\1", text)
+
+
+def load_outages(job_dir):
+    """(entries of <job>/outages.jsonl, problem or None). The runner writes the file on the host,
+    outside the trial dirs. A file with any unreadable line proves nothing."""
+    path = os.path.join(job_dir, "outages.jsonl")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            entries = [json.loads(ln) for ln in fh if ln.strip()]
+        if not all(isinstance(e, dict) for e in entries):
+            raise ValueError("a line is not a JSON object")
+    except FileNotFoundError:
+        return [], None
+    except (OSError, ValueError, RecursionError) as e:
+        return [], f"unreadable {path}: {e}"
+    return entries, None
+
+
+def outage_overlap(job_dir, res):
+    """The recorded outage window that overlaps the trial, as text, or None. Shared by the
+    harvester and the runner. Missing or invalid timestamps prove nothing."""
+    began, ended = parse_iso(res.get("started_at")), parse_iso(res.get("finished_at"))
+    if not (began and ended and began <= ended):
+        return None
+    for o in load_outages(job_dir)[0]:
+        a, b = parse_iso(o.get("start")), parse_iso(o.get("end"))
+        if a and b and a <= b and a <= ended and began <= b:
+            return f"model server outage {o['start']} to {o['end']}"
+    return None
+
+
+def classify(d, trial_dir=None, job_dir=None):
+    """trial_dir defaults to the result's trial_uri; job_dir (which holds outages.jsonl) to the
+    trial dir's parent. With neither there is no outage proof."""
     rec = {"status": None, "reward": None, "reason": None, "seconds": None,
            "timeout": False, "trial": d.get("trial_name")}
     info = d.get("exception_info") or {}
     exc = info.get("exception_type")
+    agent = (d.get("agent_info") or {}).get("name")
     opencode_api = False
-    if exc == "NonZeroAgentExitCodeError" and (d.get("agent_info") or {}).get("name") == "opencode":
+    if exc == "NonZeroAgentExitCodeError" and agent == "opencode":
         uri = urllib.parse.urlparse(str(d.get("trial_uri") or ""))
         if not trial_dir and uri.scheme == "file":
             trial_dir = urllib.request.url2pathname(uri.path)
-        opencode_api = bool(trial_dir) and opencode_api_failure(opencode_errors(trial_dir))
+        api_error = opencode_api_failure(opencode_errors(trial_dir)) if trial_dir else None
+        opencode_api = api_error is not None
+        if opencode_api:
+            data = api_error.get("data") if isinstance(api_error.get("data"), dict) else {}
+            rec["opencode_error"] = {"name": str(api_error.get("name") or "?"),
+                                     "message": str(data.get("message") or "(no message)")}
     invalid = (exc in INVALID_REWARD_EXCEPTIONS or opencode_api
                or (info.get("policy") or {}).get("has_valid_reward") is False)
     verified = bool((d.get("verifier") or {}).get("started_at"))
@@ -217,7 +297,18 @@ def classify(d, trial_dir=None):
     rw = (vr.get("rewards") or {}).get("reward")
     rec["reason"] = exc
     rec["timeout"] = exc == "AgentTimeoutError"
-    if invalid:
+    # an error raised while installing the agent, before it ever ran, is not the agent's evidence
+    never_ran = bool(d.get("agent_setup")) and not (d.get("agent_execution") or d.get("step_results"))
+    unproven = False
+    if agent in IN_CONTAINER and (exc in API_EXCEPTIONS or opencode_api) and not never_ran:
+        job_dir = job_dir or (os.path.dirname(os.path.normpath(trial_dir)) if trial_dir else None)
+        window = outage_overlap(job_dir, d) if job_dir else None
+        rec["api_error"] = {"outage": window}
+        unproven = window is None
+    if unproven:
+        rec["reward"] = None if rw is None else float(rw)
+        rec["status"] = "fail"
+    elif invalid:
         rec["status"] = "error"
     elif rw is not None:
         rec["reward"] = float(rw)
@@ -256,7 +347,10 @@ def read_job(job_dir, harness, digest, expected):
         ref = (job.get("datasets") or [{}])[0].get("ref")
         if ref != digest:
             problems.append(f"{task}: job dataset digest is {ref!r}, expected {digest!r}")
-        trials[task] = classify(d, os.path.dirname(path))
+        trials[task] = classify(d, os.path.dirname(path), job_dir)
+    bad_outages = load_outages(job_dir)[1]
+    if bad_outages:
+        problems.append(bad_outages)
     if not found:
         problems.append(f"no trials in {job_dir}")
     return trials, problems
@@ -445,6 +539,17 @@ def rate(p, interval, n=None):
     return s if n is None else f"{s} (n={n})"
 
 
+def api_note(r):
+    """What the report adds to a trial classified by the in-container API error rule."""
+    api = r.get("api_error")
+    if not api:
+        return ""
+    if api["outage"]:
+        return f"; API error, {md_safe(api['outage'])}"
+    ignored = "" if r.get("reward") is None else f", written reward {r['reward']} not counted"
+    return f"; API error without host proof of an outage{ignored}"
+
+
 def report_md(summaries, label, stamps, url):
     lines = [f"# {' '.join(stamps + [''])}Terminal-Bench 2.1 harvest: {label}", ""]
     if "SYNTHETIC" in stamps:
@@ -485,8 +590,21 @@ def report_md(summaries, label, stamps, url):
                 lines.append(f"## {s['harness']}: {title}")
                 for t, r in rows:
                     why = r.get("reason") or "no exception"
-                    lines.append(f"- {t}{' (dev)' if t in s['dev'] else ''}: {r['status']} ({why})")
+                    lines.append(f"- {t}{' (dev)' if t in s['dev'] else ''}: {r['status']} "
+                                 f"({why}{api_note(r)})")
                 lines.append("")
+    lines += ["## OpenCode log errors (audit)", "",
+              "API or transport error events in the OpenCode log. The log is written by the agent under "
+              "test, so it is not proof: a trial is `error` only with a recorded model server outage, "
+              "otherwise a scored fail.", ""]
+    audited = [(s["harness"], t, r) for s in summaries for t, r in s["tasks"].items()
+               if r.get("opencode_error")]
+    for h, t, r in audited:
+        e = r["opencode_error"]
+        lines.append(f"- {h} {t} ({r['status']}): {md_safe(e['name'], 40)}: {md_safe(e['message'])}")
+    if not audited:
+        lines.append("- none")
+    lines.append("")
     lines += ["## Reruns and first attempts", "",
               "First attempt: each re-run task is scored by its first finished trial.", "",
               f"| harness | reruns | without evidence | cancelled or partial | first-attempt {head} "

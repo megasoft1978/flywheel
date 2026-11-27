@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <assert.h>
 #include <errno.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
@@ -237,6 +238,11 @@ static bool handle_security(int cfd, const char *last_msg) {
     return true;
 }
 
+/* the flag of Scotland: U+1F3F4, tags "gbsct", U+E007F */
+#define FLAG_SCT "\xf0\x9f\x8f\xb4\xf3\xa0\x81\xa7\xf3\xa0\x81\xa2\xf3\xa0\x81\xb3" \
+                 "\xf3\xa0\x81\xa3\xf3\xa0\x81\xb4\xf3\xa0\x81\xbf"
+#define SEG_PLAIN "FIRSTPART\necho safe  x#; id\nflag " FLAG_SCT " not \xf0\x9f\x8f\xb4 ok!"
+
 static void handle_client(int cfd) {
     static char req[2 << 20];
     size_t got = 0;
@@ -288,6 +294,44 @@ static void handle_client(int cfd) {
 
     if (handle_probe(cfd, last_msg)) return;
     if (handle_security(cfd, last_msg)) return;
+
+    if (strstr(last_msg, "PERSIAN_REPLY")) {   /* ZWNJ kept, ZWSP removed */
+        reply(cfd, "content", "\xd8\xb3\xd9\x84\xd8\xa7\xd9\x85 \xd9\x85\xdb\x8c\xe2\x80\x8c\xe2\x80\x8b"
+              "\xd8\xae\xd9\x88\xd8\xa7\xd9\x87\xd9\x85", false);
+        return;
+    }
+
+    if (strstr(last_msg, "SEG_REPLY")) {   /* answer split by reasoning, with hidden text */
+        static const char *const part[][2] = {
+            {"content", "FIRSTPART\\n"},
+            {"reasoning_content", "hmm"},
+            {"content", "echo safe \xe2\x80\xae\xe2\x81\xa6 x\xf3\xa0\x81\x81\\u001b#; id\\n"},
+            {"reasoning_content", "hmm"},
+            {"content", "flag " FLAG_SCT " not \xf0\x9f\x8f\xb4\xf3\xa0\x81\xa1\xf3\xa0\x81\xbf "
+                        "ok\xe0\x80\xaf\xed\xa0\x80\xf0\x80\x80\xaf!"},
+        };
+        for (size_t i = 0; i < sizeof part / sizeof *part; i++) {
+            char j[512];
+            snprintf(j, sizeof j, "{\"choices\":[{\"delta\":{\"%s\":\"%s\"}}]}", part[i][0], part[i][1]);
+            send_sse_chunk(cfd, j);
+        }
+        send_all(cfd, "data: [DONE]\n\n", 14);
+        close(cfd);
+        return;
+    }
+
+    if (strstr(last_msg, "BIG_REPLY")) {       /* 100 lines of 1000 bytes */
+        char j[1200], fill[1000];
+        memset(fill, 'q', sizeof fill - 1);
+        fill[sizeof fill - 1] = 0;
+        for (int i = 0; i < 100; i++) {
+            snprintf(j, sizeof j, "{\"choices\":[{\"delta\":{\"content\":\"%s\\n\"}}]}", fill);
+            send_sse_chunk(cfd, j);
+        }
+        send_all(cfd, "data: [DONE]\n\n", 14);
+        close(cfd);
+        return;
+    }
 
     if (strstr(last_msg, "STREAM_TEST")) {
         const char *think[] = {"Let", "'s", " take", " a", " look", NULL};
@@ -802,6 +846,327 @@ static void input_tests(const char *dir, const char *cmd) {
     mica_session_destroy(s);
 }
 
+/* ---------- /copy and /mouse ---------- */
+
+/* SEC_TEXT's reply with every escape sequence and control byte removed */
+#define SEC_PLAIN "abc\n```xlang\ncodehid\n```\n[l](ftp://u)"
+
+static size_t slurp(const char *path, char *buf, size_t cap) {
+    FILE *f = fopen(path, "r");
+    size_t n = f ? fread(buf, 1, cap - 1, f) : 0;
+    if (f) fclose(f);
+    buf[n] = 0;
+    return n;
+}
+
+static void ask(MicaSession *s, const char *msg) {
+    submit(s, msg);
+    wait_for_text(s, "✓ done", 8000);
+    pump(s, 200);
+}
+
+/* every session here finds a fake pbcopy first on PATH: the real clipboard is never touched */
+static void copy_tests(const char *dir, const char *cmd) {
+    char bin[1100], script[1200], clip[1200], failflag[1200];
+    char outside[] = "/tmp/fwcopy-XXXXXX";
+    assert(mkdtemp(outside) != NULL);
+    snprintf(bin, sizeof bin, "%s/fakebin", outside);
+    snprintf(script, sizeof script, "%s/pbcopy", bin);
+    snprintf(clip, sizeof clip, "%s/clip.txt", dir);
+    snprintf(failflag, sizeof failflag, "%s/pbfail", dir);
+    assert(mkdir(bin, 0700) == 0);
+    FILE *f = fopen(script, "w");
+    assert(f != NULL);
+    fprintf(f, "#!/bin/sh\nif [ -e '%s' ]; then cat >/dev/null; exit 1; fi\nexec cat > '%s'\n", failflag, clip);
+    fclose(f);
+    assert(chmod(script, 0700) == 0);
+
+    static char full[8192], got[1 << 17];
+    snprintf(full, sizeof full, "unset SSH_CONNECTION SSH_TTY SSH_CLIENT TMUX; export TERM_PROGRAM=Apple_Terminal; "
+             "export PATH='%s':\"$PATH\"; %s", bin, cmd);
+    MicaSession *s = mica_session_create(dir, full, 24, 80);
+    assert(s != NULL);
+    CHECK(s, "copy: ready", wait_for_text(s, "ready", 3000));
+    pump(s, 150);
+
+    keys(s, "/");
+    CHECK(s, "menu lists every command", find_row(s, "/copy") >= 0 && find_row(s, "/mouse") >= 0 &&
+          find_row(s, "/help") >= 0 && find_row(s, "/quit") >= 0);
+    keys(s, "\x03" "/help\r");
+    CHECK(s, "help names /copy, /mouse and the select key",
+          find_row(s, "/copy /mouse /help") >= 0 && find_row(s, "hold Fn") >= 0);
+
+    keys(s, "/clear\r");
+    keys(s, "/copy\r");
+    CHECK(s, "copy: nothing to copy yet", wait_for_text(s, "nothing to copy", 2000));
+    CHECK(s, "copy: pbcopy not run without a reply", access(clip, F_OK) != 0);
+
+    ask(s, "SEC_TEXT");
+    keys(s, "/copy\r");
+    CHECK(s, "copy: reports pbcopy", wait_for_text(s, "copied the last reply", 3000));
+    slurp(clip, got, sizeof got);
+    CHECK(s, "copy: reply text without escapes or controls", !strcmp(got, SEC_PLAIN));
+    char *osc = mica_session_take_clipboard_write(s);
+    CHECK(s, "copy: no OSC 52 when pbcopy worked", osc == NULL);
+    free(osc);
+
+    ask(s, "BIG_REPLY");
+    keys(s, "/copy\r");
+    CHECK(s, "copy: big reply reported", wait_for_text(s, "(99999 bytes, pbcopy)", 5000));
+    CHECK(s, "copy: big reply arrives whole", slurp(clip, got, sizeof got) == 99999);
+
+    f = fopen(failflag, "w");
+    assert(f != NULL);
+    fclose(f);
+    ask(s, "SEC_TEXT");
+    keys(s, "/copy\r");
+    CHECK(s, "copy: pbcopy failure is said, OSC 52 not confirmed",
+          wait_for_text(s, "pbcopy failed. Sent", 3000) && find_row(s, "Not confirmed") >= 0);
+    pump(s, 200);
+    osc = mica_session_take_clipboard_write(s);
+    CHECK(s, "copy: fallback OSC 52 carries the plain text", osc && !strcmp(osc, SEC_PLAIN));
+    free(osc);
+
+    /* mouse reporting off, then on */
+    keys(s, "/clear\r");
+    CHECK(s, "mouse: on at start", mica_session_reports_mouse(s));
+    keys(s, "\033[<0;5;5M\033[<0;5;5m");
+    CHECK(s, "mouse: a plain click shows no hint", find_row(s, "to select:") < 0);
+    keys(s, "\033[<0;5;5M\033[<0;20;5m");
+    CHECK(s, "mouse: a drag shows the select key", find_row(s, "to select: hold Fn and drag, or /mouse") >= 0);
+    keys(s, "/mouse\r");
+    CHECK(s, "mouse off: reporting disabled", !mica_session_reports_mouse(s));
+    CHECK(s, "mouse off: says how to scroll and expand",
+          find_row(s, "drag to select text") >= 0 && find_row(s, "PgUp/PgDn") >= 0 && find_row(s, "^O") >= 0);
+    submit(s, "STREAM_TEST");
+    CHECK(s, "mouse off: modal", wait_for_text(s, "Do you want to proceed?", 4000));
+    pump(s, 700);
+    CHECK(s, "mouse off: dialog does not offer clicking",
+          find_row(s, "Esc cancel") >= 0 && find_row(s, "or click") < 0);
+    keys(s, "y");
+    CHECK(s, "mouse off: task completes", wait_for_text(s, "✓ done", 4000));
+    pump(s, 200);
+    CHECK(s, "mouse off: collapsed hint names only ^O",
+          find_row(s, "(^O to expand)") >= 0 && find_row(s, "click or") < 0);
+    CHECK(s, "mouse off: stays off across a task", !mica_session_reports_mouse(s));
+    keys(s, "/mouse\r");
+    CHECK(s, "mouse on again", mica_session_reports_mouse(s) && find_row(s, "mouse on:") >= 0);
+    keys(s, "/mouse\r");
+    keys(s, "/exit\r");
+    CHECK(s, "mouse off: clean exit", wait_for_exit(s, 3000));
+    pump(s, 100);
+    CHECK(s, "mouse off: terminal restored", !mica_session_reports_mouse(s) && !mica_session_bracketed_paste(s));
+    mica_session_destroy(s);
+
+    /* over SSH: OSC 52 only, with a size cap */
+    unlink(clip);
+    unlink(failflag);
+    snprintf(full, sizeof full, "unset SSH_TTY SSH_CLIENT TMUX; export SSH_CONNECTION='1 2 3 4'; "
+             "export PATH='%s':\"$PATH\"; %s", bin, cmd);
+    s = mica_session_create(dir, full, 24, 80);
+    assert(s != NULL);
+    CHECK(s, "ssh copy: ready", wait_for_text(s, "ready", 3000));
+    pump(s, 150);
+    ask(s, "SEC_TEXT");
+    keys(s, "/copy\r");
+    CHECK(s, "ssh copy: says unconfirmed", wait_for_text(s, "Not confirmed", 3000));
+    pump(s, 200);
+    osc = mica_session_take_clipboard_write(s);
+    CHECK(s, "ssh copy: OSC 52 carries the plain text", osc && !strcmp(osc, SEC_PLAIN));
+    free(osc);
+    CHECK(s, "ssh copy: pbcopy not used", access(clip, F_OK) != 0);
+    ask(s, "BIG_REPLY");
+    keys(s, "/copy\r");
+    CHECK(s, "ssh copy: over the cap is refused",
+          wait_for_text(s, "not copied:", 3000) && find_row(s, "OSC 52 limit") >= 0);
+    pump(s, 200);
+    osc = mica_session_take_clipboard_write(s);
+    CHECK(s, "ssh copy: nothing sent over the cap", osc == NULL);
+    free(osc);
+    keys(s, "/exit\r");
+    CHECK(s, "mouse on: clean exit", wait_for_exit(s, 3000));
+    pump(s, 100);
+    CHECK(s, "mouse on: terminal restored", !mica_session_reports_mouse(s));
+    mica_session_destroy(s);
+
+    /* a project-supplied pbcopy never runs: relative, empty, absolute or symlinked
+       PATH entries. PATH holds no system pbcopy, so the clipboard stays untouched */
+    char evil[1200], inproj[1200], evil2[1300], linkdir[1200], linkfile[1300], hijack[1200];
+    snprintf(evil, sizeof evil, "%s/pbcopy", dir);
+    snprintf(inproj, sizeof inproj, "%s/inproj", dir);
+    snprintf(evil2, sizeof evil2, "%s/pbcopy", inproj);
+    snprintf(linkdir, sizeof linkdir, "%s/linkbin", outside);
+    snprintf(linkfile, sizeof linkfile, "%s/pbcopy", linkdir);
+    snprintf(hijack, sizeof hijack, "%s/HIJACKED", dir);
+    assert(mkdir(inproj, 0700) == 0 && mkdir(linkdir, 0700) == 0);
+    const char *const evils[] = {evil, evil2};
+    for (int i = 0; i < 2; i++) {
+        f = fopen(evils[i], "w");
+        assert(f != NULL);
+        fprintf(f, "#!/bin/sh\nexec /bin/cat > '%s'\n", hijack);
+        fclose(f);
+        assert(chmod(evils[i], 0700) == 0);
+    }
+    assert(symlink(evil, linkfile) == 0);
+
+    unlink(clip);
+    snprintf(full, sizeof full, "unset SSH_CONNECTION SSH_TTY SSH_CLIENT TMUX; "
+             "export PATH='.::inproj:%s:%s:/bin'; %s", inproj, linkdir, cmd);
+    s = mica_session_create(dir, full, 24, 80);
+    assert(s != NULL);
+    CHECK(s, "hijack: ready", wait_for_text(s, "ready", 3000));
+    pump(s, 150);
+    ask(s, "SEC_ZWTEXT");
+    keys(s, "/copy\r");
+    CHECK(s, "hijack: falls back to OSC 52", wait_for_text(s, "pbcopy failed. Sent", 3000));
+    pump(s, 200);
+    CHECK(s, "hijack: project pbcopy not run", access(hijack, F_OK) != 0);
+    osc = mica_session_take_clipboard_write(s);
+    CHECK(s, "copy: bidi and zero-width characters removed", osc && !strcmp(osc, "zw"));
+    free(osc);
+    mica_session_destroy(s);
+
+    /* with a safe entry after the unsafe ones, that one is used */
+    snprintf(full, sizeof full, "unset SSH_CONNECTION SSH_TTY SSH_CLIENT TMUX; "
+             "export PATH='.::inproj:%s:%s:%s:/bin'; %s", inproj, linkdir, bin, cmd);
+    s = mica_session_create(dir, full, 14, 80);
+    assert(s != NULL);
+    CHECK(s, "segments: ready", wait_for_text(s, "ready", 3000));
+    pump(s, 150);
+    ask(s, "SEG_REPLY");
+    keys(s, "/copy\r");
+    CHECK(s, "segments: says it has several lines", wait_for_text(s, "several lines (3)", 3000));
+    CHECK(s, "segments: safe pbcopy used", access(hijack, F_OK) != 0);
+    slurp(clip, got, sizeof got);
+    CHECK(s, "segments: whole reply, hidden text removed", !strcmp(got, SEG_PLAIN));
+
+    /* 14 rows: the menu scrolls to the last command */
+    keys(s, "/clear\r");
+    keys(s, "/");
+    CHECK(s, "short menu: last command off screen", find_row(s, "/quit") < 0);
+    for (int i = 0; i < 9; i++) keys(s, "\033[B");
+    int quit = find_row(s, "/quit");
+    CHECK(s, "short menu: arrows reach /quit", quit >= 0 && find_row(s, "\xe2\x96\xb8 /quit") == quit);
+    CHECK(s, "short menu: first command scrolled away", find_row(s, "write .flywheel.md") < 0);
+    keys(s, "\033[B");
+    CHECK(s, "short menu: wraps to the top", find_row(s, "\xe2\x96\xb8 /init") >= 0);
+    keys(s, "\033[A");
+    keys(s, "\x03" "/mouse\r");
+    keys(s, "/clear\r");
+    keys(s, "/help\r");
+    CHECK(s, "help: no wheel while the mouse is off",
+          find_row(s, "PgUp/PgDn scroll") >= 0 && find_row(s, "or wheel") < 0);
+    keys(s, "/mouse\r");
+    keys(s, "/clear\r");
+    keys(s, "/");
+    for (int i = 0; i < 9; i++) keys(s, "\033[B");
+    int row = find_row(s, "/exit");
+    CHECK(s, "short menu: /exit visible", row >= 0);
+    char click[32];
+    snprintf(click, sizeof click, "\033[<0;5;%dM", row + 1);
+    keys(s, click);
+    CHECK(s, "short menu: click uses the scroll offset", wait_for_exit(s, 3000));
+    mica_session_destroy(s);
+
+    /* Persian with ZWNJ round-trips; ZWSP is still removed */
+    unlink(clip);
+    snprintf(full, sizeof full, "unset SSH_CONNECTION SSH_TTY SSH_CLIENT TMUX; "
+             "export PATH='%s':\"$PATH\"; %s", bin, cmd);
+    s = mica_session_create(dir, full, 24, 80);
+    assert(s != NULL);
+    CHECK(s, "persian: ready", wait_for_text(s, "ready", 3000));
+    pump(s, 150);
+    ask(s, "PERSIAN_REPLY");
+    keys(s, "/copy\r");
+    CHECK(s, "persian: reports pbcopy", wait_for_text(s, "copied the last reply", 3000));
+    slurp(clip, got, sizeof got);
+    CHECK(s, "persian: ZWNJ kept, ZWSP removed",
+          !strcmp(got, "\xd8\xb3\xd9\x84\xd8\xa7\xd9\x85 \xd9\x85\xdb\x8c\xe2\x80\x8c"
+                       "\xd8\xae\xd9\x88\xd8\xa7\xd9\x87\xd9\x85"));
+    mica_session_destroy(s);
+
+    /* a pbcopy reached through a firmlink alias of the project bin is not run,
+       and a repo/bin pbcopy is not run from a repo subdirectory */
+    char altbin[1200], alt_script[1300], alt_hit[1200], alt_path[1300];
+    char repo[1200], repo_sub[1300], repo_bin[1300], repo_script[1400], repo_hit[1300];
+    char real_dir[PATH_MAX], alias[PATH_MAX];
+    snprintf(altbin, sizeof altbin, "%s/altbin", dir);
+    snprintf(alt_script, sizeof alt_script, "%s/pbcopy", altbin);
+    snprintf(alt_hit, sizeof alt_hit, "%s/ALT_HIJACK", dir);
+    snprintf(repo, sizeof repo, "%s/repo", dir);
+    snprintf(repo_sub, sizeof repo_sub, "%s/sub", repo);
+    snprintf(repo_bin, sizeof repo_bin, "%s/bin", repo);
+    snprintf(repo_script, sizeof repo_script, "%s/pbcopy", repo_bin);
+    snprintf(repo_hit, sizeof repo_hit, "%s/REPO_HIJACK", dir);
+    assert(realpath(dir, real_dir) != NULL);
+    snprintf(alias, sizeof alias, "/System/Volumes/Data%s", real_dir);
+    snprintf(alt_path, sizeof alt_path, "%s/altbin", alias);
+    struct stat ast, dst;
+    assert(stat(alias, &ast) == 0 && stat(dir, &dst) == 0);
+    assert(ast.st_ino == dst.st_ino && ast.st_dev == dst.st_dev);
+    assert(mkdir(altbin, 0700) == 0 && mkdir(repo, 0700) == 0 && mkdir(repo_bin, 0700) == 0);
+    assert(mkdir(repo_sub, 0700) == 0);
+    char gitdir[1300];
+    snprintf(gitdir, sizeof gitdir, "%s/.git", repo);
+    assert(mkdir(gitdir, 0700) == 0);
+    const char *const scripts[] = {alt_script, repo_script};
+    const char *const hits[] = {alt_hit, repo_hit};
+    for (int i = 0; i < 2; i++) {
+        f = fopen(scripts[i], "w");
+        assert(f != NULL);
+        fprintf(f, "#!/bin/sh\nexec /bin/cat > '%s'\n", hits[i]);
+        fclose(f);
+        assert(chmod(scripts[i], 0700) == 0);
+    }
+
+    unlink(clip);
+    snprintf(full, sizeof full, "unset SSH_CONNECTION SSH_TTY SSH_CLIENT TMUX; "
+             "export PATH='%s':/bin; %s", alt_path, cmd);
+    s = mica_session_create(dir, full, 24, 80);
+    assert(s != NULL);
+    CHECK(s, "alias: ready", wait_for_text(s, "ready", 3000));
+    pump(s, 150);
+    ask(s, "SEC_ZWTEXT");
+    keys(s, "/copy\r");
+    CHECK(s, "alias: firmlink pbcopy not used", wait_for_text(s, "pbcopy failed. Sent", 3000));
+    pump(s, 200);
+    CHECK(s, "alias: pbcopy in project bin not run", access(alt_hit, F_OK) != 0);
+    mica_session_destroy(s);
+
+    snprintf(full, sizeof full, "unset SSH_CONNECTION SSH_TTY SSH_CLIENT TMUX; "
+             "export PATH='%s':%s:/bin; %s", repo_bin, bin, cmd);
+    s = mica_session_create(repo_sub, full, 24, 80);
+    assert(s != NULL);
+    CHECK(s, "repo: ready", wait_for_text(s, "ready", 3000));
+    pump(s, 150);
+    ask(s, "SEC_TEXT");
+    keys(s, "/copy\r");
+    CHECK(s, "repo: copy from subdirectory uses the safe pbcopy",
+          wait_for_text(s, "copied the last reply", 3000));
+    CHECK(s, "repo: repo/bin pbcopy not run", access(repo_hit, F_OK) != 0);
+    mica_session_destroy(s);
+
+    unlink(alt_script);
+    unlink(repo_script);
+    unlink(alt_hit);
+    unlink(repo_hit);
+    rmdir(altbin);
+    rmdir(gitdir);
+    rmdir(repo_sub);
+    rmdir(repo_bin);
+    rmdir(repo);
+
+    unlink(evil);
+    unlink(evil2);
+    unlink(linkfile);
+    unlink(script);
+    unlink(clip);
+    rmdir(inproj);
+    rmdir(linkdir);
+    rmdir(bin);
+    rmdir(outside);
+}
+
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     const char *fw_bin = (argc > 1) ? argv[1] : "./flywheel";
@@ -1178,6 +1543,7 @@ int main(int argc, char **argv) {
     mica_session_destroy(s);
     security_tests(testdir, cmd);
     input_tests(testdir, cmd);
+    copy_tests(testdir, cmd);
     stop_mock_server(srv_th);
 
     char rm[1200];

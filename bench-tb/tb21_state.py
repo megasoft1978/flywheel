@@ -13,6 +13,7 @@ and logs every move in <job-dir>/reruns.jsonl.
 (unless it is an error, i.e. its reward is invalid);
 a fail only with recorded outage evidence (it overlaps a window in <job-dir>/outages.jsonl)
 unless --rerun-without-evidence; an error trial (harvest_tb21.classify) may be re-run.
+For flywheel and opencode, a model API error without that outage evidence is a fail, not an error.
 
 Prints "DONE_COUNT TODO_COUNT" on stdout; messages go to stderr.
 
@@ -32,7 +33,7 @@ import sys
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # -I leaves it out
-from harvest_tb21 import classify, parse_iso  # noqa: E402
+from harvest_tb21 import classify, load_outages, outage_overlap  # noqa: E402
 
 OUTAGE_EXIT = 75
 
@@ -145,27 +146,9 @@ def watch(url, job_dir, cmd):
     return rc if rc >= 0 else 128 - rc
 
 
-def outage_overlap(job_dir, res):
-    """The recorded outage window that overlaps the trial, as text, or None."""
-    path = os.path.join(job_dir, "outages.jsonl")
-    began, ended = parse_iso(res.get("started_at")), parse_iso(res.get("finished_at"))
-    if not (began and ended and os.path.exists(path)):
-        return None
-    with open(path, encoding="utf-8") as fh:
-        for line in filter(str.strip, fh):
-            o = json.loads(line)
-            a, b = parse_iso(o.get("start")), parse_iso(o.get("end"))
-            # Harbor writes UTC; a timestamp without a zone is taken as UTC
-            a, b, c, d = (t.replace(tzinfo=t.tzinfo or datetime.timezone.utc) if t else None
-                          for t in (a, b, began, ended))
-            if a and b and a <= d and c <= b:
-                return f"model server outage {o['start']} to {o['end']}"
-    return None
-
-
-def judge_rerun(job_dir, res, override):
+def judge_rerun(job_dir, res, override, trial_dir=None):
     """Return (status, evidence, refusal) for re-running a finished trial."""
-    rec = classify(res)
+    rec = classify(res, trial_dir, job_dir)
     reward = ((res.get("verifier_result") or {}).get("rewards") or {}).get("reward")
     if reward is not None and float(reward) == 1.0 and rec["status"] != "error":
         return rec["status"], None, "it has reward 1"
@@ -173,8 +156,10 @@ def judge_rerun(job_dir, res, override):
     if rec["status"] == "error":
         evidence = evidence or f"no valid reward: {rec['reason']}"
     if not evidence and not override:
+        bad = load_outages(job_dir)[1]
         return rec["status"], None, (f"it is a scored fail (reward {reward}) with no recorded outage "
-                                     "evidence; --rerun-without-evidence overrides and is reported")
+                                     "evidence; --rerun-without-evidence overrides and is reported"
+                                     + (f" ({bad})" if bad else ""))
     return rec["status"], evidence, None
 
 
@@ -219,7 +204,8 @@ def main():
         if exc == "CancelledError" and reward is None:
             moves.append((name, dict(entry, kind="cancelled")))
         elif task in rerun:
-            status, evidence, refusal = judge_rerun(a.job_dir, res, a.rerun_without_evidence)
+            status, evidence, refusal = judge_rerun(a.job_dir, res, a.rerun_without_evidence,
+                                                    os.path.join(a.job_dir, name))
             if refusal:
                 refused.append(f"--rerun {task} refused: {refusal}")
             moves.append((name, dict(entry, kind="rerun", status=status, reason=a.reason.strip(),

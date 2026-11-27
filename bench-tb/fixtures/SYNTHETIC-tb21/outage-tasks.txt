@@ -1,0 +1,6 @@
+# SYNTHETIC FIXTURE - not benchmark data
+terminal-bench/proof-task
+terminal-bench/noproof-task
+terminal-bench/reward1-task
+terminal-bench/setup-task
+terminal-bench/badtime-task
