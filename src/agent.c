@@ -50,9 +50,22 @@ static unsigned long long fnv1a(unsigned long long h, const char *s) {
 
 /* bash result for the model: output plus how the command ended, if not cleanly
    (a timeout is already announced at the top of the output) */
-static char *bash_out(const char *cmd) {
+static char *bash_out(const char *cmd, bool net, bool interactive) {
     int code;
-    char *out = run_bash_status(cmd, g_cfg.cwd, g_cfg.cmd_timeout, &code);
+    char *out = (net ? run_bash_net : run_bash_status)(cmd, g_cfg.cwd, g_cfg.cmd_timeout, &code);
+    /* say why, or the model retries the same thing */
+    if (code > 0 && !net && sandbox_on() &&
+        (strstr(out, "Operation not permitted") || strstr(out, "Could not resolve") ||
+         strstr(out, "Couldn't connect") || strstr(out, "ENOTFOUND") || strstr(out, "EPERM"))) {
+        const char *hint = interactive
+            ? "[sandbox: write only in the working directory or $TMPDIR; network is off unless you set \"network\": true]"
+            : "[sandbox: write only in the working directory or $TMPDIR; there is no network]";
+        size_t cap = strlen(out) + strlen(hint) + 2;
+        char *h = malloc(cap);
+        snprintf(h, cap, "%s%s%s", out, out[strlen(out) - 1] == '\n' ? "" : "\n", hint);
+        free(out);
+        out = h;
+    }
     if (!code || (code < 0 && (!strncmp(out, "[timeout after", 14) || !strcmp(out, "error: pipe failed"))))
         return out;
     char st[48] = "[killed by a signal]";
@@ -78,6 +91,11 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
     int escape_turns = 0, slow_gates = 0;
     time_t wall0 = time(NULL);
     const char *finish = "turns";
+    /* fail closed: nobody to ask and nothing to contain the commands */
+    if (!ui->approve_cmd && !g_cfg.unsafe && !sandbox_available()) {
+        if (sum) snprintf(sum, sumcap, "finish=no-sandbox — nothing was run; --unsafe runs without one");
+        return "no-sandbox";
+    }
     /* the current task is the newest user message (a REPL has older ones) */
     int task = msgs->n - 1;
     while (task > 0 && strcmp(msgs->v[task].role, "user")) task--;
@@ -273,6 +291,9 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
                 cJSON *args = args_parse_strict(rawargs);
                 cJSON *jc = cJSON_GetObjectItemCaseSensitive(args, "command");
                 char *fixed = heredoc_fix(cJSON_IsString(jc) ? jc->valuestring : "");
+                /* only the sandbox withholds network, so only then is it asked for */
+                bool net = sandbox_on() &&
+                           cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(args, "network"));
                 cJSON_Delete(args);
                 if (ui->emit_tool) ui->emit_tool("Bash", fixed, ui->ud);
                 if (!*fixed) {
@@ -282,13 +303,25 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
                 } else {
                     const char *denied = deny_check(fixed, g_cfg.cwd);
                     /* never ask about a command that will be refused anyway */
-                    bool unapproved = !denied && ui->approve_cmd && !perm_allowed(fixed) &&
-                                      !ui->approve_cmd(fixed, false, ui->ud);
+                    bool unapproved = false;
+                    if (!denied && net && ui->approve_cmd) {
+                        /* asked every time, whatever the rules say. The newline
+                           keeps an "always" rule from being offered or matching */
+                        static const char head[] = "# allow NETWORK access for this one command\n";
+                        size_t cap = sizeof head + strlen(fixed);
+                        char *ask = malloc(cap);
+                        snprintf(ask, cap, "%s%s", head, fixed);
+                        unapproved = !ui->approve_cmd(ask, false, ui->ud);
+                        free(ask);
+                    } else if (!denied && ui->approve_cmd && !perm_allowed(fixed))
+                        unapproved = !ui->approve_cmd(fixed, false, ui->ud);
                     if (denied) out = str_dup(denied);
+                    else if (net && !ui->approve_cmd)
+                        out = str_dup("error: network access needs the user's approval, which this mode cannot ask for — not executed; run it without \"network\"");
                     else if (unapproved) out = str_dup("error: user denied this command — adapt, explain why it is needed, or try another approach");
                     else if (g_abort) out = str_dup("error: aborted by user — not executed");
                     else {
-                        out = bash_out(fixed);
+                        out = bash_out(fixed, net, ui->approve_cmd != NULL);
                         if (cmd_is_write(fixed)) wrote = true;
                     }
                     snprintf(reckey, sizeof reckey, "%.1100s", fixed);

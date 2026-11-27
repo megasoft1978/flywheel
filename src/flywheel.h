@@ -36,6 +36,7 @@ typedef struct {
     bool  yes;           /* auto-confirm setup prompts */
     char *sys_extra;     /* appended to system prompt */
     bool  outside_writes;/* --allow-outside-writes only: throwaway containers */
+    bool  unsafe;        /* --unsafe only: run commands without the sandbox */
 } Cfg;
 
 extern Cfg g_cfg;
@@ -102,6 +103,12 @@ char     *http_get(const char *path); /* GET endpoint+path, malloc'd body or NUL
 char     *http_get_url(const char *url); /* GET absolute URL, malloc'd body or NULL */
 
 /* tools.c */
+bool  sandbox_available(void);        /* a working kernel sandbox (macOS only) */
+bool  sandbox_on(void);               /* available and not --unsafe */
+void  sandbox_disable_for_test(bool off);
+/* commands run sandboxed unless --unsafe; run_bash_net also allows network and
+   is only for a command the user just approved for that */
+char *run_bash_net(const char *cmd, const char *cwd, int timeout_s, int *code);
 char *run_bash(const char *cmd, const char *cwd, int timeout_s); /* never NULL */
 /* *code = exit status, -1 if timed out or killed */
 char *run_bash_status(const char *cmd, const char *cwd, int timeout_s, int *code);
@@ -126,6 +133,8 @@ char *args_extract_key(const char *raw_args_json, const char *key);  /* malloc'd
 const char *resolve_confined(const char *cwd, const char *path, char *out, size_t cap, bool for_write);
 char *tool_write_file(const char *cwd, const char *path, const char *content);   /* malloc'd status */
 char *tool_edit_file(const char *cwd, const char *path, const char *old_str, const char *new_str);
+/* tests only: runs between the path checks of a file tool and its I/O */
+extern void (*fw_file_hook)(void);
 cJSON *args_parse_strict(const char *raw);  /* complete JSON object or NULL */
 void  args_note_repair(const char *kind);               /* bumps repair stats */
 
@@ -173,7 +182,8 @@ typedef struct {
     void (*emit_status)(const char *, void *);      /* status-line text */
     void (*emit_event)(const char *kind, const char *detail, void *); /* prune/gate/reset/done */
     void (*emit_stats)(const AgentStats *, void *); /* live telemetry updates */
-    /* NULL = auto-approve (non-interactive). gate: cmd is the verification
+    /* NULL = auto-approve (non-interactive; refused with no sandbox
+       and no --unsafe). gate: cmd is the verification
        gate; it is never set for anything the model asked for */
     bool (*approve_cmd)(const char *cmd, bool gate, void *);
     void *ud;

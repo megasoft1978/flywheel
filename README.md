@@ -61,7 +61,7 @@ The Linux build speaks plain HTTP only.
 
 ```bash
 flywheel                            # interactive REPL
-flywheel "fix the bug in x.ts"      # one-shot (approves commands automatically)
+flywheel "fix the bug in x.ts"      # one-shot (approves commands automatically, sandboxed)
 flywheel -f prompt.md -T 60 -W 900 --transcript run.jsonl
 flywheel bench <suite-dir> <tag>    # run a benchmark suite
 ```
@@ -76,10 +76,11 @@ flywheel bench <suite-dir> <tag>    # run a benchmark suite
 | `--gates N` | requirement-check passes before finishing | 1 |
 | `--transcript FILE` | JSONL log of the run | off |
 | `--allow-outside-writes` | throwaway containers only, see [Safety](#safety) | off |
+| `--unsafe` | no sandbox, full environment; see [Safety](#safety). Goes before `bench` | off |
 
 `flywheel --help` lists the rest. Settings can also live in `~/.config/flywheel/config`.
 Project instructions come from the first of `.flywheel.md`, `AGENTS.md` or `CLAUDE.md`
-(first 3,800 characters).
+(first 3,800 characters). A file that links outside the project or into a credential store is skipped.
 
 ## What the harness does
 
@@ -121,8 +122,129 @@ Project instructions come from the first of `.flywheel.md`, `AGENTS.md` or `CLAU
 
 ## Safety
 
-flywheel runs shell commands and project code on your machine. **It is not a sandbox.** Do not
-run it on an untrusted repository or task outside a container or VM.
+flywheel runs shell commands and project code on your machine. On macOS, the commands the model
+runs and the verification gate go through a Seatbelt sandbox (`sandbox-exec`): **they cannot write
+outside the project or reach the network unless you approve it.** That is the whole claim. Run an
+untrusted repository or task in a VM.
+
+**Sandbox (macOS)**
+
+- Writes: the working directory and a private `$TMPDIR` (plus `/dev/null` and similar). Not `/tmp`.
+  Not the project's `.envrc`, `.git/hooks`, `.git/config`, `.git/config.worktree`,
+  `.git/commondir`, `.git/rebase-merge`, `.git/rebase-apply` or `.git/sequencer`, which run or
+  redirect code later, outside the sandbox. Without a real `.git` directory, nothing can create
+  `.git`. The project directory itself and the directories above these files and the stores below
+  cannot be renamed or removed.
+- Never a `HEAD` in the root, in any case of the name: with `.git` made invalid, git would treat the
+  root as a repository. So a root file called `head` cannot be written or checked out (a directory
+  of that name that already exists works).
+- Anywhere it can write, nested ones included: no creating, changing, renaming in or linking a
+  `.envrc` or a nested `.git` (directory, file or symlink), and none of `config`,
+  `config.worktree`, `commondir`, `hooks`, `rebase-merge`, `rebase-apply` or `sequencer` in a
+  `.git` directory, its `modules` or its `worktrees`. The same holds in the project's git directory
+  when `.git` is a link or a `gitdir:` file. No new entry can appear in `.git/modules` or `.git/worktrees`. These are fixed
+  rules by name, in every spelling the filesystem treats as the same: nothing is scanned, moved
+  or repaired, and detached processes are bound by them too. In a root that is already a bare
+  repository (or has a `HEAD` file), the same names are closed there. Every link and `gitdir:` or
+  `commondir` file on the way to the project's protected files is closed too, so none can be pointed
+  elsewhere, and so is whatever a linked hook in a protected hooks directory leads to. A path
+  through `/System/Volumes/Data`, a name at the root starting with a dot (`/.vol`, `/.nofollow`:
+  second spellings the rules would miss) or `/dev` (other than `/dev/null`) is refused. If the rules cannot be built, a store is a link that cannot be followed (a loop), or a protected file or git
+  directory cannot be followed or read (a loop, or no permission), the command is not run and the
+  file tools do not write; the message names the path.
+- What `core.hooksPath` names is closed like `.git/hooks`, also to the file tools and before it
+  exists; for husky's `.husky/_`, all of `.husky`. Every value in the system, global, repository,
+  worktree and submodule configs counts, also one that another overrides, and every `include` and
+  `includeIf` file is followed whatever its condition; those config files are closed too. A
+  relative value is closed in each work tree, also linked worktrees outside the project, and in
+  the git directories, where hooks run on receive. Linked
+  hooks directly in such a directory are followed. If a value covers the whole project (`.`, the
+  project root or a directory above it), cannot be resolved (`%(prefix)`, an unknown `~user`) or a
+  config cannot be read or parsed (also a tab inside an unquoted value, or a
+  `.git/worktrees/<name>` without a readable `gitdir`: `git worktree prune`), no command runs, the
+  file tools do not write, and the message says why. `/dev/null` turns hooks off and is fine.
+- A command that was given the network has all its processes killed when it ends, detached ones
+  included, so that none keeps that access. Other background processes (a dev server) keep
+  running, still inside the sandbox.
+- In a linked git worktree, also its own git directory and the main repository's `objects`, `refs`
+  and `logs`, so commits work. Config and hooks there stay closed.
+- Reads: everything you can read, except these credential stores in your home directory, which are
+  neither readable nor writable, also through the file tools and where they are symlinks:
+  `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.docker`, `~/.azure`, `~/.netrc`,
+  `~/.git-credentials`, `~/.config/{gh,flywheel,gcloud}`, `~/.npmrc`, `~/.pypirc`,
+  `~/.cargo/credentials*`, `~/.gem/credentials`, `~/.pgpass`, `~/.vault-token`,
+  `~/.m2/settings.xml`, `~/.gradle/gradle.properties`, shell and REPL history files, keychains,
+  cookies and the common browser profiles. **Any file not on that list stays readable**, including
+  other tokens and `.env` files, and its contents can reach the model.
+- Network: none, not even localhost. In an interactive session the model can ask for it for one
+  command; you are asked every time, whatever your "always allow" rules say. One-shot and `bench`
+  cannot grant it. Allowed network is any IP address, not one host.
+- Environment: only `PATH`, `HOME`, `LANG` and `TERM` are passed on; `TMPDIR`, `XDG_CACHE_HOME`,
+  `GOCACHE` and `npm_config_cache` point into the private temporary directory.
+
+What stops working inside it:
+
+- Tools that write under `$HOME`: package caches and global installs (`cargo`, `pip --user`,
+  Gradle and the like). Fetch dependencies yourself first.
+- `git init`, and anything that writes `.git/config` or hooks: `git config`, `git remote add`,
+  `git push -u`, `git branch -u`, hook installers such as husky or `pre-commit install`.
+  Neither can anything that changes a `core.hooksPath` directory, such as editing `.husky/` or a
+  checkout, merge or stash that touches files tracked there. `add`,
+  `commit`, branches and stash work in the project's own repository. Git may report success
+  although the setting was not saved; the tool output says so.
+- `git init`, `clone`, `worktree add` and `submodule add` anywhere below the project, also in
+  `$TMPDIR`, and so tests that make repositories and package installs that clone one (git
+  dependencies) or ship an `.envrc`.
+- Rebase and cherry-pick sequences: the model cannot start, continue or abort a rebase,
+  `git pull --rebase`, `git am` or a cherry-pick or revert of several commits inside the sandbox.
+  You still can, outside it.
+- Removing a directory that holds a nested `.git` or `.envrc` (`rm -rf` removes the
+  rest and leaves the protected files), and
+  `git worktree remove` or `prune`. Renaming the directory around them works.
+- Tools that need a denied file: private registry logins in `~/.npmrc`, `~/.m2/settings.xml`,
+  `~/.gradle/gradle.properties` and the like.
+- `git fetch`/`push` (offline; over SSH it also fails with network approved, as keys and
+  `known_hosts` are unreadable), and Keychain or `gh` credentials.
+- A submodule opened as the project, or a worktree whose link back from the main repository does
+  not match: no commits.
+- New file names with non-ASCII characters in a directory that holds a credential store.
+- Docker, `ssh-agent` and other Unix sockets, local servers and tests that open a port (unless
+  network is approved), `ps`, pseudo-terminals, `open` and AppleScript.
+
+Where it does not protect you:
+
+- Other files inside the project can be changed, including build scripts, `Makefile`,
+  `package.json` and the scripts your hooks call from elsewhere. You or your editor may later run
+  them **outside** the sandbox.
+- Only a `.git` and what is under it is recognized by name. A bare repository under another name,
+  existing or written by hand (`HEAD`, `objects`, `refs`, `config`), can be created and changed
+  by commands (and assembled with the file tools), and git run later inside it obeys it; the same holds for the target of a `.git`
+  link file that points outside any `.git`, for what a nested config or `.envrc` symlink, or nested
+  or submodule hook links, point to, for hard links that already exist, and for new directories
+  under a `.git/modules/<group>/` of submodules with a `/` in their name. In a project that is
+  itself a bare repository, `modules/` is not closed.
+- Links in subdirectories of a hooks directory are not followed: what they point to can be changed.
+- `core.hooksPath` is looked for in the repository the project is in (the first `.git` upward, and
+  any directory that looks bare on the way), its submodules and its linked worktrees. Not in
+  repositories above that one, in other repositories below the project, in the system config
+  of a git installed somewhere unusual, or in `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG_COUNT`.
+- For a linked worktree whose directory is missing, a relative `core.hooksPath` containing `..` is
+  resolved by name and the missing directory itself is not closed: a command may be able to create
+  it as a link and redirect that worktree's hooks. `git worktree prune` removes the stale entry.
+- Started in your home directory (or above it), the sandbox makes all of it writable, except the
+  stores listed above.
+- A store reached through a chain of several symlinks is protected at both ends, but a link in the
+  middle of the chain can be renamed.
+- File tools do not go through the sandbox; they have their own project confinement and refuse the
+  stores and the protected files.
+- **`bench` grading scripts run the code the model wrote, unsandboxed and with your environment.**
+  Run untrusted suites or models in a VM.
+- A background process of a command without network access, or of any command with `--unsafe` or
+  without a sandbox, keeps running after the command ends, also after flywheel exits.
+
+**No sandbox** (Linux, or `sandbox-exec` unavailable, for example inside another sandbox):
+one-shot and `bench` refuse to run unless you pass `--unsafe`. Interactive mode says so and keeps
+asking for approval. `--unsafe` turns the sandbox and the environment filtering off.
 
 **Interactive mode**
 
@@ -137,7 +259,8 @@ run it on an untrusted repository or task outside a container or VM.
   a repository are not trusted. A remembered `npm run`, `go test`, `cargo test` or gate check runs
   whatever the project files contain at that moment, including files the model wrote.
 
-**One-shot and `bench` modes approve everything automatically**, the verification gate included.
+**One-shot and `bench` modes approve everything automatically**, the verification gate included
+(network excepted).
 `tsc` (through `npx`, which uses a project-local binary), `cargo check` (which runs `build.rs`)
 and similar tools execute code from the project.
 
@@ -148,18 +271,22 @@ in every mode. They read the command text only:
   are not inspected.
 - Values of unknown `$VARS`, the output of `$(...)` and arguments fed through `xargs` are not seen.
 - Write checks do not follow symlinks.
-- `/tmp` and `/dev` (except disk devices) are writable.
+- They allow `/tmp` and `/dev` (except disk devices); the sandbox does not.
 - Keeping reads inside the project applies only to the auto-approved built-in commands.
 
 `--allow-outside-writes` is for throwaway containers: commands may write and delete outside the
 working directory, recursively too. `sudo`, the other basic deny rules and recursive `rm` of `/`
-or your home directory stay blocked.
+or your home directory stay blocked. It relaxes only these text rules: on macOS the sandbox still
+applies unless `--unsafe` is also given.
 
 ## Limits
 
 - Text only. The model has vision, but flywheel sends it text only.
 - No API key support. The Linux build has no HTTPS.
 - No context compaction.
+- No sandbox on Linux yet.
+- Detached background processes are found and killed only for sandboxed commands that had the
+  network.
 - Go and Rust gates are experimental.
 - The harness was tuned on the private suite below.
 - Not yet measured against OpenCode with the same model, or against Claude Haiku 5.5 run as an
