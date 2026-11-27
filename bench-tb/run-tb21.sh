@@ -60,7 +60,8 @@ done
 case "$HARNESS" in
   flywheel)
     AGENT_ARGS=(--agent flywheel_agent:FlywheelAgent
-                --ak "engine_url=$ENDPOINT" --ak "fw_model=$MODEL_NAME") ;;
+                --ak "engine_url=$ENDPOINT" --ak "fw_model=$MODEL_NAME"
+                --ak "timeout_multiplier=$TIMEOUT_MULT") ;;
   terminus-2)
     # litellm strips the "openai/" provider prefix, so the engine receives $MODEL_NAME.
     AGENT_ARGS=(--agent terminus-2 --model "openai/$MODEL_NAME"

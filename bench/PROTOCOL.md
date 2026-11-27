@@ -6,10 +6,13 @@ compared with two other harnesses on the same model. The result is published wha
 Status: Terminal-Bench 2.1 preparation only. No scored run has started. Nothing here is a result.
 
 ## Open blockers (resolve before freeze)
-- flywheel time limit: `bench-tb/flywheel_agent.py` stops flywheel after a fixed 900 s
-  (`wall_timeout`), 150 turns (`turn_timeout`) and 180 s per command, whatever the task allows.
-  Task agent timeouts run from 600 s to 12000 s; Terminus 2 and OpenCode get no such flywheel
-  cap, so the harnesses do not have the same time limit. Do not start a scored run until fixed.
+- flywheel time limit (code fixed in FW-TBTIME, not yet smoke-tested): flywheel now gets the
+  task's Harbor agent timeout (task.toml `agent.timeout_sec` x `--timeout-multiplier`, read from
+  `bench-tb/tb21-timeouts.tsv` by task name). Harbor does not pass it to custom agents; only its
+  `asyncio.wait_for` around `run()` enforces it (`harbor/trial/trial.py:784`, `:1724`). flywheel
+  `-W` = budget - 60 s, `-T` 20000 (never binds), `-t` 180 s. Before a scored run: one smoke task
+  must show flywheel exiting before Harbor's kill (`FW_EXIT`, `finish=wall`), and it must be
+  checked whether the kill stops the flywheel process in the container before the verifier runs.
 
 ## Tracks
 1. Terminal-Bench 2.1 through Harbor: all 89 tasks, three harnesses, same local model.
@@ -61,8 +64,12 @@ Cannot match, and to be disclosed with the results:
 - flywheel raises temperature to 0.5 (top_p 0.95) to escape loops. At temperature 0 it sends no
   top_p.
 - OpenCode's title agent keeps its own temperature (0.5).
-- Turn and time limits: flywheel stops at 150 turns and 900 s (see Open blockers); Terminus 2 has
-  no turn limit by default.
+- Time limits: all three harnesses are cut by the same Harbor per-task agent timeout. flywheel's
+  `-W` is a soft stop, checked only between turns and inside model requests, so a command started
+  just before the limit can run up to 180 s (`-t`) more; Harbor's kill is the hard cap. Terminus 2
+  waits at most its per-command duration (default cap 180 s, `harbor/agents/terminus_2/tmux_session.py:792`)
+  and has no turn limit by default. flywheel's 20000-turn limit (`-T`) is not expected to bind.
+  OpenCode's own bash timeout is not in Harbor's source and is not checked yet.
 - OpenCode automatic context compaction is off (context limit set to 0). Each harness otherwise
   keeps its own context handling, prompts and tool set.
 - The Terminus 2 and OpenCode behaviour above was checked in their source and the resolved Harbor
