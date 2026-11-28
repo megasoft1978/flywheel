@@ -824,6 +824,42 @@ static void test_clipboard(void) {
     T("linux: bytes and name", p.size == sizeof TINY && p.source && !strcmp(p.source, "clipboard"));
     image_part_free(&p);
 
+    /* too much output, or no end to it: said, and the next tool is not tried */
+    script("wl-paste", "#!/bin/sh\nexec /bin/cat /dev/zero\n");
+    time_t t0 = time(NULL);
+    T("linux: endless output", clip(false, &p, err, sizeof err) == CLIP_ERR &&
+                               !strcmp(err, "image is larger than 10 MB") && !p.url);
+    T("linux: endless output stopped early", time(NULL) - t0 < 5);
+    T("linux: endless output, no fallback", !slurp_in("args", args, sizeof args));
+    for (int code = 0; code < 2; code++) {      /* gone before it could be polled */
+        snprintf(body, sizeof body, "#!/bin/sh\n/usr/bin/head -c %d /dev/zero\nexit %d\n",
+                 IMG_FILE_MAX + 1, code);
+        script("wl-paste", body);
+        T("linux: oversized output", clip(false, &p, err, sizeof err) == CLIP_ERR &&
+                                     !strcmp(err, "image is larger than 10 MB"));
+        T("linux: oversized output, no fallback", !slurp_in("args", args, sizeof args));
+    }
+    script("wl-paste", "#!/bin/sh\nexec /bin/sleep 30\n");
+    image_test_clip_s = 1;
+    T("linux: hung tool", clip(false, &p, err, sizeof err) == CLIP_ERR &&
+                          !strcmp(err, "clipboard program timed out") && !p.url);
+    T("linux: hung tool, no fallback", !slurp_in("args", args, sizeof args));
+    image_test_clip_s = 0;
+
+    /* runs in the private directory, with no descriptor of ours beyond 0-2 */
+    snprintf(body, sizeof body,
+             "#!/bin/sh\ncase \"$(pwd -P)\" in */fw-clip-*) ;; *) exit 1;; esac\n"
+             "if { true >&9; } 2>/dev/null; then exit 1; fi\nexec /bin/cat '%s/pic.png'\n", dir);
+    script("wl-paste", body);
+    stub_have[2] = false;
+    int nul = open("/dev/null", O_WRONLY);
+    T("linux: descriptor to leak", nul >= 0 && dup2(nul, 9) == 9);
+    T("linux: own directory, no stray descriptor", clip(false, &p, err, sizeof err) == CLIP_OK);
+    image_part_free(&p);
+    if (nul != 9) close(nul);
+    close(9);
+    stub_have[2] = true;
+
     script("wl-paste", "#!/bin/sh\necho half; echo oops >&2; exit 1\n");
     T("linux: falls back to xclip", clip(false, &p, err, sizeof err) == CLIP_OK);
     slurp_in("args", args, sizeof args);
@@ -842,12 +878,23 @@ static void test_clipboard(void) {
     T("linux: neither tool is named", strstr(err, "wl-paste") && strstr(err, "xclip"));
 
     stub_have[0] = true;
-    snprintf(body, sizeof body, "#!/bin/sh\nfor a; do out=$a; done\nexec /bin/cp '%s/pic.png' \"$out\"\n", dir);
+    snprintf(body, sizeof body,
+             "#!/bin/sh\nfor a; do out=$a; done\n"
+             "[ \"$(pwd -P)\" = \"$(cd \"${out%%/*}\" && pwd -P)\" ] || exit 1\n"
+             "exec /bin/cp '%s/pic.png' \"$out\"\n", dir);
     script("osascript", body);
     T("mac: osascript", clip(true, &p, err, sizeof err) == CLIP_OK && p.size == sizeof TINY);
     image_part_free(&p);
     script("osascript", "#!/bin/sh\nexit 1\n");
     T("mac: no image", clip(true, &p, err, sizeof err) == CLIP_NONE);
+    script("osascript", "#!/bin/sh\nfor a; do out=$a; done\nexec /bin/cat /dev/zero >\"$out\"\n");
+    T("mac: endless output", clip(true, &p, err, sizeof err) == CLIP_ERR &&
+                             !strcmp(err, "image is larger than 10 MB"));
+    script("osascript", "#!/bin/sh\nexec /bin/sleep 30\n");
+    image_test_clip_s = 1;
+    T("mac: hung tool", clip(true, &p, err, sizeof err) == CLIP_ERR &&
+                        !strcmp(err, "clipboard program timed out"));
+    image_test_clip_s = 0;
     stub_have[0] = false;
 
     drop("pic.png");

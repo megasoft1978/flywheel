@@ -1248,8 +1248,19 @@ static bool sends(MicaSession *s, const char *msg, const char *want) {
     return ok;
 }
 
-/* every session here finds a fake osascript first on PATH: the real clipboard
-   is never read */
+/* the same script as wl-paste and xclip, which write the picture to stdout, so
+   a Linux build never reaches the real ones either */
+static void put_linux_clip_stubs(const char *dir, const char *sh) {
+    static const char *const NAMES[2] = {"wl-paste", "xclip"};
+    for (int i = 0; i < 2; i++) {
+        char path[1100];
+        snprintf(path, sizeof path, "%s/%s", dir, NAMES[i]);
+        put_file(path, sh, strlen(sh), 0700);
+    }
+}
+
+/* every session here finds fake osascript, wl-paste and xclip first on PATH: the
+   real clipboard is never read */
 static void image_tests(const char *cmd) {
     char proj[] = "/tmp/fwimg-XXXXXX", outside[] = "/tmp/fwimgbin-XXXXXX";
     assert(mkdtemp(proj) != NULL && mkdtemp(outside) != NULL);
@@ -1270,6 +1281,10 @@ static void image_tests(const char *cmd) {
                      "[ -e '%s' ] && exec /bin/sleep 30\n[ -e '%s' ] && /bin/sleep 2\n"
                      "exec /bin/cp '%s' \"$out\"\n", hang, slow, shot);
     put_file(script, sh, (size_t)n, 0700);
+    snprintf(sh, sizeof sh, "#!/bin/sh\n"
+             "[ -e '%s' ] && exec /bin/sleep 30\n[ -e '%s' ] && /bin/sleep 2\n"
+             "exec /bin/cat '%s'\n", hang, slow, shot);
+    put_linux_clip_stubs(outside, sh);
 
     char full[8192], msg[2048];
     snprintf(full, sizeof full, "unset SSH_CONNECTION SSH_TTY SSH_CLIENT TMUX; "
@@ -1476,7 +1491,7 @@ static void image_tests(const char *cmd) {
 }
 
 /* ---------- ^V, empty paste, image chips and preview ----------
-   A fake osascript is first on PATH. No preview is ever opened: those sessions
+   Fake osascript, wl-paste and xclip are first on PATH. No preview is ever opened: those sessions
    are over SSH or have no usable TMPDIR, so it is refused before a viewer starts. */
 
 static void click_row(MicaSession *s, int row) {
@@ -1503,6 +1518,10 @@ static void clipboard_tests(const char *cmd) {
                      "[ -e '%s' ] && exit 1\n[ -e '%s' ] && /bin/sleep 2\n"
                      "exec /bin/cp '%s' \"$out\"\n", ran, none, slow, shot);
     put_file(script, sh, (size_t)n, 0700);
+    snprintf(sh, sizeof sh, "#!/bin/sh\n: >'%s'\n"
+             "[ -e '%s' ] && exit 1\n[ -e '%s' ] && /bin/sleep 2\n"
+             "exec /bin/cat '%s'\n", ran, none, slow, shot);
+    put_linux_clip_stubs(outside, sh);
 
     char full[8192], msg[2048];
     snprintf(full, sizeof full, "unset SSH_CONNECTION SSH_TTY SSH_CLIENT TMUX; "

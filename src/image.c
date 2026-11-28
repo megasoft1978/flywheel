@@ -279,22 +279,40 @@ static bool make_part(unsigned char *d, size_t n, const char *source, ImagePart 
 
 #define CLIPBOARD_TIMEOUT_S 10
 
-/* One clipboard program, no shell, killed on timeout or abort. Its output goes
-   to the new file out; with none it is discarded (osascript writes its own).
-   True if it exited successfully. */
-static bool run_clip(const char *prog, char *const argv[], const char *out) {
+#ifdef FW_IMAGE_TEST
+int image_test_clip_s;
+#endif
+
+typedef enum { RUN_OK, RUN_FAIL, RUN_TIMEOUT, RUN_TOO_BIG } RunResult;
+
+static bool oversized(const char *path) {
+    struct stat st;
+    return !stat(path, &st) && st.st_size > IMG_FILE_MAX;
+}
+
+/* One clipboard program, no shell, run in dir, killed on timeout, abort or once
+   file passes IMG_FILE_MAX. With to_stdout its output goes to the new file;
+   else it is discarded (osascript writes file itself). */
+static RunResult run_clip(const char *prog, char *const argv[], const char *dir,
+                          const char *file, bool to_stdout) {
+    int limit = CLIPBOARD_TIMEOUT_S;
+#ifdef FW_IMAGE_TEST
+    if (image_test_clip_s) limit = image_test_clip_s;
+#endif
     pid_t pid = fork();
-    if (pid < 0) return false;
+    if (pid < 0) return RUN_FAIL;
     if (pid == 0) {
         int nul = open("/dev/null", O_RDWR);
         if (nul >= 0) { dup2(nul, 0); dup2(nul, 1); dup2(nul, 2); }
-        if (out) {
-            int fd = open(out, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (to_stdout) {
+            int fd = open(file, O_WRONLY | O_CREAT | O_EXCL, 0600);
             if (fd < 0 || dup2(fd, 1) < 0) _exit(126);
         } else {
             unsetenv("LC_ALL");
             setenv("LC_CTYPE", "UTF-8", 1);
         }
+        if (chdir(dir)) _exit(127);
+        for (int k = 3; k < 256; k++) close(k);
         execv(prog, argv);
         _exit(127);
     }
@@ -302,14 +320,17 @@ static bool run_clip(const char *prog, char *const argv[], const char *out) {
     clock_gettime(CLOCK_MONOTONIC, &t0);
     int st = 0;
     pid_t r;
-    while ((r = waitpid(pid, &st, WNOHANG)) == 0 && !g_abort) {
+    bool late = false;
+    while ((r = waitpid(pid, &st, WNOHANG)) == 0 && !g_abort && !oversized(file)) {
         clock_gettime(CLOCK_MONOTONIC, &t);
-        if (t.tv_sec - t0.tv_sec >= CLIPBOARD_TIMEOUT_S) break;
+        if ((late = t.tv_sec - t0.tv_sec >= limit)) break;
         if (fw_tick_hook) fw_tick_hook();
         nanosleep(&nap, NULL);
     }
-    if (r == 0) { kill(pid, SIGKILL); waitpid(pid, &st, 0); return false; }
-    return r == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0;
+    if (r == 0) { kill(pid, SIGKILL); waitpid(pid, &st, 0); }
+    if (oversized(file)) return RUN_TOO_BIG;   /* also if it exited between polls */
+    if (r == 0) return late ? RUN_TIMEOUT : RUN_FAIL;
+    return r == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0 ? RUN_OK : RUN_FAIL;
 }
 
 ClipResult image_from_clipboard(bool mac, ImageFind find, ImagePart *out, char *err, size_t errcap) {
@@ -341,7 +362,12 @@ ClipResult image_from_clipboard(bool mac, ImageFind find, ImagePart *out, char *
             file, NULL};
         char *const wl[] = {"wl-paste", "--no-newline", "--type", "image/png", NULL};
         char *const x[] = {"xclip", "-selection", "clipboard", "-t", "image/png", "-o", NULL};
-        if (run_clip(prog[i], i == 0 ? script : i == 1 ? wl : x, mac ? NULL : file) && !g_abort) {
+        RunResult ran = run_clip(prog[i], i == 0 ? script : i == 1 ? wl : x, dir, file, !mac);
+        if (ran == RUN_TOO_BIG || ran == RUN_TIMEOUT) {
+            fail(err, errcap, ran == RUN_TOO_BIG ? "image is larger than 10 MB"
+                                                 : "clipboard program timed out");
+            res = CLIP_ERR;
+        } else if (ran == RUN_OK && !g_abort) {
             size_t n;
             unsigned char *d = load(file, &n, err, errcap);
             if (!d) res = CLIP_ERR;

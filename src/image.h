@@ -59,5 +59,6 @@ void image_preview_cleanup(void);
 
 #ifdef FW_IMAGE_TEST
 extern int image_test_port;   /* 127.0.0.1:<port> is allowed when nonzero */
+extern int image_test_clip_s; /* clipboard timeout in seconds when nonzero */
 #endif
 #endif
