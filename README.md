@@ -239,7 +239,9 @@ untrusted repository or task in a VM.
   a git config or a dependency's clone URL). Its contents can reach the model.
 - Network: none, not even localhost. In an interactive session the model can ask for it for one
   command; you are asked every time, whatever your "always allow" rules say. One-shot and `bench`
-  cannot grant it. Allowed network is any IP address, not one host.
+  cannot grant it. Allowed network is any IP address, not one host. The request gets its own
+  approval prompt, with No preselected. When commands run without the sandbox, the bottom row
+  shows `NOT SANDBOXED`.
 - Environment: only `PATH`, `HOME`, `LANG` and `TERM` are passed on; `TMPDIR`, `XDG_CACHE_HOME`,
   `GOCACHE` and `npm_config_cache` point into the private temporary directory. A `PATH` entry that
   passes through a link and is, or leads, under your home is passed on as where it leads; entries
