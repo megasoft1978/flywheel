@@ -11,6 +11,8 @@
  *   <suite>/tasks/<id>/prompt.md  task prompt
  *   <suite>/tasks/<id>/starter/   optional, copied into the sandbox
  *   <suite>/<grade_script>        <id> <files_dir> -> one JSON line on stdout
+ *     run under the command sandbox unless --unsafe: it reads the suite, gets a
+ *     copy of the collected files and writes only in its cwd and $TMPDIR
  *
  * results: <suite>/runs/<tag>/{summary.json,<id>/{prompt.md,transcript.jsonl,files/}}
  */
@@ -21,6 +23,12 @@
 #include <time.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+
+/* bounds on what is collected from a task: the model made it */
+#define COLLECT_MAX_DEPTH 64            /* directories, one stack frame each */
+#define COLLECT_MAX_FILE  (64 << 20)    /* bytes */
+#define COLLECT_MAX_TOTAL (256 << 20)
 
 /* ---------- small fs helpers ---------- */
 
@@ -42,21 +50,33 @@ static void mkdirs(const char *p) {
     mkdir(tmp, 0755);
 }
 
+/* what is left of in, at most *limit bytes, and the mode in st, to out;
+   *limit goes down by what was read. -1 on an error or an abort. */
+static int copy_fd(int in, const struct stat *st, int out, long long *limit) {
+    char buf[65536];
+    ssize_t n;
+    int rc = 0;
+    while (!rc && *limit > 0) {
+        if (g_abort) { rc = -1; break; }
+        size_t want = *limit < (long long)sizeof buf ? (size_t)*limit : sizeof buf;
+        if ((n = read(in, buf, want)) == 0) break;
+        if (n < 0) { rc = -1; break; }
+        *limit -= n;
+        for (ssize_t off = 0, w; off < n; off += w)
+            if ((w = write(out, buf + off, (size_t)(n - off))) <= 0) { rc = -1; break; }
+    }
+    if (fchmod(out, st->st_mode & 07777)) rc = -1;
+    return rc;
+}
+
 int fw_copy_file(const char *src, const char *dst) {
     int in = open(src, O_RDONLY);
     if (in < 0) return -1;
     struct stat st;
     int out = fstat(in, &st) ? -1 : open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (out < 0) { close(in); return -1; }
-    char buf[65536];
-    ssize_t n;
-    int rc = 0;
-    while (!rc && (n = read(in, buf, sizeof buf)) != 0) {
-        if (n < 0) { rc = -1; break; }
-        for (ssize_t off = 0, w; off < n; off += w)
-            if ((w = write(out, buf + off, (size_t)(n - off))) <= 0) { rc = -1; break; }
-    }
-    if (fchmod(out, st.st_mode & 07777)) rc = -1;
+    long long all = LLONG_MAX;
+    int rc = copy_fd(in, &st, out, &all);
     close(in);
     if (close(out)) rc = -1;
     return rc;
@@ -125,9 +145,9 @@ static bool in_list(cJSON *arr, const char *s) {
 
 /* ---------- sandbox ---------- */
 
-static void setup_sandbox(const char *suite, const char *tid, const Manifest *m, char *out, size_t cap) {
+static bool setup_sandbox(const char *suite, const char *tid, const Manifest *m, char *out, size_t cap) {
     char tmpl[] = "/tmp/fwbench-XXXXXX";
-    if (!mkdtemp(tmpl)) { snprintf(out, cap, "/tmp/fwbench-fail"); return; }
+    if (!mkdtemp(tmpl)) return false;
     snprintf(out, cap, "%s", tmpl);
     char src[1400], dst[1400], cmd[2800];
     cJSON *it;
@@ -146,21 +166,34 @@ static void setup_sandbox(const char *suite, const char *tid, const Manifest *m,
     }
     snprintf(src, sizeof src, "%s/tasks/%s/starter", suite, tid);
     if (is_dir(src)) copy_tree(src, out);
+    return true;
+}
+
+static void remove_tree(const char *dir) {
+    char rm[1400];
+    snprintf(rm, sizeof rm, "rm -rf \"%s\"", dir);
+    system(rm);
 }
 
 /* collect deliverables: recursive copy with skip rules (mirrors suite.py) */
-static void collect_rec(const char *root, const char *rel, const char *dest, const Manifest *m) {
-    char dir[1400];
-    snprintf(dir, sizeof dir, "%s%s%s", root, rel[0] ? "/" : "", rel);
-    DIR *d = opendir(dir);
-    if (!d) return;
+/* Takes over dfd, the directory rel of the task, depth levels down; *left is
+   what may still be copied. A process the model left behind
+   can still be swapping entries for links: each one is opened without following,
+   checked and copied through that descriptor, never by its path again. */
+static void collect_rec(int dfd, const char *rel, const char *dest, const Manifest *m,
+                        int depth, long long *left) {
+    if (depth >= COLLECT_MAX_DEPTH) {
+        if (dfd >= 0) close(dfd);
+        fprintf(stderr, "bench: directories nested %d deep, not collected below\n", depth);
+        return;
+    }
+    DIR *d = dfd < 0 ? NULL : fdopendir(dfd);
+    if (!d) { if (dfd >= 0) close(dfd); return; }
     struct dirent *e;
-    while ((e = readdir(d))) {
+    while (!g_abort && (e = readdir(d))) {
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
         char cr[1400];
         snprintf(cr, sizeof cr, "%s%s%s", rel, rel[0] ? "/" : "", e->d_name);
-        char fp[1400];
-        snprintf(fp, sizeof fp, "%s/%s", root, cr);
         /* first path component in skip list? */
         char first[512];
         snprintf(first, sizeof first, "%s", cr);
@@ -168,46 +201,79 @@ static void collect_rec(const char *root, const char *rel, const char *dest, con
         if (slash) *slash = 0;
         if (in_list(m->skip, first)) continue;
         /* model-made links point anywhere: neither followed nor collected */
+        int in = openat(dirfd(d), e->d_name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+        if (in < 0) continue;
         struct stat st;
-        if (lstat(fp, &st)) continue;
-        if (S_ISDIR(st.st_mode)) { collect_rec(root, cr, dest, m); continue; }
-        if (!S_ISREG(st.st_mode)) continue;
-        if (strstr(e->d_name, ".test.") || strstr(e->d_name, ".spec.")) continue;
-        char dp[1400];
-        snprintf(dp, sizeof dp, "%s/%s", dest, cr);
-        char dpar[1400];
-        snprintf(dpar, sizeof dpar, "%s", dp);
-        char *ls = strrchr(dpar, '/');
-        if (ls) { *ls = 0; mkdirs(dpar); }
-        fw_copy_file(fp, dp);
+        if (fstat(in, &st)) { close(in); continue; }
+        if (S_ISDIR(st.st_mode)) { collect_rec(in, cr, dest, m, depth + 1, left); continue; }
+        if (S_ISREG(st.st_mode) && !strstr(e->d_name, ".test.") && !strstr(e->d_name, ".spec.")) {
+            if (st.st_size > COLLECT_MAX_FILE || st.st_size > *left) {
+                char *safe = clean_text(cr, false, false);   /* the model's name */
+                for (char *p = safe; *p; p++) if (*p == '\n') *p = ' ';
+                fprintf(stderr, "bench: %s is too large, not collected\n", safe);
+                free(safe);
+                close(in);
+                continue;
+            }
+            char dp[1400];
+            snprintf(dp, sizeof dp, "%s/%s", dest, cr);
+            char dpar[1400];
+            snprintf(dpar, sizeof dpar, "%s", dp);
+            char *ls = strrchr(dpar, '/');
+            if (ls) { *ls = 0; mkdirs(dpar); }
+            int out = open(dp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            if (out >= 0) {
+                long long n = st.st_size;   /* growth after the check is left out */
+                copy_fd(in, &st, out, &n);
+                *left -= st.st_size - n;
+                close(out);
+            }
+        }
+        close(in);
     }
     closedir(d);
 }
 
 /* ---------- grading ---------- */
 
+/* The script's stdout and stderr; the script, which runs the model's code, is
+   sandboxed unless --unsafe, with a copy of the collected files to work on. */
+static void run_grade(const char *suite, const char *script, const char *tid,
+                      const char *files, int timeout, char **out, char **err) {
+    char sp[1400];
+    snprintf(sp, sizeof sp, "%s/%s", suite, script);
+    if (g_abort) {   /* what was collected may be partial, and nothing new starts */
+        *err = str_dup("aborted — not graded");
+        return;
+    }
+    if (g_cfg.unsafe) {
+        run_script(sp, tid, files, NULL, NULL, timeout, out, err);
+        return;
+    }
+    char work[] = "/tmp/fwgrade-XXXXXX";
+    if (!mkdtemp(work)) {
+        *err = str_dup("error: cannot create the grading directory — not graded");
+        return;
+    }
+    char copy[64];
+    snprintf(copy, sizeof copy, "%s/files", work);
+    mkdirs(copy);
+    copy_tree(files, copy);
+    /* the script gets another cwd: no relative paths */
+    char *root = realpath(suite, NULL), *full = realpath(sp, NULL);
+    if (!root || !full) *err = str_dup("error: cannot find the grade script");
+    else if (!run_script(full, tid, copy, work, root, timeout, out, err))
+        fprintf(stderr, "bench: %s\n", *err);
+    free(root);
+    free(full);
+    remove_tree(work);
+}
+
 /* runs grade script, returns parsed JSON result object (owned) — never NULL */
 static cJSON *grade_task(const char *suite, const char *script, const char *tid,
                          const char *files, int timeout) {
-    char sp[1400], errf[1400], cmd[3200];
-    snprintf(sp, sizeof sp, "%s/%s", suite, script);
-    snprintf(errf, sizeof errf, "/tmp/fwbench-grade-err-%d", getpid());
-    snprintf(cmd, sizeof cmd,
-        "perl -e 'alarm %d; exec @ARGV' bash \"%s\" \"%s\" \"%s\" 2>\"%s\"",
-        timeout, sp, tid, files, errf);
-    FILE *pp = popen(cmd, "r");
-    char *out = NULL;
-    size_t cap = 0, len = 0;
-    if (pp) {
-        char buf[4096];
-        size_t n;
-        while ((n = fread(buf, 1, sizeof buf, pp))) {
-            if (len + n + 1 > cap) { cap = (len + n + 1) * 2; out = realloc(out, cap); }
-            memcpy(out + len, buf, n); len += n;
-        }
-        pclose(pp);
-    }
-    if (out) out[len] = 0;
+    char *out = NULL, *errc = NULL;
+    run_grade(suite, script, tid, files, timeout, &out, &errc);
     /* last line starting with '{' */
     cJSON *res = NULL;
     if (out) {
@@ -221,22 +287,20 @@ static cJSON *grade_task(const char *suite, const char *script, const char *tid,
         }
     }
     if (!res) {
-        char *errc = read_file(errf);
         res = cJSON_CreateObject();
         cJSON_AddStringToObject(res, "id", tid);
         cJSON_AddBoolToObject(res, "tsc_ok", 0);
         cJSON_AddNumberToObject(res, "tsc_errors", 0);
         cJSON_AddNumberToObject(res, "tests_total", 0);
         cJSON_AddNumberToObject(res, "tests_passed", 0);
-        const char *tail = errc ? errc : (out ? out : "");
+        const char *tail = errc && *errc ? errc : (out ? out : "");
         size_t tl = strlen(tail);
         char snippet[301];
         snprintf(snippet, sizeof snippet, "%.300s", tail + (tl > 300 ? tl - 300 : 0));
         cJSON_AddStringToObject(res, "first_failure", snippet);
-        free(errc);
     }
     free(out);
-    unlink(errf);
+    free(errc);
     /* full_pass */
     cJSON *tt = cJSON_GetObjectItemCaseSensitive(res, "tests_total");
     cJSON *tp = cJSON_GetObjectItemCaseSensitive(res, "tests_passed");
@@ -244,6 +308,9 @@ static cJSON *grade_task(const char *suite, const char *script, const char *tid,
     int total = cJSON_IsNumber(tt) ? tt->valueint : 0;
     int passed = cJSON_IsNumber(tp) ? tp->valueint : 0;
     bool tsc = cJSON_IsTrue(ts);
+    /* computed here only: a script may print the key more than once */
+    while (cJSON_GetObjectItemCaseSensitive(res, "full_pass"))
+        cJSON_DeleteItemFromObjectCaseSensitive(res, "full_pass");
     cJSON_AddBoolToObject(res, "full_pass", total > 0 && passed == total && tsc);
     return res;
 }
@@ -316,7 +383,11 @@ int fw_do_bench(int argc, char **argv) {
         if (!prompt) { fprintf(stderr, "bench: no prompt for %s, skipping\n", tid); continue; }
 
         char sb[1400];
-        setup_sandbox(suite, tid, &m, sb, sizeof sb);
+        if (!setup_sandbox(suite, tid, &m, sb, sizeof sb)) {
+            fprintf(stderr, "bench: no directory for %s, skipping\n", tid);
+            free(prompt);
+            continue;
+        }
 
         char td[1400];
         snprintf(td, sizeof td, "%s/%s", rundir, tid);
@@ -364,7 +435,8 @@ int fw_do_bench(int argc, char **argv) {
         char fdir[1400];
         snprintf(fdir, sizeof fdir, "%s/files", td);
         mkdirs(fdir);
-        collect_rec(sb, "", fdir, &m);
+        long long left = COLLECT_MAX_TOTAL;
+        collect_rec(open(sb, O_RDONLY | O_DIRECTORY | O_NOFOLLOW), "", fdir, &m, 0, &left);
         cJSON *res = grade_task(suite, m.grade_script, tid, fdir, m.grade_timeout);
 
         /* summary entry, python-compatible shape */
@@ -411,9 +483,7 @@ int fw_do_bench(int argc, char **argv) {
         fflush(stdout);
 
         /* cleanup sandbox */
-        char rm[1400];
-        snprintf(rm, sizeof rm, "rm -rf \"%s\"", sb);
-        system(rm);
+        remove_tree(sb);
         free(prompt);
         if (g_abort) { fprintf(stderr, "bench: aborted\n"); break; }
     }

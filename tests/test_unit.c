@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -809,6 +810,7 @@ static void test_agent_strict(void) {
 /* run ./flywheel, stdout on a pty or a pipe; returns what it printed */
 static int run_status;   /* exit code of the last run */
 
+static unsigned run_limit = 20;   /* seconds a run may take */
 static char *run_flywheel(bool tty, char *const *argv) {
     static char out[65536];
     int rd = -1, wr = -1, fds[2];
@@ -821,7 +823,7 @@ static char *run_flywheel(bool tty, char *const *argv) {
     fflush(stdout);
     pid_t pid = fork();
     if (!pid) {
-        alarm(20);
+        alarm(run_limit);
         int nul = open("/dev/null", O_RDWR);
         dup2(nul, 0); dup2(wr, 1); dup2(nul, 2);
         close(rd); close(wr);
@@ -2383,6 +2385,286 @@ static void test_sandbox_escapes(void) {
     free(oldhome);
 }
 
+/* bench runs the grade script, and so the model's code, under the sandbox */
+static void test_bench_grader(void) {
+    char tmpl[] = "/tmp/fwgrdXXXXXX", base[PATH_MAX], home[PATH_MAX], suite[PATH_MAX + 8];
+    if (!mkdtemp(tmpl) || !realpath(tmpl, base)) { T("mkdtemp", false); return; }
+    int port, ls = listener(&port);
+    snprintf(home, sizeof home, "%s/home", base);
+    mkdir(home, 0700);
+    char *oldhome = str_dup(getenv("HOME"));
+    setenv("HOME", home, 1);
+    /* under the home directory: the grader must still be able to read its suite */
+    snprintf(suite, sizeof suite, "%s/home/suite", base);
+    mkdir(suite, 0700);
+    put(under(home, ".ssh/key"), "TOPSECRET");
+    put(under(suite, "tasks/t1/prompt.md"), "hi\n");
+    put(under(suite, "tasks/slow/prompt.md"), "hi\n");
+    put(under(suite, "hidden.txt"), "expected\n");
+    put(under(suite, "runs/tg/other/result"), "genuine");
+    put(under(suite, "suite.json"), "{\"grade_timeout\":3}");
+    char script[6000];
+    snprintf(script, sizeof script,
+        "tid=$1 files=$2\n"
+        "suite=$(cd \"$(dirname \"$0\")\" && pwd)\n"
+        "if [ \"$tid\" = slow ]; then\n"
+        "  sleep 30 & echo \"{\\\"tests_total\\\":1,\\\"bg\\\":$!}\"; wait; exit\n"
+        "fi\n"
+        "n=0\n"
+        "grep -q expected \"$suite/hidden.txt\" && n=$((n+1))\n"
+        "grep -q ok \"$files/answer.txt\" && n=$((n+1))\n"
+        "echo w > \"$TMPDIR/w\" && echo f > \"$files/scratch\" && n=$((n+1))\n"
+        "echo x > \"$suite/planted\"\n"
+        "echo '#x' >> \"$0\"\n"
+        "echo forged > \"$suite/runs/tg/other/result\"\n"
+        "echo x > \"$suite/runs/tg/t1/files/planted\"\n"
+        "echo x > '%s/outside'\n"
+        "echo x > \"$HOME/planted\"\n"
+        "secret=$(cat \"$HOME/.ssh/key\")\n"
+        "(exec 3<>/dev/tcp/127.0.0.1/%d)\n"
+        "bg=$(perl -MPOSIX -e '$p = fork; if ($p) { print $p; exit } setsid;"
+        " close STDOUT; close STDERR; sleep 30')\n"
+        "echo \"{\\\"tsc_ok\\\":true,\\\"tests_total\\\":3,\\\"tests_passed\\\":$n,"
+        "\\\"bg\\\":$bg,\\\"first_failure\\\":\\\"secret=$secret\\\"}\"\n",
+        base, port);
+    put(under(suite, "run_task.sh"), script);
+
+    bench_call = "{\"command\":\"echo ok > answer.txt\"}";
+    pid_t srv = serve(reply_bench);   /* replaces g_cfg.endpoint: build argv after */
+    char *bv[] = {"flywheel", "-e", g_cfg.endpoint, "-T", "3", "bench", suite, "tg", "t1", NULL};
+    run_flywheel(false, bv);
+    stop(srv);
+    char *sum = slurp(under(suite, "runs/tg/summary.json"));
+    T("grader: reads suite and files, writes its own dirs",
+      sum && strstr(sum, "\"tests_passed\":\t3") && strstr(sum, "\"full_pass\":\ttrue"));
+    T("grader: fake-HOME secret unreadable", sum && !strstr(sum, "TOPSECRET"));
+    char *bg = sum ? strstr(sum, "\"bg\":") : NULL;
+    int bgpid = bg ? atoi(bg + 5) : 0;
+    usleep(200000);
+    T("grader: detached process killed", bgpid > 1 && kill(bgpid, 0) != 0);
+    if (bgpid > 1) kill(bgpid, SIGKILL);
+    free(sum);
+    T("grader: suite not writable", access(under(suite, "planted"), F_OK) != 0);
+    char *now = slurp(under(suite, "run_task.sh"));
+    T("grader: script unchanged", now && !strcmp(now, script));
+    free(now);
+    T("grader: other results unchanged", holds(under(suite, "runs/tg/other/result"), "genuine"));
+    T("grader: collected files unchanged",
+      access(under(suite, "runs/tg/t1/files/planted"), F_OK) != 0
+      && access(under(suite, "runs/tg/t1/files/scratch"), F_OK) != 0);
+    T("grader: nothing written outside", access(under(base, "outside"), F_OK) != 0);
+    T("grader: HOME not writable", access(under(home, "planted"), F_OK) != 0);
+    struct pollfd pf = {.fd = ls, .events = POLLIN};
+    T("grader: no network", poll(&pf, 1, 100) == 0);
+
+    unlink(under(suite, "runs/tg/summary.json"));   /* only this run's counts */
+    srv = serve(reply_bench);
+    bv[2] = g_cfg.endpoint;
+    bv[8] = "slow";
+    time_t t0 = time(NULL);
+    run_flywheel(false, bv);
+    stop(srv);
+    T("grader: grade_timeout kept", time(NULL) - t0 < 15);
+    sum = slurp(under(suite, "runs/tg/summary.json"));
+    bg = sum ? strstr(sum, "\"bg\":") : NULL;
+    bgpid = bg ? atoi(bg + 5) : 0;
+    usleep(200000);
+    T("grader: timeout kills its processes", bgpid > 1 && kill(bgpid, 0) != 0);
+    if (bgpid > 1) kill(bgpid, SIGKILL);
+    free(sum);
+
+    close(ls);
+    setenv("HOME", oldhome, 1);
+    free(oldhome);
+}
+
+/* a detached process left by the model swaps files and directories for links
+   while bench collects: nothing from HOME may be copied into the results */
+static void test_bench_collect_race(void) {
+    char tmpl[] = "/tmp/fwraceXXXXXX", base[PATH_MAX], home[PATH_MAX + 8], suite[PATH_MAX + 8];
+    char cmd[3 * PATH_MAX];
+    if (!mkdtemp(tmpl) || !realpath(tmpl, base)) { T("mkdtemp", false); return; }
+    snprintf(home, sizeof home, "%s/home", base);
+    snprintf(suite, sizeof suite, "%s/suite", base);
+    mkdir(home, 0700);
+    mkdir(suite, 0700);
+    char *oldhome = str_dup(getenv("HOME"));
+    setenv("HOME", home, 1);
+    put(under(home, ".ssh/key"), "TOPSECRET");
+    put(under(suite, "tasks/t1/prompt.md"), "hi\n");
+    put(under(suite, "run_task.sh"), "echo '{}'\n");
+    put(under(suite, "tasks/t1/starter/swap.pl"),
+        "use POSIX;\n"
+        "my $h = shift;\n"
+        "open F, '>', 'm0'; print F 'decoy'; close F;\n"
+        "for (1..60) { mkdir 'p'; chdir 'p' }\n"
+        "sub plain { open F, '>', 'r'; print F 'decoy'; close F; rename 'r', $_[0] }\n"
+        "for (1..3) { mkdir \"d$_\"; plain(\"f$_\"); plain(\"d$_/key\") }\n"
+        "if (fork) { select undef, undef, undef, 0.3; exit }\n"
+        "setsid; close STDIN; close STDOUT; close STDERR;\n"
+        "my $end = time + 4;\n"
+        "while (time < $end) {\n"
+        "  for (1..3) { symlink \"$h/.ssh/key\", 'l'; rename 'l', \"f$_\";\n"
+        "    rename \"d$_\", \"k$_\"; symlink \"$h/.ssh\", \"d$_\" }\n"
+        "  for (1..3) { plain(\"f$_\"); unlink \"d$_\"; rename \"k$_\", \"d$_\" }\n"
+        "}\n");
+    snprintf(cmd, sizeof cmd, "{\"command\":\"perl swap.pl '%s'\"}", home);
+    bench_call = cmd;
+    char files[PATH_MAX + 32], grep[2 * PATH_MAX], rm[2 * PATH_MAX];
+    snprintf(files, sizeof files, "%s/runs/tg/t1/files", suite);
+    snprintf(grep, sizeof grep, "grep -rq TOPSECRET '%s'", files);
+    snprintf(rm, sizeof rm, "rm -rf '%s'", files);
+    bool leaked = false, collected = true;
+    for (int i = 0; i < 25 && !leaked; i++) {
+        pid_t srv = serve(reply_bench);
+        char *bv[] = {"flywheel", "-e", g_cfg.endpoint, "-T", "3", "bench", suite, "tg", "t1", NULL};
+        run_flywheel(false, bv);
+        stop(srv);
+        collected = collected && holds(under(suite, "runs/tg/t1/files/m0"), "decoy");
+        leaked = !system(grep);
+        T("bench race: clean up", !system(rm));
+    }
+    T("bench race: files collected", collected);
+    T("bench race: no secret in the results", !leaked);
+    setenv("HOME", oldhome, 1);
+    free(oldhome);
+}
+
+/* run bench on a task whose command is the given perl script; suite gets the
+   new suite directory. true if bench got to its last line */
+static bool bench_perl(char *suite, const char *script) {
+    char tmpl[] = "/tmp/fwlimXXXXXX";
+    if (!mkdtemp(tmpl) || !realpath(tmpl, suite)) { *suite = 0; return false; }
+    put(under(suite, "tasks/t1/prompt.md"), "hi\n");
+    put(under(suite, "run_task.sh"), "echo '{}'\n");
+    put(under(suite, "tasks/t1/starter/make.pl"), script);
+    bench_call = "{\"command\":\"perl make.pl\"}";
+    pid_t srv = serve(reply_bench);
+    char *bv[] = {"flywheel", "-e", g_cfg.endpoint, "-T", "3", "bench", suite, "tg", "t1", NULL};
+    char *out = run_flywheel(false, bv);
+    stop(srv);
+    return strstr(out, "tg DONE tasks=1") != NULL;
+}
+
+static void bench_perl_done(const char *suite) {
+    char rm[PATH_MAX + 16];
+    snprintf(rm, sizeof rm, "rm -rf '%s'", suite);
+    if (*suite) T("bench limits: clean up", !system(rm));
+}
+
+/* what the model leaves cannot crash the collection or fill the disk */
+static void test_bench_collect_limits(void) {
+    char suite[PATH_MAX];
+    run_limit = 180;   /* macOS makes and removes deep trees slowly */
+    bool done = bench_perl(suite,
+        "open F, '>', 'shallow'; print F 'ok'; close F;\n"
+        "for (1..3000) { mkdir 'p' or die; chdir 'p' or die;\n"
+        "  if ($_ == 70) { open F, '>', 'past'; close F } }\n"
+        "open F, '>', 'bottom'; close F;\n");
+    run_limit = 20;
+    T("bench deep tree: bench finishes", done);
+    T("bench deep tree: shallow file collected",
+      holds(under(suite, "runs/tg/t1/files/shallow"), "ok"));
+    char deep[PATH_MAX + 256];
+    int n = snprintf(deep, sizeof deep, "%s/runs/tg/t1/files", suite);
+    for (int i = 0; i < 64; i++) n += snprintf(deep + n, sizeof deep - (size_t)n, "/p");
+    T("bench deep tree: depth capped", access(deep, F_OK) != 0);
+    bench_perl_done(suite);
+
+    done = bench_perl(suite,
+        "open F, '>', 'small'; print F 'ok'; close F;\n"
+        "open F, '>', 'big'; truncate F, 1 << 30 or die; close F;\n");
+    T("bench huge file: bench finishes", done);
+    T("bench huge file: sibling collected", holds(under(suite, "runs/tg/t1/files/small"), "ok"));
+    T("bench huge file: not collected", access(under(suite, "runs/tg/t1/files/big"), F_OK) != 0);
+    bench_perl_done(suite);
+}
+
+/* the work directory of the grader of the suite named by mark, and its processes */
+static bool find_grader(const char *mark, char *work, size_t cap, int *sh, int *child) {
+    DIR *d = opendir("/tmp");
+    struct dirent *e;
+    bool found = false;
+    while (d && !found && (e = readdir(d))) {
+        if (strncmp(e->d_name, "fwgrade-", 8)) continue;
+        snprintf(work, cap, "/tmp/%s", e->d_name);
+        char *s = slurp(under(work, "pid"));
+        found = s && strstr(s, mark) && sscanf(s, "%d %d", sh, child) == 2;
+        free(s);
+    }
+    if (d) closedir(d);
+    return found;
+}
+
+/* a signal that ends bench ends the grader with it; full_pass is bench's own */
+static void test_bench_signals(void) {
+    char tmpl[] = "/tmp/fwsigXXXXXX", suite[PATH_MAX];
+    if (!mkdtemp(tmpl) || !realpath(tmpl, suite)) { T("mkdtemp", false); return; }
+    put(under(suite, "tasks/t1/prompt.md"), "hi\n");
+    put(under(suite, "tasks/dup/prompt.md"), "hi\n");
+    put(under(suite, "suite.json"), "{\"grade_timeout\":60}");
+    put(under(suite, "run_task.sh"),
+        "if [ \"$1\" = dup ]; then\n"
+        "  echo '{\"tests_total\":1,\"full_pass\":true,\"full_pass\":true,\"full_pass\":true}'\n"
+        "  exit\n"
+        "fi\n"
+        "sleep 30 & echo \"$$ $! $0\" > pid.new; mv pid.new pid; wait\n");
+    bench_call = "{\"command\":\"echo ok > answer.txt\"}";
+
+    pid_t srv = serve(reply_bench);
+    char *dv[] = {"flywheel", "-e", g_cfg.endpoint, "-T", "3", "bench", suite, "tg", "dup", NULL};
+    run_flywheel(false, dv);
+    stop(srv);
+    char *sum = slurp(under(suite, "runs/tg/summary.json"));
+    T("grader: every full_pass of the script dropped",
+      sum && strstr(sum, "\"full_pass\":\tfalse") && !strstr(sum, "\"full_pass\":\ttrue"));
+    free(sum);
+
+    static const int sigs[] = {SIGHUP, SIGTERM, SIGQUIT};
+    static const char *const names[] = {"SIGHUP", "SIGTERM", "SIGQUIT"};
+    for (int i = 0; i < 3; i++) {
+        srv = serve(reply_bench);
+        char *bv[] = {"flywheel", "-e", g_cfg.endpoint, "-T", "3", "bench", suite, "tg", "t1", NULL};
+        fflush(stdout);
+        pid_t bench = fork();
+        if (!bench) {
+            signal(sigs[i], SIG_DFL);   /* the tests may run with it ignored */
+            alarm(40);
+            int nul = open("/dev/null", O_RDWR);
+            dup2(nul, 0); dup2(nul, 1); dup2(nul, 2);
+            const char *bin = getenv("FW_BIN");
+            execv(bin ? bin : "./flywheel", bv);
+            _exit(127);
+        }
+        char work[PATH_MAX];
+        int sh = 0, child = 0, st = 0;
+        bool up = false, ended = false;
+        for (int w = 0; w < 1000 && !(up = find_grader(suite, work, sizeof work, &sh, &child)); w++)
+            usleep(10000);
+        kill(bench, sigs[i]);
+        for (int w = 0; w < 500 && !(ended = waitpid(bench, &st, WNOHANG) == bench); w++)
+            usleep(10000);
+        if (!ended) { kill(bench, SIGKILL); waitpid(bench, &st, 0); }
+        stop(srv);
+        usleep(200000);
+        bool procs = up && sh > 1 && child > 1 && kill(sh, 0) != 0 && kill(child, 0) != 0;
+        bool no_work = up && access(work, F_OK) != 0;
+        char name[96];
+        snprintf(name, sizeof name, "bench %s: grader started", names[i]);
+        T(name, up);
+        snprintf(name, sizeof name, "bench %s: grader processes gone", names[i]);
+        T(name, procs);
+        snprintf(name, sizeof name, "bench %s: grading directory removed", names[i]);
+        T(name, no_work);
+        if (up && !procs) { kill(sh, SIGKILL); kill(child, SIGKILL); }
+        if (up && !no_work) {
+            char rm[PATH_MAX + 16];
+            snprintf(rm, sizeof rm, "rm -rf '%s'", work);
+            T("bench signal: clean up", !system(rm));
+        }
+    }
+}
+
 /* outside the sandbox: set up a fixture with a shell script */
 static void host(const char *dir, const char *script) {
     char cmd[6000];
@@ -3808,6 +4090,21 @@ static void test_fail_closed(void) {
     sbx_answer = false;
     T("no sandbox: interactive still asks", agent_bash(args, &ask, "user denied") && sbx_asks == 1);
     T("no sandbox: denied command did not run", access(p, F_OK) != 0);
+    char script[300], *out, *err;
+    snprintf(script, sizeof script, "%s/grade.sh", dir);
+    FILE *f = fopen(script, "w");
+    if (f) { fputs("touch \"$1\"\necho ran\n", f); fclose(f); }
+    T("no sandbox: grader refused",
+      !run_script(script, p, "", dir, dir, 5, &out, &err) && !out && err && access(p, F_OK));
+    free(err);
+    g_cfg.unsafe = true;
+    T("no sandbox: --unsafe grades",
+      run_script(script, p, "", NULL, NULL, 5, &out, &err) && out && !strcmp(out, "ran\n")
+      && !access(p, F_OK));
+    free(out);
+    free(err);
+    unlink(p);
+    g_cfg.unsafe = false;
     g_cfg.unsafe = true;
     new_task(&m);
     run_agent(&m, "tool_calls", 1, calls, 1, &oneshot);
@@ -3893,6 +4190,10 @@ int main(void) {
         test_hooks_path();
         test_sandbox();
         test_sandbox_escapes();
+        test_bench_grader();
+        test_bench_collect_race();
+        test_bench_collect_limits();
+        test_bench_signals();
         test_nested_git();
         test_linked_worktree();
         test_home_reads();

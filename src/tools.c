@@ -1129,18 +1129,20 @@ void utf8_sanitize(char *s) {
 }
 
 #define OUT_CAP (32 * 1024)
+#define SCRIPT_CAP (1024 * 1024)
 
-/* Read until EAGAIN/EOF or max_reads. buf stays bounded: once full, keep the
+/* Read until EAGAIN/EOF or max_reads. buf stays within cap: once full, keep the
    head and the newest tail. Returns true if data may still be waiting. */
-static bool drain_pipe(int fd, char *buf, size_t *len, int max_reads) {
+static bool drain_pipe(int fd, char *buf, size_t *len, size_t cap, int max_reads) {
     for (int i = 0; i < max_reads; i++) {
         char tmp[8192];
         ssize_t r = read(fd, tmp, sizeof tmp);
         if (r < 0 && errno == EINTR) continue;
         if (r <= 0) return false;
-        if (*len + (size_t)r > OUT_CAP) {
-            memmove(buf + 4096, buf + *len - 8192, 8192);
-            *len = 4096 + 8192;
+        if (*len + (size_t)r > cap) {
+            size_t head = cap / 8, tail = cap / 4;
+            memmove(buf + head, buf + *len - tail, tail);
+            *len = head + tail;
         }
         memcpy(buf + *len, tmp, (size_t)r);
         *len += (size_t)r;
@@ -2305,7 +2307,7 @@ static bool module_dir(const char *proj, char home[4][PATH_MAX], int n, char *mo
 }
 
 static bool sb_home_reads(Sb *b, const Areas *areas, const char *proj, const char *tmp,
-                          const Linked *linked) {
+                          const Linked *linked, const char *ro) {
     char home[4][PATH_MAX];
     int n = homes(home);
     if (n < 0) return false;
@@ -2327,6 +2329,7 @@ static bool sb_home_reads(Sb *b, const Areas *areas, const char *proj, const cha
             sb_read(&r, linked->common, false);
         }
         if (module) sb_read(&r, mod, false);
+        if (ro) sb_read(&r, ro, false);
         for (int i = 0; i < n; i++)
             sb_read(&r, home[i], false);        /* itself only ever looked up */
         if (!each_home_read(&r, proj, home, n)) return false;
@@ -2487,8 +2490,9 @@ static void sb_names(Sb *b, const char *proj, bool repo, const char *other) {
 }
 
 /* malloc'd profile, NULL if it cannot be built whole: the command is then not
-   run. tmp and mark may be NULL. */
-static char *sbx_profile(const char *cwd, const char *tmp, bool net, const char *mark) {
+   run. tmp, mark and ro (one more place to read, never to write) may be NULL. */
+static char *sbx_profile(const char *cwd, const char *tmp, bool net, const char *mark,
+                         const char *ro) {
     char proj[PATH_MAX], rtmp[PATH_MAX], git[PATH_MAX];
     *sbx_blocked = 0;
     if (!cwd || !realpath(cwd, proj)) return NULL;
@@ -2523,7 +2527,7 @@ static char *sbx_profile(const char *cwd, const char *tmp, bool net, const char 
     sb_add(&b, ")");
     /* the probe runs a system binary: a home that cannot be ruled on must stop
        commands, not make the sandbox count as unavailable */
-    if (!sbx_probing && !sb_home_reads(&b, &areas, proj, tmp ? rtmp : NULL, linked ? &w : NULL)) {
+    if (!sbx_probing && !sb_home_reads(&b, &areas, proj, tmp ? rtmp : NULL, linked ? &w : NULL, ro)) {
         free(b.s);
         return NULL;
     }
@@ -2561,7 +2565,7 @@ bool sandbox_available(void) {
     /* run something under a real profile: a nested sandbox or a policy that
        blocks sandbox-exec must count as unavailable */
     sbx_probing = true;
-    char *prof = sbx_profile("/usr/share", NULL, false, NULL);
+    char *prof = sbx_profile("/usr/share", NULL, false, NULL, NULL);
     sbx_probing = false;
     if (!prof) return false;
     pid_t pid = fork();
@@ -2753,6 +2757,33 @@ static int sbx_sweep(const char *mark, bool grace, bool *left) {
     return total;
 }
 
+static void sbx_mark(char *mark, size_t cap) {
+    static unsigned runs;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    snprintf(mark, cap, "fw.mark.%ld.%ld.%09ld.%u", (long)getpid(), (long)ts.tv_sec,
+             ts.tv_nsec, ++runs);
+}
+
+/* the profile, or NULL with the reason in why */
+static char *sbx_setup(const char *cwd, const char *tmp, bool net, const char *mark,
+                       const char *ro, char *why, size_t cap) {
+    char *prof = NULL;
+    *sbx_blocked = 0;
+    if (each_secret(secret_unresolved, NULL) || !(prof = sbx_profile(cwd, tmp, net, mark, ro)))
+        snprintf(why, cap, "error: cannot set up the sandbox for this directory%s%s%s%s"
+                 " — not executed", *sbx_blocked ? ": " : "", *sbx_blocked ? sbx_reason : "",
+                 *sbx_blocked ? " " : "", sbx_blocked);
+    return prof;
+}
+
+/* in the child: no inherited sockets or files, and no controlling terminal */
+static void sbx_detach(void) {
+    long max = sysconf(_SC_OPEN_MAX);
+    for (int fd = 3; fd < (max > 0 && max < 65536 ? max : 65536); fd++) close(fd);
+    setsid();
+}
+
 static char *run_command(const char *cmd, const char *cwd, int timeout_s, int *code, bool net) {
     if (code) *code = -1;
     /* --unsafe: as is. Otherwise a clean environment always, and the sandbox when
@@ -2764,20 +2795,10 @@ static char *run_command(const char *cmd, const char *cwd, int timeout_s, int *c
         const char *tmp = sbx_tmpdir();
         if (!tmp) return str_dup("error: cannot create a private TMPDIR — not executed");
         if (boxed) {
-            static unsigned runs;
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            if (net) snprintf(mark, sizeof mark, "fw.mark.%ld.%ld.%09ld.%u", (long)getpid(),
-                              (long)ts.tv_sec, ts.tv_nsec, ++runs);
-            *sbx_blocked = 0;
-            if (each_secret(secret_unresolved, NULL)
-                || !(prof = sbx_profile(cwd, tmp, net, *mark ? mark : NULL))) {
-                char why[PATH_MAX + 128];
-                snprintf(why, sizeof why, "error: cannot set up the sandbox for this directory%s%s%s%s"
-                         " — not executed", *sbx_blocked ? ": " : "", *sbx_blocked ? sbx_reason : "",
-                         *sbx_blocked ? " " : "", sbx_blocked);
-                return str_dup(why);
-            }
+            char why[PATH_MAX + 128];
+            if (net) sbx_mark(mark, sizeof mark);
+            prof = sbx_setup(cwd, tmp, net, *mark ? mark : NULL, NULL, why, sizeof why);
+            if (!prof) return str_dup(why);
         }
         sbx_env(env, cwd, tmp);
     }
@@ -2800,10 +2821,7 @@ static char *run_command(const char *cmd, const char *cwd, int timeout_s, int *c
             _exit(126);
         }
         if (clean) {
-            /* no inherited sockets or files, and no controlling terminal */
-            long max = sysconf(_SC_OPEN_MAX);
-            for (int fd = 3; fd < (max > 0 && max < 65536 ? max : 65536); fd++) close(fd);
-            setsid();
+            sbx_detach();
             if (boxed)
                 execle(SBX_EXEC, "sandbox-exec", "-p", prof, "/bin/bash", "-c", cmd,
                        (char *)NULL, env);
@@ -2825,7 +2843,7 @@ static char *run_command(const char *cmd, const char *cwd, int timeout_s, int *c
     struct timespec t0, now;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     for (;;) {
-        bool more = drain_pipe(fds[0], buf, &len, 64);
+        bool more = drain_pipe(fds[0], buf, &len, OUT_CAP, 64);
         pid_t w = waitpid(pid, &status, WNOHANG);
         if (w == pid) break;
         if (fw_tick_hook) fw_tick_hook();
@@ -2846,7 +2864,7 @@ static char *run_command(const char *cmd, const char *cwd, int timeout_s, int *c
     bool left = false;
     if (boxed && net) swept = sbx_sweep(mark, !timed && !g_abort, &left);
     /* drain what is left; bounded so a surviving background writer can't pin us */
-    drain_pipe(fds[0], buf, &len, 1024);
+    drain_pipe(fds[0], buf, &len, OUT_CAP, 1024);
     close(fds[0]);
     buf[len] = 0;
     utf8_sanitize(buf);
@@ -2903,6 +2921,103 @@ char *run_bash_status(const char *cmd, const char *cwd, int timeout_s, int *code
 
 char *run_bash_net(const char *cmd, const char *cwd, int timeout_s, int *code) {
     return run_command(cmd, cwd, timeout_s, code, true);
+}
+
+/* see flywheel.h. Nothing is shared with the agent's commands, which may have
+   left processes behind: the caller's work and a TMPDIR inside it are new. */
+bool run_script(const char *script, const char *a1, const char *a2, const char *work,
+                const char *ro, int timeout_s, char **out, char **err) {
+    *out = NULL;
+    *err = NULL;
+    bool boxed = !g_cfg.unsafe;
+    char *env[SBX_NENV] = {NULL}, *prof = NULL;
+    char mark[64] = "", tmp[PATH_MAX], rro[PATH_MAX], why[PATH_MAX + 128];
+    if (boxed) {
+        const char *no = NULL;
+        if (!sandbox_available()) no = "error: no sandbox here and no --unsafe — not executed";
+        else if (snprintf(tmp, sizeof tmp, "%s/tmp", work) >= (int)sizeof tmp
+                 || mkdir(tmp, 0700) || !realpath(ro, rro))
+            no = "error: cannot create the script's directories — not executed";
+        if (no) { *err = str_dup(no); return false; }
+        sbx_mark(mark, sizeof mark);
+        if (!(prof = sbx_setup(work, tmp, false, mark, rro, why, sizeof why))) {
+            *err = str_dup(why);
+            return false;
+        }
+        sbx_env(env, work, tmp);
+    }
+    int o[2] = {-1, -1}, e[2] = {-1, -1};
+    pid_t pid = -1;
+    if (!pipe(o) && !pipe(e)) {
+        fcntl(o[0], F_SETFL, O_NONBLOCK);
+        fcntl(e[0], F_SETFL, O_NONBLOCK);
+        pid = fork();
+    }
+    if (pid == 0) {
+        dup2(o[1], 1);
+        dup2(e[1], 2);
+        close(o[0]); close(o[1]); close(e[0]); close(e[1]);
+        int devnull = open("/dev/null", O_RDONLY);
+        if (devnull >= 0) { dup2(devnull, 0); close(devnull); }
+        if (boxed) {
+            if (chdir(work)) _exit(126);
+            sbx_detach();
+            /* env: the bash found in PATH, as without the sandbox */
+            execle(SBX_EXEC, "sandbox-exec", "-p", prof, "/usr/bin/env", "bash", script, a1, a2,
+                   (char *)NULL, env);
+        } else {
+            setpgid(0, 0);
+            execlp("bash", "bash", script, a1, a2, (char *)NULL);
+        }
+        _exit(127);
+    }
+    free(prof);
+    for (int i = 0; env[i]; i++) free(env[i]);
+    if (o[1] >= 0) close(o[1]);
+    if (e[1] >= 0) close(e[1]);
+    if (pid < 0) {
+        if (o[0] >= 0) close(o[0]);
+        if (e[0] >= 0) close(e[0]);
+        *err = str_dup("error: cannot start the script");
+        return false;
+    }
+    char *ob = malloc(SCRIPT_CAP + 1), *eb = malloc(OUT_CAP + 1);
+    size_t ol = 0, el = 0;
+    int status;
+    bool timed = false;
+    struct timespec t0, now;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (;;) {
+        bool more = drain_pipe(o[0], ob, &ol, SCRIPT_CAP, 64);
+        more = drain_pipe(e[0], eb, &el, OUT_CAP, 64) || more;
+        if (waitpid(pid, &status, WNOHANG) == pid) break;
+        if (!more) usleep(20000);
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double waited = (now.tv_sec - t0.tv_sec) + (now.tv_nsec - t0.tv_nsec) / 1e9;
+        if ((timeout_s > 0 && waited >= timeout_s) || g_abort) {
+            timed = true;
+            killpg(pid, SIGKILL);
+            kill(pid, SIGKILL);   /* in case it has no group of its own yet */
+            waitpid(pid, &status, 0);
+            break;
+        }
+    }
+    /* nothing the script started outlives it */
+    if (!timed) killpg(pid, SIGKILL);
+    bool left = false;
+    if (boxed) sbx_sweep(mark, false, &left);
+    if (left) fprintf(stderr, "flywheel: some processes of %s could NOT be stopped\n", script);
+    drain_pipe(o[0], ob, &ol, SCRIPT_CAP, 1024);
+    drain_pipe(e[0], eb, &el, OUT_CAP, 1024);
+    close(o[0]);
+    close(e[0]);
+    ob[ol] = 0;
+    eb[el] = 0;
+    utf8_sanitize(ob);
+    utf8_sanitize(eb);
+    *out = ob;
+    *err = eb;
+    return true;
 }
 
 /* ---------- permission rules (claude-code style) ----------

@@ -112,6 +112,13 @@ char *run_bash_net(const char *cmd, const char *cwd, int timeout_s, int *code);
 char *run_bash(const char *cmd, const char *cwd, int timeout_s); /* never NULL */
 /* *code = exit status, -1 if timed out or killed */
 char *run_bash_status(const char *cmd, const char *cwd, int timeout_s, int *code);
+/* `bash script a1 a2` for code the model may have written. Unless --unsafe: in
+   the same sandbox, never with network, in the fresh directory work, which with
+   work/tmp (made here) is all it can write; ro stays readable. With --unsafe
+   work and ro are ignored. stdout and stderr (newest tail kept) are malloc'd.
+   false: not run, *err says why and *out is NULL */
+bool  run_script(const char *script, const char *a1, const char *a2, const char *work,
+                 const char *ro, int timeout_s, char **out, char **err);
 char *deny_check(const char *cmd, const char *cwd);              /* NULL=ok, else static reason */
 char *heredoc_fix(const char *cmd);                              /* returns new or copy */
 bool  cmd_is_write(const char *cmd);

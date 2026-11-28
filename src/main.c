@@ -469,6 +469,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "bench")) {
             if (refuse_unsandboxed()) return 2;
             signal(SIGINT, on_sigint);
+            /* the grader has its own session: only g_abort ends it (nohup stays) */
+            static const int ends[] = {SIGTERM, SIGHUP, SIGQUIT};
+            for (int k = 0; k < 3; k++)
+                if (signal(ends[k], on_sigint) == SIG_IGN) signal(ends[k], SIG_IGN);
             #ifndef FW_MINI_HTTP
             curl_global_init(CURL_GLOBAL_DEFAULT);
             #endif

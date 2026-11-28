@@ -322,8 +322,23 @@ Where it does not protect you:
   middle of the chain can be renamed.
 - File tools do not go through the sandbox; they have their own project confinement and refuse the
   stores and the protected files.
-- **`bench` grading scripts run the code the model wrote, unsandboxed and with your environment.**
-  Run untrusted suites or models in a VM.
+
+**`bench` grading scripts** run the code the model wrote, so they get the same sandbox, never with
+network, and their processes are killed when grading ends, also when `bench` gets SIGINT, SIGTERM,
+SIGHUP or SIGQUIT. SIGKILL of `bench` can still orphan a grader. A grade script runs in a fresh
+temporary directory; it can read the suite and write there and in `$TMPDIR`. `$2` is a copy of the
+collected files, thrown away afterwards. Of your environment only `PATH`, `HOME`, `LANG` and `TERM`
+are passed on, and anything it needs under `$HOME` outside the places listed above is unreadable,
+a `grade_script` outside the suite included. A suite that is `$HOME` or a directory above it is not
+readable. `--unsafe` runs it with your environment and no sandbox; unlike before, its stdin is
+`/dev/null`, it has its own process group and what it leaves in that group is killed.
+Collected files are limited to 64 MiB each, 256 MiB per task and 64 directory levels; what is over
+is left out, with a line on stderr.
+**The score is still not trustworthy against a hostile model:** code
+the grader runs shares its process and output, so it can forge the result line, stop the grader,
+change the copied files before they are checked, and read the whole suite, hidden tests and earlier
+results included. Run untrusted suites or models in a VM.
+
 - A background process of a command without network access, or of any command with `--unsafe` or
   without a sandbox, keeps running after the command ends, also after flywheel exits.
 
@@ -371,7 +386,7 @@ applies unless `--unsafe` is also given.
 - No context compaction.
 - No sandbox on Linux yet.
 - Detached background processes are found and killed only for sandboxed commands that had the
-  network.
+  network, and for `bench` grading scripts.
 - Go and Rust gates are experimental.
 - The harness was tuned on the private suite below.
 - Not yet measured against OpenCode with the same model, or against Claude Haiku 5.5 run as an
