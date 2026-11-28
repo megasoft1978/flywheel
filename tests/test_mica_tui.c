@@ -1103,7 +1103,7 @@ static void copy_tests(const char *dir, const char *cmd) {
     keys(s, "/clear\r");
     keys(s, "/");
     CHECK(s, "short menu: last command off screen", find_row(s, "/quit") < 0);
-    for (int i = 0; i < 10; i++) keys(s, "\033[B");
+    for (int i = 0; i < 11; i++) keys(s, "\033[B");
     int quit = find_row(s, "/quit");
     CHECK(s, "short menu: arrows reach /quit", quit >= 0 && find_row(s, "\xe2\x96\xb8 /quit") == quit);
     CHECK(s, "short menu: first command scrolled away", find_row(s, "write .flywheel.md") < 0);
@@ -1118,7 +1118,7 @@ static void copy_tests(const char *dir, const char *cmd) {
     keys(s, "/mouse\r");
     keys(s, "/clear\r");
     keys(s, "/");
-    for (int i = 0; i < 9; i++) keys(s, "\033[B");
+    for (int i = 0; i < 10; i++) keys(s, "\033[B");
     int row = find_row(s, "/exit");
     CHECK(s, "short menu: /exit visible", row >= 0);
     char click[32];
@@ -1468,6 +1468,225 @@ static void image_tests(const char *cmd) {
     keys(s, "/clear\r");
     CHECK(s, "no vision: /paste refused", sends(s, "/paste", "serving without vision"));
     CHECK(s, "no vision: plain text still works", sends(s, "IMGQ", "GOT last=0 all=0"));
+    mica_session_destroy(s);
+
+    char rm[1200];
+    snprintf(rm, sizeof rm, "rm -rf '%s' '%s'", proj, outside);
+    system(rm);
+}
+
+/* ---------- ^V, empty paste, image chips and preview ----------
+   A fake osascript is first on PATH. No preview is ever opened: those sessions
+   are over SSH or have no usable TMPDIR, so it is refused before a viewer starts. */
+
+static void click_row(MicaSession *s, int row) {
+    char b[64];
+    snprintf(b, sizeof b, "\033[<0;5;%dM\033[<0;5;%dm", row + 1, row + 1);
+    keys(s, b);
+}
+
+static void clipboard_tests(const char *cmd) {
+    char proj[] = "/tmp/fwclip-XXXXXX", outside[] = "/tmp/fwclipbin-XXXXXX";
+    assert(mkdtemp(proj) != NULL && mkdtemp(outside) != NULL);
+    char shot[1100], md[1100], script[1100], none[1100], slow[1100], ran[1100], own[1100];
+    snprintf(shot, sizeof shot, "%s/my shot.png", proj);
+    snprintf(md, sizeof md, "%s/.flywheel.md", proj);
+    snprintf(script, sizeof script, "%s/osascript", outside);
+    snprintf(none, sizeof none, "%s/none", outside);
+    snprintf(slow, sizeof slow, "%s/slow", outside);
+    snprintf(ran, sizeof ran, "%s/ran", outside);
+    snprintf(own, sizeof own, "%s/.flywheel", proj);
+    put_file(shot, TINY_PNG, sizeof TINY_PNG, 0600);
+    put_file(md, "# clip\n", 7, 0600);
+    char sh[4096];
+    int n = snprintf(sh, sizeof sh, "#!/bin/sh\nfor a; do out=$a; done\n: >'%s'\n"
+                     "[ -e '%s' ] && exit 1\n[ -e '%s' ] && /bin/sleep 2\n"
+                     "exec /bin/cp '%s' \"$out\"\n", ran, none, slow, shot);
+    put_file(script, sh, (size_t)n, 0700);
+
+    char full[8192], msg[2048];
+    snprintf(full, sizeof full, "unset SSH_CONNECTION SSH_TTY SSH_CLIENT TMUX; "
+             "export PATH='%s':\"$PATH\"; %s", outside, cmd);
+    MicaSession *s = mica_session_create(proj, full, 30, 100);
+    assert(s != NULL);
+    CHECK(s, "clip: ready", wait_for_text(s, "ready", 3000));
+    pump(s, 150);
+
+    /* ^V */
+    type_str(s, "IMGQ draft");
+    mica_session_text(s, 'v', VTERM_MOD_CTRL);
+    CHECK(s, "^V: attaches", wait_for_text(s, "1 image attached", 4000));
+    pump(s, 200);
+    int chip = find_row(s, "pending 1: clipboard \xc2\xb7 1 KB");
+    CHECK(s, "^V: pending chip above the input box", chip >= 0 && chip < find_last_row(s, "\xe2\x95\xad"));
+    CHECK(s, "^V: chip offers a click", find_row(s, "click to preview") == chip);
+    CHECK(s, "^V: the draft stays", find_last_row(s, "IMGQ draft") > chip);
+    CHECK(s, "^V writes nothing into the project", access(own, F_OK) != 0);
+    assert_box_borders(s, "borders intact with a pending chip");
+    CHECK(s, "^V: goes with the message", sends(s, "", "GOT last=1 all=1 png=1"));
+    CHECK(s, "chip: no longer pending", find_row(s, "pending 1:") < 0);
+    CHECK(s, "chip: stays in the sent message",
+          find_row(s, "image: clipboard \xc2\xb7 1 KB \xc2\xb7 click to preview") >= 0);
+
+    /* pasted text stays text */
+    keys(s, "/clear\r");
+    unlink(ran);
+    keys(s, PS "IMGQ a\x16" "b" PE);
+    pump(s, 300);
+    CHECK(s, "paste with ^V byte: text only", find_row(s, "IMGQ ab") >= 0);
+    CHECK(s, "paste with ^V byte: clipboard not read", access(ran, F_OK) != 0);
+    keys(s, "\x03");
+    keys(s, PS "\x16" PE);
+    keys(s, PS "\n" PE);
+    keys(s, "\x03");
+    CHECK(s, "paste of bytes that are dropped: clipboard not read", access(ran, F_OK) != 0);
+
+    /* an empty paste: Cmd+V with only a picture on the clipboard */
+    keys(s, "/clear\r");
+    keys(s, PS PE);
+    CHECK(s, "empty paste: attaches the picture", wait_for_text(s, "pending 1: clipboard", 4000));
+    pump(s, 200);
+    CHECK(s, "empty paste: sent", sends(s, "IMGQ", "GOT last=1 all=1"));
+    keys(s, "/clear\r");
+    put_file(none, "", 0, 0600);
+    unlink(ran);
+    keys(s, PS PE);
+    pump(s, 600);
+    CHECK(s, "empty paste, no picture: clipboard looked at", access(ran, F_OK) == 0);
+    CHECK(s, "empty paste, no picture: quiet",
+          find_row(s, "not attached") < 0 && find_row(s, "attached") < 0 && find_row(s, "pending") < 0);
+    mica_session_text(s, 'v', VTERM_MOD_CTRL);
+    CHECK(s, "^V, no picture: said", wait_for_text(s, "no image on the clipboard", 4000));
+    keys(s, "/clear\r");
+    keys(s, "/model mock/qwen-alt\r");
+    keys(s, "/clear\r");
+    keys(s, PS PE);
+    pump(s, 600);
+    CHECK(s, "empty paste, no picture, blind model: quiet", find_row(s, "not attached") < 0);
+    unlink(none);
+    keys(s, PS PE);
+    CHECK(s, "empty paste with a picture, blind model: said",
+          wait_for_text(s, "serving without vision", 4000));
+    pump(s, 200);
+    CHECK(s, "blind model: nothing held", find_row(s, "pending 1:") < 0);
+    keys(s, "/model mock/qwen\r");
+
+    /* an approval dialog: neither key reads the clipboard */
+    unlink(ran);
+    CHECK(s, "approval: dialog", open_modal(s, "SEC_EARLY"));
+    pump(s, 700);
+    mica_session_text(s, 'v', VTERM_MOD_CTRL);
+    keys(s, PS PE);
+    pump(s, 500);
+    CHECK(s, "approval: dialog still open", find_row(s, "Do you want to proceed?") >= 0);
+    close_modal(s);
+    pump(s, 600);
+    CHECK(s, "approval: clipboard never read", access(ran, F_OK) != 0);
+    CHECK(s, "approval: nothing attached", find_row(s, "pending 1:") < 0);
+
+    /* while busy: taken after the work in hand, in order */
+    keys(s, "/clear\r");
+    put_file(slow, "", 0, 0600);
+    mica_session_text(s, 'v', VTERM_MOD_CTRL);
+    pump(s, 300);
+    mica_session_text(s, 'v', VTERM_MOD_CTRL);
+    pump(s, 200);
+    CHECK(s, "busy ^V: queued", find_row(s, "attaches after") >= 0 || find_row(s, "queued") >= 0);
+    CHECK(s, "busy ^V: attaches afterwards", wait_for_text(s, "pending 2: clipboard", 9000));
+    pump(s, 300);
+    unlink(slow);
+    keys(s, "\x03");
+    CHECK(s, "^C drops pending chips", find_row(s, "pending 1:") < 0);
+
+    /* many pending images: four rows, the last one counting the rest */
+    keys(s, "/clear\r");
+    for (int i = 0; i < 5; i++) { mica_session_text(s, 'v', VTERM_MOD_CTRL); pump(s, 700); }
+    CHECK(s, "many: three chips and a count", find_row(s, "pending 3:") >= 0 &&
+          find_row(s, "pending 4:") < 0 && find_row(s, "+2 more") >= 0);
+    keys(s, "\x03");
+
+    /* an interrupted paste may still be arriving */
+    keys(s, "/clear\r");
+    unlink(ran);
+    type_str(s, PS "stuck");
+    CHECK(s, "interrupted: noticed", wait_for_text(s, "paste end marker missing", 7000));
+    mica_session_text(s, 'v', VTERM_MOD_CTRL);
+    pump(s, 600);
+    CHECK(s, "interrupted: ^V reads nothing", access(ran, F_OK) != 0);
+    keys(s, "\x1b");
+    keys(s, "\x03");
+    keys(s, "/exit\r");
+    CHECK(s, "clip: clean exit", wait_for_exit(s, 3000));
+    mica_session_destroy(s);
+
+    /* preview: the temporary directory cannot be made, so no viewer ever starts,
+       and the message names the image that was picked */
+    snprintf(full, sizeof full, "unset SSH_CONNECTION SSH_TTY SSH_CLIENT TMUX; "
+             "export TMPDIR=/nonexistent-fw DISPLAY=:99; export PATH='%s':\"$PATH\"; %s", outside, cmd);
+    s = mica_session_create(proj, full, 30, 100);
+    assert(s != NULL);
+    CHECK(s, "preview: ready", wait_for_text(s, "ready", 3000));
+    pump(s, 150);
+    snprintf(msg, sizeof msg, PS "%s/my\\ shot.png " PE, proj);
+    CHECK(s, "preview: held", sends(s, msg, "1 image attached"));
+    int row = find_row(s, "pending 1: my shot.png");
+    CHECK(s, "preview: pending chip names the file", row >= 0);
+    char drag[64];
+    snprintf(drag, sizeof drag, "\033[<0;5;%dM\033[<0;20;%dm", row + 1, row + 1);
+    keys(s, drag);
+    CHECK(s, "drag over a chip: select hint, no preview",
+          find_row(s, "to select:") >= 0 && find_row(s, "preview of") < 0);
+    click_row(s, row);
+    CHECK(s, "click on a pending chip", wait_for_text(s, "no preview of my shot.png: cannot create", 3000));
+    keys(s, "/clear\r");
+    CHECK(s, "preview: held after /clear", sends(s, msg, "1 image attached"));
+    keys(s, "/preview\r");
+    CHECK(s, "/preview: the pending one",
+          wait_for_text(s, "no preview of my shot.png: cannot create", 3000));
+    keys(s, "/preview 2\r");
+    CHECK(s, "/preview N: out of range", wait_for_text(s, "no image 2", 3000));
+    CHECK(s, "preview: sent", sends(s, "IMGQ", "GOT last=1 all=1"));
+    keys(s, "\x03");
+    row = find_row(s, "image: my shot.png");
+    CHECK(s, "sent chip shown", row >= 0);
+    click_row(s, row);
+    CHECK(s, "click on a sent chip", wait_for_text(s, "no preview of my shot.png: cannot create", 3000));
+    keys(s, "/clear\r");
+    keys(s, "/preview\r");
+    CHECK(s, "/preview: nothing attached", wait_for_text(s, "nothing to preview", 3000));
+    keys(s, "/mouse\r");
+    CHECK(s, "mouse off: held", sends(s, msg, "1 image attached"));
+    CHECK(s, "mouse off: chip names the command", find_row(s, "KB \xc2\xb7 /preview 1") >= 0);
+    CHECK(s, "mouse off: sent chip offers no click", sends(s, "IMGQ", "GOT last=1 all=1") &&
+          find_row(s, "click to preview") < 0);
+    keys(s, "/preview 1\r");
+    CHECK(s, "mouse off: /preview reaches the sent image",
+          wait_for_text(s, "no preview of my shot.png", 3000));
+    keys(s, "/clear\r");
+    keys(s, "/help\r");
+    CHECK(s, "help names ^V and /preview", find_row(s, "^V") >= 0 && find_row(s, "/preview [N]") >= 0);
+    mica_session_destroy(s);
+
+    /* over SSH: no clipboard, no preview */
+    snprintf(full, sizeof full, "unset SSH_TTY SSH_CLIENT TMUX; export SSH_CONNECTION='1 2 3 4' "
+             "TMPDIR=/nonexistent-fw; export PATH='%s':\"$PATH\"; %s", outside, cmd);
+    s = mica_session_create(proj, full, 30, 100);
+    assert(s != NULL);
+    CHECK(s, "ssh clip: ready", wait_for_text(s, "ready", 3000));
+    pump(s, 150);
+    unlink(ran);
+    keys(s, PS PE);
+    pump(s, 400);
+    CHECK(s, "ssh: empty paste is quiet", find_row(s, "SSH") < 0);
+    mica_session_text(s, 'v', VTERM_MOD_CTRL);
+    CHECK(s, "ssh: ^V explains", wait_for_text(s, "not over SSH", 3000));
+    CHECK(s, "ssh: clipboard not read", access(ran, F_OK) != 0);
+    keys(s, "/clear\r");
+    CHECK(s, "ssh: a file still attaches", sends(s, msg, "1 image attached"));
+    row = find_row(s, "pending 1: my shot.png");
+    CHECK(s, "ssh: chip offers no preview", row >= 0 && find_row(s, "click to preview") < 0);
+    click_row(s, row);
+    CHECK(s, "ssh: click explains", wait_for_text(s, "preview needs a local session", 3000));
     mica_session_destroy(s);
 
     char rm[1200];
@@ -2070,16 +2289,6 @@ int main(int argc, char **argv) {
     CHECK(s, "UTF-8 backspace removes whole emoji -> col 4", cr == input_row && cc == 4);
     assert_box_borders(s, "borders after emoji edit");
 
-    /* ^V is not a clipboard image paste: nothing is written into the project */
-    mica_session_text(s, 'c', VTERM_MOD_CTRL);
-    pump(s, 100);
-    mica_session_text(s, 'v', VTERM_MOD_CTRL);
-    pump(s, 1500);
-    char pastedir[1200];
-    snprintf(pastedir, sizeof pastedir, "%s/.flywheel", testdir);
-    CHECK(s, "^V writes nothing into the project", access(pastedir, F_OK) != 0);
-    CHECK(s, "^V reports no image paste", find_row(s, "image") < 0);
-
     /* 3. Long input soft-wrapping (must NOT break right border) */
     mica_session_text(s, 'c', VTERM_MOD_CTRL);
     pump(s, 100);
@@ -2376,6 +2585,7 @@ int main(int argc, char **argv) {
     input_tests(testdir, cmd);
     copy_tests(testdir, cmd);
     image_tests(cmd);
+    clipboard_tests(cmd);
     signal_tests(testdir, cmd);
     sandbox_tests(testdir, cmd);
     branch_tests(testdir, cmd);

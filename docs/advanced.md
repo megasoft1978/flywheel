@@ -106,8 +106,18 @@ prompt of several lines are never searched. It prints `✓ N image(s) attached` 
   ending in `.png`, `.jpg`, `.jpeg`, `.gif` or `.webp`. Shell escapes and quotes are understood.
 - Give an `http://` or `https://` URL ending the same way. Only public addresses are fetched, with no
   redirects and no proxy. The static Linux build refuses URLs.
-- `/paste` attaches the picture on the clipboard (a local macOS session, not over SSH). A file copied
-  in Finder may give its icon, so drag files instead.
+- In the interactive UI, `^V` or `/paste` attaches the picture on the clipboard. So does a paste that
+  brings no text, which is what `Cmd+V` sends in some terminals when the clipboard holds only a
+  picture; others send nothing, so use `^V`. Text pastes as before. A local session only, not over
+  SSH: macOS reads it with `osascript`, Linux with `wl-paste` (wl-clipboard) or `xclip`, never one
+  found through a relative `PATH` entry or inside the project. While the agent works, `^V` queues like
+  a message. A file copied in Finder may give its icon, so drag files instead.
+
+A pending image is listed above the input box and a sent one under its message, with name and size.
+Click it, or type `/preview [N]`, to see it: Quick Look on macOS, `xdg-open` on Linux (it needs a
+graphical display), not over SSH. The viewer gets a private temporary copy of the bytes flywheel
+holds (after any downscale), under a fixed name. At most 8 copies are kept; they are removed when
+flywheel exits.
 
 A message holding only images keeps them for your next one; `^C` or `/clear` drops them. If one cannot
 be loaded, nothing is sent and the message returns to the input box; messages queued behind it wait
@@ -151,7 +161,7 @@ images while the server reports no vision.
 - Keep typing while the agent works: Enter queues, `Esc` interrupts, scrollback stays put.
 - Streaming markdown, code boxes, tables and links.
 - Tool output and thinking collapse; click or `^O` to expand.
-- Slash menu (`/init /clear /model /allow /status /paste /copy /mouse /help /exit`), input history,
+- Slash menu (`/init /clear /model /allow /status /paste /preview /copy /mouse /help /exit`), input history,
   large-paste collapse.
 - Images, see [Images](#images).
 - `/copy` copies the last assistant reply as plain text (escape sequences, control characters and

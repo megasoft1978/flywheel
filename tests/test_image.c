@@ -3,6 +3,9 @@
 /* image loading, URL guards and image message parts. Loopback only. */
 #include "../src/image.h"
 #include <arpa/inet.h>
+#include <errno.h>
+#include <limits.h>
+#include <time.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdint.h>
@@ -766,6 +769,181 @@ static void test_oneshot(void) {
     drop("task.txt");
 }
 
+/* ---------- clipboard and preview, with stub programs: the real clipboard and
+   viewers are never touched ---------- */
+
+static bool stub_have[3];            /* osascript, wl-paste, xclip */
+static const char *const STUB_NAMES[3] = {"osascript", "wl-paste", "xclip"};
+
+static bool stub_find(const char *name, char *out) {
+    for (int i = 0; i < 3; i++)
+        if (!strcmp(name, STUB_NAMES[i]) && stub_have[i]) {
+            snprintf(out, PATH_MAX, "%s/%s", dir, name);
+            return true;
+        }
+    return false;
+}
+
+static void script(const char *name, const char *body) {
+    char p[800];
+    put(name, body, strlen(body));
+    snprintf(p, sizeof p, "%s/%s", dir, name);
+    chmod(p, 0700);
+}
+
+static size_t slurp_in(const char *name, char *out, size_t cap) {
+    char p[800];
+    snprintf(p, sizeof p, "%s/%s", dir, name);
+    FILE *f = fopen(p, "rb");
+    size_t n = f ? fread(out, 1, cap - 1, f) : 0;
+    if (f) fclose(f);
+    out[n] = 0;
+    return n;
+}
+
+static ClipResult clip(bool mac, ImagePart *p, char *err, size_t cap) {
+    *p = (ImagePart){0};
+    *err = 0;
+    drop("args");
+    return image_from_clipboard(mac, stub_find, p, err, cap);
+}
+
+static void test_clipboard(void) {
+    char body[2048], args[1024], err[256];
+    ImagePart p;
+    put("pic.png", TINY, sizeof TINY);
+
+    snprintf(body, sizeof body, "#!/bin/sh\necho wl \"$@\" >>'%s/args'\n/bin/cat '%s/pic.png'\n", dir, dir);
+    script("wl-paste", body);
+    snprintf(body, sizeof body, "#!/bin/sh\necho x \"$@\" >>'%s/args'\n/bin/cat '%s/pic.png'\n", dir, dir);
+    script("xclip", body);
+    stub_have[1] = stub_have[2] = true;
+    T("linux: wl-paste first", clip(false, &p, err, sizeof err) == CLIP_OK);
+    slurp_in("args", args, sizeof args);
+    T("linux: wl-paste argv", !strcmp(args, "wl --no-newline --type image/png\n"));
+    T("linux: bytes and name", p.size == sizeof TINY && p.source && !strcmp(p.source, "clipboard"));
+    image_part_free(&p);
+
+    script("wl-paste", "#!/bin/sh\necho half; echo oops >&2; exit 1\n");
+    T("linux: falls back to xclip", clip(false, &p, err, sizeof err) == CLIP_OK);
+    slurp_in("args", args, sizeof args);
+    T("linux: xclip argv", !strcmp(args, "x -selection clipboard -t image/png -o\n"));
+    image_part_free(&p);
+
+    stub_have[1] = false;
+    script("xclip", "#!/bin/sh\necho just text\n");
+    T("linux: text is not an image", clip(false, &p, err, sizeof err) == CLIP_NONE && !p.url);
+    T("linux: says there is none", !strcmp(err, "no image on the clipboard"));
+    script("xclip", "#!/bin/sh\nexit 1\n");
+    T("linux: tool failure is no image", clip(false, &p, err, sizeof err) == CLIP_NONE);
+
+    stub_have[2] = false;
+    T("linux: neither tool", clip(false, &p, err, sizeof err) == CLIP_NO_TOOL);
+    T("linux: neither tool is named", strstr(err, "wl-paste") && strstr(err, "xclip"));
+
+    stub_have[0] = true;
+    snprintf(body, sizeof body, "#!/bin/sh\nfor a; do out=$a; done\nexec /bin/cp '%s/pic.png' \"$out\"\n", dir);
+    script("osascript", body);
+    T("mac: osascript", clip(true, &p, err, sizeof err) == CLIP_OK && p.size == sizeof TINY);
+    image_part_free(&p);
+    script("osascript", "#!/bin/sh\nexit 1\n");
+    T("mac: no image", clip(true, &p, err, sizeof err) == CLIP_NONE);
+    stub_have[0] = false;
+
+    drop("pic.png");
+    drop("args");
+    drop("osascript");
+    drop("wl-paste");
+    drop("xclip");
+}
+
+/* the stub viewer's record appears when it is done: it is nobody's child */
+static bool wait_file(const char *name) {
+    char p[800];
+    snprintf(p, sizeof p, "%s/%s", dir, name);
+    for (int i = 0; i < 500; i++) {
+        if (!access(p, F_OK)) return true;
+        struct timespec ts = {0, 10000000};
+        nanosleep(&ts, NULL);
+    }
+    return false;
+}
+
+static void test_preview(void) {
+    char body[4096], err[256] = "", rec[2048], viewer[800], noise[800];
+    /* records argv and PATH; prints on both streams; keeps running a while */
+    snprintf(body, sizeof body,
+             "#!/bin/sh\necho NOISE; echo NOISE >&2\n"
+             "{ for a; do printf '%%s\\n' \"$a\"; done; printf 'PATH=%%s\\n' \"$PATH\"; } >'%s/rec.tmp'\n"
+             "/bin/mv '%s/rec.tmp' '%s/rec'\nexec /bin/sleep 3\n", dir, dir, dir);
+    script("viewer", body);
+    snprintf(viewer, sizeof viewer, "%s/viewer", dir);
+
+    put("shot.jpg", TINY, sizeof TINY);   /* a PNG under a misleading name */
+    ImagePart p = {0};
+    char shot[800];
+    snprintf(shot, sizeof shot, "%s/shot.jpg", dir);
+    T("preview: load", image_from_file(NULL, shot, &p, err, sizeof err));
+    drop("shot.jpg");                     /* the held bytes are what is shown */
+
+    snprintf(noise, sizeof noise, "%s/noise", dir);
+    fflush(stdout);
+    int keep1 = dup(1), keep2 = dup(2);
+    int cap = open(noise, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    dup2(cap, 1); dup2(cap, 2); close(cap);
+    time_t t0 = time(NULL);
+    bool ok = image_preview(&p, viewer, "-p", "/usr/bin:/bin", err, sizeof err);
+    bool quick = time(NULL) - t0 < 2;
+    bool ran = wait_file("rec");
+    dup2(keep1, 1); dup2(keep2, 2); close(keep1); close(keep2);
+    T("preview: starts", ok);
+    T("preview: does not wait for the viewer", quick);
+    T("preview: viewer ran", ran);
+    T("preview: output silenced", slurp_in("noise", rec, sizeof rec) == 0);
+    errno = 0;
+    T("preview: no child left behind", waitpid(-1, NULL, WNOHANG) == -1 && errno == ECHILD);
+
+    slurp_in("rec", rec, sizeof rec);
+    char *opt = strtok(rec, "\n"), *file = strtok(NULL, "\n"), *path = strtok(NULL, "\n");
+    T("preview: option first", opt && !strcmp(opt, "-p"));
+    T("preview: PATH replaced", path && !strcmp(path, "PATH=/usr/bin:/bin"));
+    char first[800] = "", fdir[800] = "";
+    if (file) snprintf(first, sizeof first, "%s", file);
+    snprintf(fdir, sizeof fdir, "%s", first);
+    char *slash = strrchr(fdir, '/');
+    T("preview: fixed name, detected type", slash && !strcmp(slash, "/image.png"));
+    if (slash) *slash = 0;
+    struct stat st;
+    T("preview: file is private", !stat(first, &st) && S_ISREG(st.st_mode) && (st.st_mode & 0777) == 0600);
+    T("preview: directory is private", !stat(fdir, &st) && S_ISDIR(st.st_mode) && (st.st_mode & 0777) == 0700);
+    unsigned char got[sizeof TINY + 8];
+    FILE *f = fopen(first, "rb");
+    size_t n = f ? fread(got, 1, sizeof got, f) : 0;
+    if (f) fclose(f);
+    T("preview: the held bytes", n == sizeof TINY && !memcmp(got, TINY, n));
+
+    drop("rec");
+    T("preview: again", image_preview(&p, viewer, NULL, NULL, err, sizeof err) && wait_file("rec"));
+    slurp_in("rec", rec, sizeof rec);
+    char *second = strtok(rec, "\n");
+    T("preview: no option, fresh directory", second && strcmp(second, first) && strstr(second, "/image.png"));
+    char other[800] = "";
+    if (second) snprintf(other, sizeof other, "%s", second);
+
+    T("preview: a missing viewer is said",
+      !image_preview(&p, "/nonexistent/viewer", NULL, NULL, err, sizeof err) && strstr(err, "viewer"));
+    T("preview: nothing left of a failed start", waitpid(-1, NULL, WNOHANG) == -1);
+
+    image_preview_cleanup();
+    T("preview: files removed", access(first, F_OK) && access(other, F_OK));
+    T("preview: directories removed", access(fdir, F_OK));
+
+    image_part_free(&p);
+    drop("rec");
+    drop("noise");
+    drop("viewer");
+}
+
 int main(void) {
     const char *tmp = getenv("TMPDIR");
     snprintf(dir, sizeof dir, "%s/fw-test-image-XXXXXX", tmp && *tmp ? tmp : "/tmp");
@@ -784,6 +962,8 @@ int main(void) {
     test_drop_rejected();
     test_drop_kept();
     test_oneshot();
+    test_clipboard();
+    test_preview();
     rmdir(dir);
     printf("image: %d passed, %d failed\n", passed, failed);
     return failed ? 1 : 0;

@@ -26,6 +26,8 @@
    - mouse wheel + PageUp/PageDown smooth transcript scrolling
    - /mouse turns mouse reporting off so the terminal can select text again;
      /copy puts the last reply on the clipboard (pbcopy, or OSC 52 over SSH)
+   - ^V, or a paste that brings no text, attaches the clipboard picture; a click
+     on an image (or /preview) shows it with Quick Look or xdg-open
    - interactive Claude-Code-style modal menu for bash approvals & multi-choice
      prompts (↑↓ + Enter, 1-9, y/a/n shortcuts, or mouse click)
    - rounded input box + slash menu below it + status bar pinned at bottom
@@ -57,6 +59,7 @@ static volatile sig_atomic_t g_resized = 0;
 static void handle_key(unsigned char ch, bool busy);
 static void drain_queue(void);
 static void tui_pump(void);
+static void preview_image(const ImagePart *p);
 static char *HIST[MAXHIST];
 static int hist_n, hpos = -1;
 
@@ -75,6 +78,7 @@ static bool pasting, paste_discard, paste_over;
 /* a paste stopped without its end marker: later bytes may still be pasted ones,
    so approvals are locked until the marker, Esc or ^C arrives */
 static bool paste_suspect;
+static bool paste_empty;          /* the one just ended brought no byte at all */
 static char *pbuf;
 static size_t plen, pcap;
 static char ptail[6];             /* last bytes seen, to find the end marker */
@@ -95,7 +99,8 @@ static const struct { const char *cmd, *desc; } SLASH[] = {
     {"/model",  "show or switch model (/model NAME)"},
     {"/allow",  "list this project's permission rules"},
     {"/status", "engine, model, profile, conversation size"},
-    {"/paste",  "attach the clipboard image to the next message"},
+    {"/paste",  "attach the clipboard image (also ^V)"},
+    {"/preview", "show an attached image (/preview N)"},
     {"/copy",   "copy the last reply to the clipboard"},
     {"/mouse",  "mouse on/off (off: select text natively)"},
     {"/help",   "keys, mouse, and commands"},
@@ -113,7 +118,8 @@ typedef enum {
     T_USER,    /* user prompt */
     T_THINK,   /* dimmed model reasoning */
     T_TEXT,    /* assistant answer text */
-    T_TOOL     /* collapsible Bash(cmd) + output */
+    T_TOOL,    /* collapsible Bash(cmd) + output */
+    T_IMAGE    /* an image of a sent message; a click previews it */
 } ItemKind;
 
 typedef struct {
@@ -125,6 +131,7 @@ typedef struct {
     bool expanded;      /* T_TOOL collapse state (default false) */
     bool done;          /* T_TOOL finished / T_THINK closed */
     double t0, t1;      /* T_THINK timing */
+    ImagePart img;      /* T_IMAGE: our copy, the message may be cut or dropped */
 } TItem;
 
 static TItem *items = NULL;
@@ -133,6 +140,8 @@ static int scroll_off = 0;       /* 0 = pinned at bottom; >0 = scrolled up N row
 static int max_scroll = 0;
 static int row_tool_idx[512];    /* screen row (0-based) -> tool item index, or -1 */
 static int slash_menu_top = -1;  /* screen row (0-based) where slash menu starts */
+#define CHIP_ROWS 4               /* more pending images than this are counted */
+static int chip_top = -1, chip_cnt;   /* screen rows of the pending-image chips */
 static int slash_menu_cnt = 0;
 static int slash_menu_off = 0;   /* first command shown when not all fit */
 
@@ -278,6 +287,7 @@ static void transcript_clear(void) {
     for (int i = 0; i < nitems; i++) {
         free(items[i].text);
         free(items[i].out);
+        image_part_free(&items[i].img);
     }
     nitems = 0;
     scroll_off = 0;
@@ -390,6 +400,7 @@ static void on_fatal(int sig) {
             if (raw_on) tcsetattr(0, TCSANOW, &saved_t);
             if (tui_up) modes_off();
         }
+        image_preview_cleanup();
     }
     signal(sig, SIG_DFL);   /* macOS ignores SA_RESETHAND for SIGILL */
     raise(sig);             /* SA_NODEFER: the default action, now */
@@ -1087,8 +1098,36 @@ static int count_lines(const char *s) {
     return n;
 }
 
+/* on this machine's own terminal: over SSH its clipboard and screen are not the
+   user's */
+static bool local_session(void) {
+    return !getenv("SSH_CONNECTION") && !getenv("SSH_TTY") && !getenv("SSH_CLIENT");
+}
+
+/* the file's base name, or the whole URL */
+static const char *image_name(char *dst, size_t cap, const ImagePart *p) {
+    const char *src = p->source, *base = strrchr(src, '/');
+    return clean_line(dst, cap, !strstr(src, "://") && base ? base + 1 : src);
+}
+
+/* "name · size", then how to see it from here; n is its number if pending, else 0 */
+static void image_label(char *dst, size_t cap, const ImagePart *p, int n) {
+    char name[256], how[40] = "";
+    if (local_session()) {
+        if (mouse_on) snprintf(how, sizeof how, " · click to preview");
+        else if (n) snprintf(how, sizeof how, " · /preview %d", n);
+        else snprintf(how, sizeof how, " · /preview");
+    }
+    snprintf(dst, cap, "%s · %zu KB%s", image_name(name, sizeof name, p), (p->size + 1023) / 1024, how);
+}
+
 static void build_item(VBuf *vb, const TItem *it, int i) {
-        if (it->kind == T_RAW) {
+        if (it->kind == T_IMAGE) {
+            char label[320], line[360];
+            image_label(label, sizeof label, &it->img, 0);
+            snprintf(line, sizeof line, DIM "  ▣ image: %s" RESET, label);
+            vb_wrap(vb, line, "", 0, "    ", 4, "", "", i);
+        } else if (it->kind == T_RAW) {
             vb_wrap(vb, it->text ? it->text : "", "", 0, "", 0, "", "", -1);
         } else if (it->kind == T_USER) {
             vb_push(vb, "", -1);
@@ -1200,7 +1239,7 @@ static void build_item(VBuf *vb, const TItem *it, int i) {
 static void build_transcript(VBuf *vb) {
     for (int i = 0; i < nitems; i++) {
         TItem v = items[i];
-        if (v.kind == T_RAW) { build_item(vb, &v, i); continue; }
+        if (v.kind == T_RAW || v.kind == T_IMAGE) { build_item(vb, &v, i); continue; }
         v.text = clean_text(items[i].text, true, false);
         v.out = items[i].out ? clean_text(items[i].out, true, false) : NULL;
         build_item(vb, &v, i);
@@ -1374,7 +1413,7 @@ static void render_screen(void) {
     /* Determine chrome height */
     VLine vl[MAX_VLINES];
     int cur_vl = 0, cur_col = 0, nv = 1, vis = 1, vstart = 0;
-    int mc = 0, ch = 0;
+    int mc = 0, ch = 0, chips = 0;
     VBuf mb = {0};
     int modal_blank = 0;
 
@@ -1408,11 +1447,14 @@ static void render_screen(void) {
         if (vstart + vis > nv) vstart = nv - vis;
         if (vstart < 0) vstart = 0;
         mc = menu_count();
-        ch = vis + 2 + mc + 1;
+        chips = pending.n > CHIP_ROWS ? CHIP_ROWS : pending.n;
+        ch = vis + 2 + mc + 1 + chips;
         if (ch > rows - 2) {      /* short window: show what fits */
             mc -= ch - (rows - 2);
             if (mc < 0) mc = 0;
-            ch = vis + 3 + mc;
+            int room = rows - 2 - (vis + 3 + mc);
+            if (chips > room) chips = room > 0 ? room : 0;
+            ch = vis + 3 + mc + chips;
         }
         /* the selection runs over every match; the visible rows follow it */
         int total = menu_count();
@@ -1448,6 +1490,8 @@ static void render_screen(void) {
     for (int r = 0; r < 512; r++) row_tool_idx[r] = -1;
     slash_menu_top = -1;
     slash_menu_cnt = 0;
+    chip_top = -1;
+    chip_cnt = 0;
 
     begin_sync();
     printf("\033[1;%dr", rows);   /* full screen region (no DECSTBM drift) */
@@ -1520,6 +1564,21 @@ static void render_screen(void) {
         /* Hide cursor on modal menu (or park at selected row) */
         printf("\033[%d;3H", m->opt_row_start + m->sel + 1);
     } else {
+        /* Pending images above the input box; the last row counts what is left */
+        if (chips) {
+            chip_top = r - 1;
+            chip_cnt = chips == pending.n ? chips : chips - 1;   /* else the last counts */
+        }
+        for (int i = 0; i < chips; i++, r++) {
+            char line[360], label[320];
+            if (i < chip_cnt) {
+                image_label(label, sizeof label, &pending.v[i], i + 1);
+                snprintf(line, sizeof line, "▣ pending %d: %s", i + 1, label);
+            } else
+                snprintf(line, sizeof line, "▣ +%d more pending (/preview N)", pending.n - i);
+            printf("\033[%d;1H" CLR_LINE "  " CYAN "%.*s" RESET, r, fit_bytes(line, cols - 3), line);
+        }
+
         /* Input box top border with project/branch badge */
         printf("\033[%d;1H" CLR_LINE, r++);
         draw_input_top(box_w);
@@ -1737,6 +1796,7 @@ static void paste_begin(bool discard) {
 static void paste_finish(bool lost_end) {
     pasting = false;
     if (lost_end) paste_suspect = true;
+    paste_empty = !paste_discard && !paste_over && !lost_end && !plen;
     if (!paste_discard) {
         if (paste_over) set_notice("paste over 1 MB refused");
         else {
@@ -1805,6 +1865,22 @@ static void toggle_tool(int idx) {
     }
 }
 
+/* the image drawn on screen row r0: *chip or *item gets its index, else -1 */
+static const ImagePart *image_at(int r0, int *chip, int *item) {
+    *chip = *item = -1;
+    if (active_modal || r0 < 0) return NULL;
+    if (chip_top >= 0 && r0 >= chip_top && r0 < chip_top + chip_cnt && r0 - chip_top < pending.n) {
+        *chip = r0 - chip_top;
+        return &pending.v[*chip];
+    }
+    if (r0 < 512 && row_tool_idx[r0] >= 0 && row_tool_idx[r0] < nitems &&
+        items[row_tool_idx[r0]].kind == T_IMAGE) {
+        *item = row_tool_idx[r0];
+        return &items[*item].img;
+    }
+    return NULL;
+}
+
 /* Parse an SGR mouse sequence "\033[<btn;col;rowM" (press) or "...m" (release).
    Returns true if it was a mouse sequence (consumed). Sets *clicked_row (0-based) on left press. */
 static bool handle_mouse_seq(const unsigned char *buf, int len, int *clicked_row) {
@@ -1814,7 +1890,8 @@ static bool handle_mouse_seq(const unsigned char *buf, int len, int *clicked_row
     if (term != 'M' && term != 'm') return false;
     int btn = 0, mx = 0, my = 0;
     if (sscanf((const char *)buf + 3, "%d;%d;%d", &btn, &mx, &my) != 3) return true;
-    static int press_x, press_y;
+    static int press_x, press_y, press_chip = -1, press_item = -1;
+    int chip, item;
     if (term != 'M') {
         /* a left drag is an attempt to select text, which reporting swallows */
         if (btn == 0 && (mx != press_x || my != press_y)) {
@@ -1822,10 +1899,19 @@ static bool handle_mouse_seq(const unsigned char *buf, int len, int *clicked_row
             snprintf(b, sizeof b, "to select: hold %s and drag, or /mouse", select_key());
             set_notice(b);
             render_screen();
+        } else if (btn == 0) {
+            /* a click on an image: acted on at release, so that a drag does not
+               open it and the release does not clear what it reports */
+            const ImagePart *p = image_at(my - 1, &chip, &item);
+            if (p && chip == press_chip && item == press_item) preview_image(p);
         }
+        press_chip = press_item = -1;
         return true;
     }
-    if (btn == 0) { press_x = mx; press_y = my; }
+    if (btn == 0) {
+        press_x = mx; press_y = my;
+        image_at(my - 1, &press_chip, &press_item);
+    }
     if (btn == 64) { /* wheel up */
         scroll_off += 3;
         if (scroll_off > max_scroll) scroll_off = max_scroll;
@@ -2233,12 +2319,9 @@ void tui_run_task(const char *prompt) {
     *att = pending;
     pending = (Images){0};
     for (int i = 0; i < att->n; i++) {
-        const char *src = att->v[i].source, *base = strrchr(src, '/');
-        char b[400], name[256];
-        snprintf(b, sizeof b, DIM "  image: %s · %zu KB" RESET,
-                 clean_line(name, sizeof name, !strstr(src, "://") && base ? base + 1 : src),
-                 (att->v[i].size + 1023) / 1024);
-        item_append(item_new(T_RAW), b);
+        Images one = {&att->v[i], 1}, copy = images_copy(&one);
+        item_new(T_IMAGE)->img = copy.v[0];
+        free(copy.v);
     }
     render_screen();
 
@@ -2490,10 +2573,66 @@ static bool run_pbcopy(const char *s, size_t n) {
 /* on this Mac's own terminal: over SSH its clipboard is not the user's */
 static bool local_mac(void) {
 #ifdef __APPLE__
-    return !getenv("SSH_CONNECTION") && !getenv("SSH_TTY") && !getenv("SSH_CLIENT");
+    return local_session();
 #else
     return false;
 #endif
+}
+
+#ifndef __APPLE__
+/* PATH without the entries find_tool would skip, for xdg-open: it is a script
+   and looks its helpers up there */
+static void trusted_path(char *out, size_t cap) {
+    char root[PATH_MAX];
+    struct stat rst;
+    const char *p = getenv("PATH");
+    size_t o = 0;
+    out[0] = 0;
+    if (!p || !project_root(root, &rst)) return;
+    while (*p) {
+        size_t n = strcspn(p, ":");
+        char dir[PATH_MAX], real_dir[PATH_MAX];
+        if (n && n < sizeof dir && *p == '/') {
+            memcpy(dir, p, n);
+            dir[n] = 0;
+            if (realpath(dir, real_dir) && !path_within(real_dir, &rst) && o + n + 2 <= cap)
+                o += (size_t)snprintf(out + o, cap - o, "%s%s", o ? ":" : "", dir);
+        }
+        p += n;
+        if (*p == ':') p++;
+    }
+}
+#endif
+
+/* Quick Look on a Mac, else xdg-open, on a private copy of the bytes we hold;
+   the outcome goes to the status bar */
+static void preview_image(const ImagePart *p) {
+    char name[256], err[160] = "", b[sizeof notice];
+    image_name(name, sizeof name, p);
+    bool ok = false;
+    if (!local_session()) {
+        set_notice("preview needs a local session, not SSH");
+        render_screen();
+        return;
+    }
+#ifdef __APPLE__
+    ok = image_preview(p, "/usr/bin/qlmanage", "-p", NULL, err, sizeof err);
+#else
+    char prog[PATH_MAX], path[8192];
+    if (!getenv("DISPLAY") && !getenv("WAYLAND_DISPLAY"))
+        snprintf(err, sizeof err, "no graphical display");
+    else if (!find_tool("xdg-open", prog))
+        snprintf(err, sizeof err, "xdg-open was not found");
+    else {
+        trusted_path(path, sizeof path);
+        ok = image_preview(p, prog, NULL, path, err, sizeof err);
+    }
+#endif
+    int n = fit_bytes(name, 32);
+    if (ok) snprintf(b, sizeof b, "preview opened: %.*s", n, name);
+    else snprintf(b, sizeof b, "no preview of %.*s: %s", n, name, err);
+    set_notice(b);
+    render_screen();
 }
 
 static void send_osc52(const char *s, size_t n) {
@@ -2588,8 +2727,6 @@ static void toggle_mouse(void) {
    Only the input box and the clipboard feed this: never model output, tool
    output or project files. */
 
-#define CLIPBOARD_TIMEOUT_S 10.0
-
 /* shows as busy while an image loads: typed messages queue (nothing here can be
    entered again) and Esc cancels */
 static void load_begin(void) {
@@ -2644,63 +2781,6 @@ static bool attach_refs(char **refs, int n, char *why, size_t cap) {
     return image_attach_refs(g_cfg.cwd, refs, n, &pending, g_msgs, why, cap);
 }
 
-/* osascript writes the clipboard picture to path; no shell */
-static bool run_clipboard(const char *path) {
-    char prog[PATH_MAX];
-    if (!find_tool("osascript", prog)) return false;
-    pid_t pid = fork();
-    if (pid < 0) return false;
-    if (pid == 0) {
-        int nul = open("/dev/null", O_RDWR);
-        if (nul >= 0) { dup2(nul, 0); dup2(nul, 1); dup2(nul, 2); }
-        unsetenv("LC_ALL");
-        setenv("LC_CTYPE", "UTF-8", 1);
-        execv(prog, (char *const[]){
-            "osascript", "-e", "on run argv",
-            "-e", "set d to (the clipboard as «class PNGf»)",
-            "-e", "set f to open for access (POSIX file (item 1 of argv)) with write permission",
-            "-e", "write d to f", "-e", "close access f", "-e", "end run",
-            (char *)path, NULL});
-        _exit(127);
-    }
-    double end = mono_now() + CLIPBOARD_TIMEOUT_S;
-    struct timespec nap = {.tv_sec = 0, .tv_nsec = 20000000};
-    int st = 0;
-    pid_t r;
-    while ((r = waitpid(pid, &st, WNOHANG)) == 0 && mono_now() < end && !g_abort) {
-        if (fw_tick_hook) fw_tick_hook();
-        nanosleep(&nap, NULL);
-    }
-    if (r == 0) { kill(pid, SIGKILL); waitpid(pid, &st, 0); return false; }
-    return r == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0;
-}
-
-static bool attach_clipboard(char *why, size_t cap) {
-    const char *tmp = getenv("TMPDIR");
-    char dir[1024], file[1100];
-    snprintf(dir, sizeof dir, "%s/fw-clip-XXXXXX", tmp && *tmp == '/' ? tmp : "/tmp");
-    if (!mkdtemp(dir)) { snprintf(why, cap, "cannot create a temporary directory"); return false; }
-    snprintf(file, sizeof file, "%s/clipboard.png", dir);
-    ImagePart p = {0};
-    char err[256] = "";
-    bool ran = run_clipboard(file);
-    bool ok = ran && image_from_file(NULL, file, &p, err, sizeof err);
-    unlink(file);
-    rmdir(dir);
-    if (g_abort) snprintf(why, cap, "cancelled");
-    else if (!ran) snprintf(why, cap, "no image on the clipboard");
-    else if (!ok) snprintf(why, cap, "%s", err);
-    else {
-        free(p.source);
-        p.source = str_dup("clipboard");
-        const char *no = images_add(&pending, &p, g_msgs);
-        if (!no) return true;
-        snprintf(why, cap, "%s", no);
-    }
-    if (ok) image_part_free(&p);
-    return false;
-}
-
 static void say_attached(void) {
     char b[160];
     snprintf(b, sizeof b, GREEN "  ✓ %d image%s attached" RESET ": type your message (^C drops %s)",
@@ -2708,22 +2788,66 @@ static void say_attached(void) {
     push_raw(b);
 }
 
-static void paste_clipboard(void) {
-    if (!local_mac()) {
-        push_raw("  /paste reads the clipboard of a local Mac session only.\n"
-                 "  Drag the file in or give an image URL instead.");
+/* The clipboard picture into pending. quiet (a paste that brought no text):
+   say nothing when there is no picture to attach. */
+static void paste_clipboard(bool quiet) {
+    if (!local_session()) {
+        if (!quiet)
+            push_raw("  The clipboard is read in a local session only, not over SSH.\n"
+                     "  Drag the file in or give an image URL instead.");
         return;
     }
+#ifdef __APPLE__
+    const bool mac = true;
+#else
+    const bool mac = false;
+#endif
     char why[600];
+    ImagePart p = {0};
     load_begin();
-    bool ok = !vision_off();
-    if (!ok) no_vision(why, sizeof why);
-    else ok = attach_clipboard(why, sizeof why);
+    ClipResult got = image_from_clipboard(mac, find_tool, &p, why, sizeof why);
+    bool ok = got == CLIP_OK;
+    if (ok && vision_off()) { no_vision(why, sizeof why); ok = false; }
+    tui_pump();                         /* /models does not tick: read an Esc */
+    bool cancelled = g_abort;
+    if (ok && cancelled) { snprintf(why, sizeof why, "cancelled"); ok = false; }
+    if (ok) {
+        const char *no = images_add(&pending, &p, g_msgs);
+        if (no) { snprintf(why, sizeof why, "%s", no); ok = false; }
+    }
+    image_part_free(&p);                /* empty once added */
     load_end();
     if (ok) { say_attached(); return; }
+    if (quiet && (cancelled || got == CLIP_NONE || got == CLIP_NO_TOOL)) return;
     char b[700];
     snprintf(b, sizeof b, YELLOW "  not attached:" RESET " %s", why);
     push_raw(b);
+}
+
+/* /preview [N]: pending image N, else image N of the last sent message that had
+   any; without N, the newest */
+static void preview_command(const char *arg) {
+    char *end = NULL;
+    long n = *arg ? strtol(arg, &end, 10) : 0;
+    const ImagePart *p = NULL;
+    int count = pending.n, from = 0;
+    if (!count) {
+        int last = nitems - 1;
+        while (last >= 0 && items[last].kind != T_IMAGE) last--;
+        for (from = last; from > 0 && items[from - 1].kind == T_IMAGE; from--) {}
+        count = last >= 0 ? last - from + 1 : 0;
+    }
+    if (!count) { set_notice("nothing to preview: no image attached yet"); render_screen(); return; }
+    if (!*arg) n = count;
+    if ((end && *end) || n < 1 || n > count) {
+        char c[24], b[sizeof notice];
+        snprintf(b, sizeof b, "no image %s (1 to %d)", clean_line(c, sizeof c, arg), count);
+        set_notice(b);
+        render_screen();
+        return;
+    }
+    p = pending.n ? &pending.v[n - 1] : &items[from + n - 1].img;
+    preview_image(p);
 }
 
 static void run_slash(const char *cmd) {
@@ -2745,7 +2869,9 @@ static void run_slash(const char *cmd) {
         }
         render_screen();
     } else if (!strcmp(cmd, "/paste")) {
-        paste_clipboard();
+        paste_clipboard(false);
+    } else if (!strncmp(cmd, "/preview", 8) && (!cmd[8] || cmd[8] == ' ')) {
+        preview_command(cmd[8] ? cmd + 9 : "");
     } else if (!strcmp(cmd, "/copy")) {
         copy_last_reply();
     } else if (!strcmp(cmd, "/mouse")) {
@@ -2753,10 +2879,11 @@ static void run_slash(const char *cmd) {
     } else if (!strcmp(cmd, "/help")) {
         char b[900];
         snprintf(b, sizeof b,
-                 "commands: /init /clear /model /allow /status /paste /copy /mouse /help /exit\n"
+                 "commands: /init /clear /model /allow /status /paste /copy /mouse /help /preview /exit\n"
                  "keys: ↑↓ history · Alt+Enter newline (Shift+Enter if the terminal sends it) · ^O expand/collapse cmd · PgUp/PgDn%s scroll · Esc aborts · ^C clear · ^D quit\n"
                  "copy: /copy takes the last reply · /mouse lets the terminal select text\n"
-                 "images: drag a file in or give an image URL · /paste takes the clipboard's\n"
+                 "images: drag a file in, give an image URL, or ^V / /paste for the clipboard's\n"
+                 "        click one, or /preview [N], to see it\n"
                  "mouse on: hold %s and drag to select",
                  mouse_on ? " or wheel" : "", select_key());
         push_raw(b);
@@ -2972,6 +3099,7 @@ static void keep_unsent(const char *raw) {
 /* Send one message the user entered: cmd as the model gets it, raw as typed.
    A path starts with '/' too, so known commands are told apart first. */
 static void submit(const char *cmd, const char *raw) {
+    if (cmd[0] == 22) { paste_clipboard(cmd[1] == 'q'); return; }   /* see clipboard_key */
     if (is_slash(cmd) && known_command(cmd)) { run_slash(cmd); return; }
     char *refs[IMG_MAX_COUNT + 1], *scan = scan_text(raw);
     bool only = false;
@@ -3016,13 +3144,40 @@ static void submit(const char *cmd, const char *raw) {
     tui_run_task(cmd);
 }
 
+/* ^V, or a paste that brought no text (what Cmd+V sends in some terminals when
+   the clipboard holds only a picture). While work is in hand it queues like a
+   typed message, as ^V (22) followed by q if quiet: ^V cannot be typed or
+   pasted into the input box, so no message can pose as one. */
+static void clipboard_key(bool busy, bool quiet) {
+    if (paste_suspect) {                /* may be a byte of the interrupted paste */
+        if (!quiet) set_notice("paste interrupted: press Esc first");
+    } else if (busy) {
+        if (qn >= QMAX) {
+            if (!quiet) set_notice("queue full (8): image not attached");
+        } else {
+            qscan[qn] = str_dup("");
+            qmsg[qn++] = str_dup(quiet ? "\026q" : "\026");
+            if (!quiet) set_notice("image attaches after the current work");
+        }
+    } else {
+        paste_clipboard(quiet);
+        drain_queue();                  /* typed while it was loading */
+    }
+    render_screen();
+}
+
 /* Central key handler shared by the idle REPL loop and the busy pump.
    busy=true while the agent is working: typing edits the input box normally,
    Enter queues the message, Esc/^C abort the task, scrolling/expand all work. */
 static void handle_key(unsigned char ch, bool busy) {
     unsigned char escbuf[32];
-    if (pasting) { paste_feed(ch); return; }   /* nothing pasted acts as a key */
+    if (pasting) {                             /* nothing pasted acts as a key */
+        paste_feed(ch);
+        if (!pasting && paste_empty) clipboard_key(busy, true);
+        return;
+    }
     notice[0] = 0;
+    if (ch == 22) { clipboard_key(busy, false); return; }   /* ^V */
     if (ch == 27) {
         int escn = read_esc_seq(escbuf, sizeof escbuf);
         if (escn == 1) {

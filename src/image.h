@@ -43,6 +43,20 @@ void no_vision(char *why, size_t cap);
 /* true unless sa is a public unicast IPv4/IPv6 address */
 bool image_addr_blocked(const struct sockaddr *sa);
 
+/* The picture on the clipboard, read with the system's own program: osascript on
+   a Mac, else wl-paste or xclip. find locates a trusted program of that name
+   (out holds PATH_MAX bytes). Anything but CLIP_OK leaves the reason in err. */
+typedef bool (*ImageFind)(const char *name, char *out);
+typedef enum { CLIP_OK, CLIP_NONE, CLIP_NO_TOOL, CLIP_ERR } ClipResult;
+ClipResult image_from_clipboard(bool mac, ImageFind find, ImagePart *out, char *err, size_t errcap);
+
+/* Runs prog [opt] FILE, FILE being a private copy of the bytes of p, without
+   waiting for it; its output is discarded. path (may be NULL) replaces its PATH. */
+bool image_preview(const ImagePart *p, const char *prog, const char *opt, const char *path,
+                   char *err, size_t errcap);
+/* removes the preview copies (also done at exit); async-signal-safe */
+void image_preview_cleanup(void);
+
 #ifdef FW_IMAGE_TEST
 extern int image_test_port;   /* 127.0.0.1:<port> is allowed when nonzero */
 #endif

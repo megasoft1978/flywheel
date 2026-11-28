@@ -56,7 +56,8 @@ flywheel setup                # engine + model
 
 Options: `-C DIR` working directory, `-m MODEL`, `-e URL` endpoint, `--unsafe`, `--version`,
 `--help` (`--help all` lists more). Images: drag a file in, type its path (`./shot.png`, not a bare
-name) or URL, or `/paste` ([details](docs/advanced.md#images)).
+name) or URL, or paste the clipboard's with `^V` or `/paste`; click one to preview it
+([details](docs/advanced.md#images)).
 
 ## Safety
 

@@ -1,10 +1,12 @@
-/* image.c — load, check, downscale and encode image attachments */
+/* image.c — load, check, downscale and encode image attachments; read the
+   clipboard and show a held image with the system's own programs */
 #define _DARWIN_C_SOURCE 1
 #define _DEFAULT_SOURCE 1
 #include "image.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <spawn.h>
 #include <stdint.h>
@@ -138,6 +140,27 @@ static char *data_uri(const char *mime, const unsigned char *d, size_t n) {
 
 /* ---------- files ---------- */
 
+/* a new private file holding d */
+static bool write_new(const char *path, const unsigned char *d, size_t n) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0) return false;
+    size_t off = 0;
+    while (off < n) {
+        ssize_t w = write(fd, d + off, n - off);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) break;
+        off += (size_t)w;
+    }
+    return !close(fd) && off == n;
+}
+
+/* a fresh 0700 directory under TMPDIR (if absolute) or /tmp */
+static bool temp_dir(char *dir, size_t cap, const char *kind) {
+    const char *tmp = getenv("TMPDIR");
+    snprintf(dir, cap, "%s/fw-%s-XXXXXX", tmp && *tmp == '/' ? tmp : "/tmp", kind);
+    return mkdtemp(dir) != NULL;
+}
+
 /* whole regular file of at most IMG_FILE_MAX bytes; NULL with a reason */
 static unsigned char *load(const char *path, size_t *len, char *err, size_t errcap) {
     /* O_NONBLOCK: a FIFO must not hang the UI before fstat rejects it */
@@ -199,25 +222,12 @@ static bool run_quiet(char *const argv[]) {
 static bool downscale(unsigned char **d, size_t *n, const char *mime, char *err, size_t errcap) {
     bool jpeg = !strcmp(mime, "image/jpeg");
     const char *ext = jpeg ? "jpg" : mime + strlen("image/");
-    const char *tmp = getenv("TMPDIR");
     char dir[1024], in[1100], out[1100], max[16];
-    snprintf(dir, sizeof dir, "%s/fw-img-XXXXXX", tmp && *tmp == '/' ? tmp : "/tmp");
-    if (!mkdtemp(dir)) return fail(err, errcap, "cannot create a temporary directory");
+    if (!temp_dir(dir, sizeof dir, "img")) return fail(err, errcap, "cannot create a temporary directory");
     snprintf(in, sizeof in, "%s/in.%s", dir, ext);
     snprintf(out, sizeof out, "%s/out.%s", dir, jpeg ? "jpg" : "png");
     snprintf(max, sizeof max, "%d", IMG_MAX_DIM);
-    bool ok = false;
-    int fd = open(in, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-    if (fd >= 0) {
-        size_t off = 0;
-        while (off < *n) {
-            ssize_t w = write(fd, *d + off, *n - off);
-            if (w < 0 && errno == EINTR) continue;
-            if (w <= 0) break;
-            off += (size_t)w;
-        }
-        ok = !close(fd) && off == *n;
-    }
+    bool ok = write_new(in, *d, *n);
     char *argv[] = {"/usr/bin/sips", "-s", "format", jpeg ? "jpeg" : "png",
                     "-Z", max, in, "--out", out, NULL};
     if (!ok) fail(err, errcap, "could not write the temporary copy to downscale");
@@ -263,6 +273,195 @@ static bool make_part(unsigned char *d, size_t n, const char *source, ImagePart 
         return fail(err, errcap, "out of memory");
     }
     return true;
+}
+
+/* ---------- clipboard ---------- */
+
+#define CLIPBOARD_TIMEOUT_S 10
+
+/* One clipboard program, no shell, killed on timeout or abort. Its output goes
+   to the new file out; with none it is discarded (osascript writes its own).
+   True if it exited successfully. */
+static bool run_clip(const char *prog, char *const argv[], const char *out) {
+    pid_t pid = fork();
+    if (pid < 0) return false;
+    if (pid == 0) {
+        int nul = open("/dev/null", O_RDWR);
+        if (nul >= 0) { dup2(nul, 0); dup2(nul, 1); dup2(nul, 2); }
+        if (out) {
+            int fd = open(out, O_WRONLY | O_CREAT | O_EXCL, 0600);
+            if (fd < 0 || dup2(fd, 1) < 0) _exit(126);
+        } else {
+            unsetenv("LC_ALL");
+            setenv("LC_CTYPE", "UTF-8", 1);
+        }
+        execv(prog, argv);
+        _exit(127);
+    }
+    struct timespec t0, t, nap = {0, 20000000};
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int st = 0;
+    pid_t r;
+    while ((r = waitpid(pid, &st, WNOHANG)) == 0 && !g_abort) {
+        clock_gettime(CLOCK_MONOTONIC, &t);
+        if (t.tv_sec - t0.tv_sec >= CLIPBOARD_TIMEOUT_S) break;
+        if (fw_tick_hook) fw_tick_hook();
+        nanosleep(&nap, NULL);
+    }
+    if (r == 0) { kill(pid, SIGKILL); waitpid(pid, &st, 0); return false; }
+    return r == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+
+ClipResult image_from_clipboard(bool mac, ImageFind find, ImagePart *out, char *err, size_t errcap) {
+    *out = (ImagePart){0};
+    static const struct { const char *name; bool mac; } TOOLS[] = {
+        {"osascript", true}, {"wl-paste", false}, {"xclip", false}};
+    char prog[3][PATH_MAX], dir[1024], file[1100];
+    bool have[3] = {false}, any = false;
+    for (int i = 0; i < 3; i++)
+        if (TOOLS[i].mac == mac && find(TOOLS[i].name, prog[i])) have[i] = any = true;
+    if (!any) {
+        fail(err, errcap, mac ? "osascript was not found"
+                              : "reading the clipboard needs wl-paste (wl-clipboard) or xclip");
+        return CLIP_NO_TOOL;
+    }
+    if (!temp_dir(dir, sizeof dir, "clip")) {
+        fail(err, errcap, "cannot create a temporary directory");
+        return CLIP_ERR;
+    }
+    snprintf(file, sizeof file, "%s/clipboard.png", dir);
+    ClipResult res = CLIP_NONE;
+    for (int i = 0; i < 3 && res == CLIP_NONE && !g_abort; i++) {
+        if (!have[i]) continue;
+        char *const script[] = {
+            "osascript", "-e", "on run argv",
+            "-e", "set d to (the clipboard as «class PNGf»)",
+            "-e", "set f to open for access (POSIX file (item 1 of argv)) with write permission",
+            "-e", "write d to f", "-e", "close access f", "-e", "end run",
+            file, NULL};
+        char *const wl[] = {"wl-paste", "--no-newline", "--type", "image/png", NULL};
+        char *const x[] = {"xclip", "-selection", "clipboard", "-t", "image/png", "-o", NULL};
+        if (run_clip(prog[i], i == 0 ? script : i == 1 ? wl : x, mac ? NULL : file) && !g_abort) {
+            size_t n;
+            unsigned char *d = load(file, &n, err, errcap);
+            if (!d) res = CLIP_ERR;
+            else if (!mac && !image_mime(d, n)) free(d);   /* text, say */
+            else res = make_part(d, n, "clipboard", out, err, errcap) ? CLIP_OK : CLIP_ERR;
+        }
+        unlink(file);
+    }
+    rmdir(dir);
+    if (g_abort) {
+        image_part_free(out);
+        fail(err, errcap, "cancelled");
+        return CLIP_ERR;
+    }
+    if (res == CLIP_NONE) fail(err, errcap, "no image on the clipboard");
+    return res;
+}
+
+/* ---------- preview ---------- */
+
+#define PREVIEW_KEEP 8
+
+/* the copies still on disk; live is set only once both names are complete */
+static struct { char dir[1024], file[1100]; volatile sig_atomic_t live; } previews[PREVIEW_KEEP];
+static int preview_next;
+static pid_t preview_owner;
+
+static void preview_drop(int i) {
+    if (!previews[i].live) return;
+    unlink(previews[i].file);
+    rmdir(previews[i].dir);
+    previews[i].live = 0;
+}
+
+void image_preview_cleanup(void) {
+    if (getpid() != preview_owner) return;
+    for (int i = 0; i < PREVIEW_KEEP; i++) preview_drop(i);
+}
+
+/* the bytes of a data: URI made by data_uri; malloc'd, NULL if it is not one */
+static unsigned char *data_bytes(const char *url, size_t *n) {
+    const char *s = url ? strchr(url, ',') : NULL;
+    if (!s) return NULL;
+    unsigned char *d = malloc(strlen(++s) / 4 * 3 + 3);
+    if (!d) return NULL;
+    unsigned v = 0;
+    int bits = 0;
+    *n = 0;
+    for (; *s && *s != '='; s++) {
+        int c = *s >= 'A' && *s <= 'Z' ? *s - 'A' : *s >= 'a' && *s <= 'z' ? *s - 'a' + 26
+              : *s >= '0' && *s <= '9' ? *s - '0' + 52 : *s == '+' ? 62 : *s == '/' ? 63 : -1;
+        if (c < 0) { free(d); return NULL; }
+        v = (v << 6 | (unsigned)c) & 0xFFFFFF;
+        if ((bits += 6) >= 8) d[(*n)++] = (unsigned char)(v >> (bits -= 8));
+    }
+    return d;
+}
+
+/* argv directly, no shell, in its own session with no terminal. Not waited for:
+   after a double fork the viewer is not our child, so it leaves no zombie. The
+   pipe closes on exec and carries a byte if the viewer could not start. */
+static bool launch(const char *prog, char *const argv[], const char *path, const char *cwd) {
+    int fd[2];
+    if (pipe(fd)) return false;
+    fcntl(fd[0], F_SETFD, FD_CLOEXEC);
+    fcntl(fd[1], F_SETFD, FD_CLOEXEC);
+    pid_t pid = fork();
+    if (pid < 0) { close(fd[0]); close(fd[1]); return false; }
+    if (pid == 0) {
+        setsid();
+        pid_t viewer = fork();
+        if (viewer > 0) _exit(0);
+        if (!viewer) {
+            int nul = open("/dev/null", O_RDWR);
+            if (nul >= 0 && dup2(nul, 0) >= 0 && dup2(nul, 1) >= 0 && dup2(nul, 2) >= 0 && !chdir(cwd)) {
+                if (path) setenv("PATH", path, 1);
+                for (int k = 3; k < 256; k++)
+                    if (k != fd[1]) close(k);
+                execv(prog, argv);
+            }
+        }
+        ssize_t w = write(fd[1], "x", 1);
+        _exit(w == 1 ? 127 : 126);
+    }
+    close(fd[1]);
+    char c;
+    ssize_t r;
+    while ((r = read(fd[0], &c, 1)) < 0 && errno == EINTR) {}
+    close(fd[0]);
+    while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
+    return r == 0;
+}
+
+bool image_preview(const ImagePart *p, const char *prog, const char *opt, const char *path,
+                   char *err, size_t errcap) {
+    size_t n;
+    unsigned char *d = data_bytes(p->url, &n);
+    const char *mime = d ? image_mime(d, n) : NULL;
+    if (!mime) { free(d); return fail(err, errcap, "the image cannot be decoded"); }
+    if (!preview_owner) atexit(image_preview_cleanup);
+    preview_owner = getpid();
+    int i = preview_next++ % PREVIEW_KEEP;
+    preview_drop(i);
+    if (!temp_dir(previews[i].dir, sizeof previews[i].dir, "view")) {
+        free(d);
+        return fail(err, errcap, "cannot create a temporary directory");
+    }
+    /* the name comes from the detected type only */
+    snprintf(previews[i].file, sizeof previews[i].file, "%s/image.%s", previews[i].dir,
+             !strcmp(mime, "image/jpeg") ? "jpg" : mime + strlen("image/"));
+    previews[i].live = 1;
+    bool ok = write_new(previews[i].file, d, n);
+    free(d);
+    char *argv[4] = {(char *)prog};
+    int a = 1;
+    if (opt) argv[a++] = (char *)opt;
+    argv[a] = previews[i].file;
+    if (ok && launch(prog, argv, path, previews[i].dir)) return true;
+    preview_drop(i);
+    return fail(err, errcap, ok ? "cannot start the viewer" : "could not write the temporary copy");
 }
 
 /* ---------- dragged paths ---------- */
