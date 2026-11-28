@@ -402,7 +402,7 @@ int fw_do_init(void) {
     return 0;
 }
 
-/* images named in a one-shot prompt attach as in the TUI: same finder, loader,
+/* images named in a typed one-shot prompt attach as in the TUI: same finder, loader,
    limits and vision check. Refusal goes to stderr; the notice is the TUI's. */
 static bool oneshot_images(const char *prompt, Images *out) {
     char *refs[IMG_MAX_COUNT + 1];
@@ -542,7 +542,10 @@ int main(int argc, char **argv) {
             sysp = s;
         }
         Images imgs = {0};
-        if (!oneshot_images(prompt, &imgs)) { free(sysp); return 2; }
+        /* only what the user typed: not a task file or stdin, and (as in the
+           TUI) not a block of several lines */
+        bool typed = !g_cfg.prompt_file && g_cfg.once && !strchr(prompt, '\n');
+        if (typed && !oneshot_images(prompt, &imgs)) { free(sysp); return 2; }
         Msgs msgs; msgs_init(&msgs);
         msgs_push(&msgs, "system", sysp);
         msgs_push(&msgs, "user", prompt);

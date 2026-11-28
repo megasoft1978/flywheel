@@ -127,8 +127,9 @@ Project instructions come from the first of `.flywheel.md`, `AGENTS.md` or `CLAU
 ## Images
 
 In the interactive UI and in one-shot mode (`flywheel "describe ./shot.png"`), with the same rules.
-One-shot prints `✓ N image(s) attached` on stderr, or `flywheel: not sent: ...` and exits 2 when an image
-cannot be loaded:
+One-shot searches only a one-line prompt given on the command line: a `-f` file, piped stdin and a
+prompt of several lines are never searched. It prints `✓ N image(s) attached` on stderr, or
+`flywheel: not sent: ...` and exits 2 when an image cannot be loaded:
 
 - Drag an image file onto the terminal, or type its path: absolute, `~/`, `./`, `../` or `file://`,
   ending in `.png`, `.jpg`, `.jpeg`, `.gif` or `.webp`. Shell escapes and quotes are understood.
@@ -147,7 +148,9 @@ fetched. Naming an image file attaches it, even outside the project.
 Limits: 10 MB per file, and 64 images or 32 MB (encoded) per conversation. On macOS, images over
 1568 px on a side are downscaled. Images stay in the conversation until `/clear`, and while they do, a
 model without vision gets nothing. If the server refuses a request with images (HTTP 400, 413, 415 or
-422), the images of that message are dropped, your text is kept, and the run says so; nothing is retried.
+422), the images of the newest message it has not accepted before are dropped, that message's text
+stays, and the run says so; nothing is retried. Accepted images are not dropped, and neither is
+anything when the refusal is about the context size.
 
 The engine must serve the model with vision. `flywheel setup` starts it that way. A server started
 with `--language-only` (as earlier versions did) has to be stopped and started again; flywheel refuses

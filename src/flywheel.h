@@ -60,6 +60,7 @@ typedef struct {
     char *tool_call_id;  /* tool msgs only */
     cJSON *tool_calls;   /* assistant msgs only: raw array, owned */
     Images images;       /* owned; content becomes a parts array when n > 0 */
+    bool images_seen;    /* the server has accepted a request with them */
 } Msg;
 
 typedef struct { Msg *v; int n, cap; } Msgs;

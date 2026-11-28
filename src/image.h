@@ -33,7 +33,8 @@ bool image_from_url(const char *url, ImagePart *out, char *err, size_t errcap);
 /* all-or-none load of refs into set (see image.c); why gets the reason */
 bool image_attach_refs(const char *cwd, char **refs, int n, Images *set, const Msgs *conv,
                        char *why, size_t cap);
-/* after a refused request: drop the newest message's images, note what went */
+/* after a refused request: drop the images of the newest message that has not
+   been accepted yet, note what went; nothing on a context overflow */
 bool image_drop_rejected(Msgs *msgs, const char *err, char *note, size_t cap);
 /* tui.c: true only when /models says the current model cannot take images;
    no_vision fills why for that refusal */

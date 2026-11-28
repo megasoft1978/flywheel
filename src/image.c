@@ -721,21 +721,34 @@ bool image_attach_refs(const char *cwd, char **refs, int n, Images *set, const M
     return ok;
 }
 
+/* a refusal for the size of the conversation, which no image caused alone */
+static bool context_overflow(const char *err) {
+    /* also covers "maximum context length" and "exceed_context_size" */
+    for (; *err; err++)
+        if (!strncasecmp(err, "context", 7)) return true;
+    return false;
+}
+
 /* The server refused a request that carried images (400, 413, 415, 422). The
-   newest message with images is the likeliest cause: its images go, its text
-   stays, so later requests stop failing. A refusal again drops the next one.
-   note gets what was dropped for the user. False if nothing was dropped. */
+   newest message with images it has not accepted before is the likeliest cause:
+   its images go, its text stays, so later requests stop failing. A refusal again
+   drops the next one. note gets what was dropped for the user. False if nothing
+   was dropped. */
 bool image_drop_rejected(Msgs *msgs, const char *err, char *note, size_t cap) {
     int code = 0;
     if (!err || strncmp(err, "status ", 7) || sscanf(err + 7, "%d", &code) != 1) return false;
     if (code != 400 && code != 413 && code != 415 && code != 422) return false;
+    if (context_overflow(err)) return false;
     for (int i = msgs->n - 1; i >= 0; i--) {
         Images *imgs = &msgs->v[i].images;
-        if (!imgs->n) continue;
-        char src[200] = "";
-        snprintf(src, sizeof src, "%s", imgs->v[0].source ? imgs->v[0].source : "image");
-        snprintf(note, cap, "server refused the image %s (status %d): dropped %d from your message, "
-                 "your text is kept", src, code, imgs->n);
+        if (!imgs->n || msgs->v[i].images_seen) continue;
+        const char *src = imgs->v[0].source ? imgs->v[0].source : "image";
+        bool url = !strncasecmp(src, "http://", 7) || !strncasecmp(src, "https://", 8);
+        const char *base = url ? NULL : strrchr(src, '/');
+        char name[200];
+        one_line(name, sizeof name, base ? base + 1 : src);
+        snprintf(note, cap, "server refused the image %s (status %d): dropped %d from the message; "
+                 "the text stays", name, code, imgs->n);
         images_free(imgs);
         return true;
     }

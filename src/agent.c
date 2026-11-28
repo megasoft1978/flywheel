@@ -184,6 +184,8 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
             if (r) chat_resp_free(r);
             break;
         }
+        for (int i = 0; i < msgs->n; i++)   /* accepted: never dropped later */
+            if (msgs->v[i].images.n) msgs->v[i].images_seen = true;
         if (r->prompt_tokens > 0) ptoks = r->prompt_tokens;
         toks += r->completion_tokens;
         secs += r->secs;
@@ -436,10 +438,12 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
                 resets++;
                 /* context reset: keep system + current task, then a reset msg */
                 Images held = images_copy(&msgs->v[task].images);   /* freed by trunc */
+                bool seen = msgs->v[task].images_seen;
                 msgs_trunc(msgs, task > 0 ? 1 : 0);
                 msgs_push(msgs, "user", taskmsg);
                 task = msgs->n - 1;
                 msgs->v[task].images = held;
+                msgs->v[task].images_seen = seen;
                 snprintf(pb, sizeof pb,
                     "Context reset after repeated %s loop. Your saved files:\n%s\nCurrent type check:\n%.1000s\nRe-read the task prompt carefully. Inspect the existing files, find what is still missing or wrong versus the requirements, fix it with a different approach, verify the type check is clean, and reply DONE.",
                     kind, files, go);
