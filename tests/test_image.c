@@ -844,6 +844,16 @@ static void test_clipboard(void) {
     T("linux: hung tool", clip(false, &p, err, sizeof err) == CLIP_ERR &&
                           !strcmp(err, "clipboard program timed out") && !p.url);
     T("linux: hung tool, no fallback", !slurp_in("args", args, sizeof args));
+
+    /* a helper the tool started dies with it */
+    snprintf(body, sizeof body, "#!/bin/sh\n/bin/sleep 30 &\necho $! >'%s/helper'\nwait\n", dir);
+    script("wl-paste", body);
+    T("linux: hung tool with a helper", clip(false, &p, err, sizeof err) == CLIP_ERR);
+    char helper[32];
+    pid_t hp = slurp_in("helper", helper, sizeof helper) ? (pid_t)atol(helper) : 0;
+    for (int i = 0; i < 100 && hp > 0 && !kill(hp, 0); i++) usleep(10000);
+    T("linux: helper killed", hp > 0 && kill(hp, 0));
+    drop("helper");
     image_test_clip_s = 0;
 
     /* runs in the private directory, with no descriptor of ours beyond 0-2 */

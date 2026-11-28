@@ -302,6 +302,7 @@ static RunResult run_clip(const char *prog, char *const argv[], const char *dir,
     pid_t pid = fork();
     if (pid < 0) return RUN_FAIL;
     if (pid == 0) {
+        setpgid(0, 0);           /* its helpers die with it */
         int nul = open("/dev/null", O_RDWR);
         if (nul >= 0) { dup2(nul, 0); dup2(nul, 1); dup2(nul, 2); }
         if (to_stdout) {
@@ -327,7 +328,7 @@ static RunResult run_clip(const char *prog, char *const argv[], const char *dir,
         if (fw_tick_hook) fw_tick_hook();
         nanosleep(&nap, NULL);
     }
-    if (r == 0) { kill(pid, SIGKILL); waitpid(pid, &st, 0); }
+    if (r == 0) { kill(-pid, SIGKILL); kill(pid, SIGKILL); waitpid(pid, &st, 0); }
     if (oversized(file)) return RUN_TOO_BIG;   /* also if it exited between polls */
     if (r == 0) return late ? RUN_TIMEOUT : RUN_FAIL;
     return r == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0 ? RUN_OK : RUN_FAIL;
