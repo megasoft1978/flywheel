@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="-10 -6 880 274" width="880" height="274" role="img" aria-labelledby="t d">
 <title id="t">How flywheel works</title>
-<desc id="d">The local model sends a tool call, which flywheel repairs or rejects, and commands run in the macOS sandbox. Output goes back to the model, and a loop breaker prunes repeats. When the model has finished after changing files, a check gate type-checks or compiles; if it fails the model goes back to fix it.</desc>
+<desc id="d">The local model sends a tool call, which flywheel repairs or rejects, and commands run in the sandbox on macOS. Output goes back to the model, and a loop breaker prunes repeats. Only TypeScript, Python, Go and Rust projects (the last two experimental) get a check gate, which type-checks or compiles when the model has finished after changing files; if it fails the model goes back to fix it. Other projects finish without one.</desc>
 <style>
   .bg{fill:#fff;stroke:#d3dae3}
   .box{fill:#eef1f6;stroke:#9aa8ba;stroke-width:1.5}

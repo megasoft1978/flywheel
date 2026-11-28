@@ -11,10 +11,11 @@ earlier build: [full 56 s video](https://megasoft1978.github.io/flywheel/) · [t
 
 ## How it works
 
-![The local model sends a tool call, flywheel repairs or rejects it, commands run in the macOS sandbox, output goes back to the model with a loop breaker watching for repeats, and a check gate runs when it has finished](docs/how-it-works.svg)
+![The local model sends a tool call, flywheel repairs or rejects it, commands run in the sandbox on macOS, output goes back to the model with a loop breaker watching for repeats, and a check gate runs when it has finished in TypeScript, Python, Go and Rust projects](docs/how-it-works.svg)
 
-File edits do not run in the sandbox; the file tools are confined to the project. The check gate is a
-type check or compile, also run now and then on long runs: passing it does not mean the code is correct.
+File edits do not run in the sandbox; the file tools are confined to the project. Only TypeScript,
+Python, Go and Rust projects (the last two experimental) get a check gate; others finish without one.
+It is a type check or compile, also run now and then on long runs: passing does not mean correct.
 
 ## Why use it
 
@@ -49,13 +50,13 @@ are untested.
 ```bash
 flywheel                      # interactive session
 flywheel "fix the bug"        # one-shot: approves commands automatically
-flywheel -f task.md           # task from a file
+flywheel -f task.md           # one-shot too, as is piped input
 flywheel setup                # engine + model
 ```
 
 Options: `-C DIR` working directory, `-m MODEL`, `-e URL` endpoint, `--unsafe`, `--version`,
-`--help` (`--help all` lists more). Images: drag a file in, type its path or URL, or `/paste`
-([details](docs/advanced.md#images)).
+`--help` (`--help all` lists more). Images: drag a file in, type its path (`./shot.png`, not a bare
+name) or URL, or `/paste` ([details](docs/advanced.md#images)).
 
 ## Safety
 
@@ -64,13 +65,18 @@ Options: `-C DIR` working directory, `-m MODEL`, `-e URL` endpoint, `--unsafe`, 
 >
 > - **No sandbox on Linux.** There, approved commands can write anywhere you can and use the network.
 > - **A project `.env` is readable by the model**, as are other secrets in the places it may read.
-> - **One-shot approves commands automatically** (so does `bench`; network excepted).
-> - **Use a VM for untrusted repositories** and untrusted tasks.
+> - **One-shot approves commands automatically**: a prompt argument, `-f` or piped input. So does
+>   `bench`. Network access is excepted.
+> - **"Always allow" is remembered.** The interactive UI does not ask again for such a command, even
+>   if the model has since changed the files it runs.
+> - **Use a VM for untrusted repositories and tasks.**
 
 On macOS, the commands the model runs and the verification gate go through a Seatbelt sandbox. Files
 inside the project can still change, including build scripts you may later run outside it.
 Everything you can read outside your home directory stays readable and can reach the model.
-Start flywheel in a project directory, not in your home directory.
+Start flywheel in a project directory, not in your home directory. `--unsafe` turns off the sandbox
+(on macOS too) and environment filtering; where there is no sandbox, one-shot and `bench` refuse to
+run without it.
 [Full safety page](docs/safety.md): every rule, exception and known gap.
 
 ## Limits
@@ -91,9 +97,8 @@ flywheel was tuned on, Claude models scored clearly higher, under a different pr
 
 ## Docs
 
-- [Safety](docs/safety.md): the sandbox in full.
-- [Advanced](docs/advanced.md): flags, config, images, harness behaviour, terminal UI, development.
-- [Benchmarks](docs/benchmarks.md): early runs and how to reproduce the pilot.
+[Safety](docs/safety.md) · [Advanced](docs/advanced.md) (flags, config, images, harness, development) ·
+[Benchmarks](docs/benchmarks.md)
 
 ## License
 

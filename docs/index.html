@@ -158,7 +158,7 @@ cd flywheel &amp;&amp; make
 <section id="harness">
   <h2>A loop built for a local model's mistakes</h2>
 
-  <svg class="loop wide" viewBox="0 0 860 262" role="img" aria-label="The local model sends a tool call, flywheel repairs or rejects it, and commands run in the sandbox. Output goes back to the model and a loop breaker prunes repeats. When finished, a check gate type-checks or compiles; if it fails the model is told to fix it.">
+  <svg class="loop wide" viewBox="0 0 860 262" role="img" aria-label="The local model sends a tool call, flywheel repairs or rejects it, and commands run in the sandbox on macOS. Output goes back to the model and a loop breaker prunes repeats. When finished, TypeScript, Python, Go and Rust projects get a check gate; if it fails the model is told to fix it.">
     <defs>
       <marker id="wa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path class="fh" d="M0 0L10 5L0 10z"/></marker>
       <marker id="wb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path class="rh" d="M0 0L10 5L0 10z"/></marker>
@@ -177,7 +177,7 @@ cd flywheel &amp;&amp; make
     <text class="l" x="415" y="252">check fails: the model is told to fix it</text>
   </svg>
 
-  <svg class="loop tall" viewBox="0 0 340 444" role="img" aria-label="Local model, then tool-call repair, then sandbox, then check gate. Output goes back to the model, a loop breaker prunes repeats, and a failed check sends the model back to fix it.">
+  <svg class="loop tall" viewBox="0 0 340 444" role="img" aria-label="Local model, then tool-call repair, then sandbox on macOS, then check gate for TypeScript, Python, Go and Rust projects. Output goes back to the model, a loop breaker prunes repeats, and a failed check sends the model back to fix it.">
     <defs>
       <marker id="ta" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path class="fh" d="M0 0L10 5L0 10z"/></marker>
       <marker id="tb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path class="rh" d="M0 0L10 5L0 10z"/></marker>
@@ -195,7 +195,7 @@ cd flywheel &amp;&amp; make
     <text class="l" transform="translate(12 192) rotate(-90)">check fails: fix it</text>
   </svg>
 
-  <p class="under">File edits skip the sandbox but are confined to the project. The interactive UI asks before anything outside a short read-only list, and before the check. A passing check means the code type-checks or compiles, not that it is correct.</p>
+  <p class="under">File edits skip the sandbox but are confined to the project. The interactive UI asks before anything outside a short read-only list, and before the check, unless you chose "always allow": a remembered command is not asked again, even if the model has since changed the files it runs. Only TypeScript, Python, Go and Rust projects (the last two experimental) get a check gate; others finish without one. A passing check means the code type-checks or compiles, not that it is correct.</p>
 </section>
 
 <section id="sandbox">
@@ -221,7 +221,7 @@ cd flywheel &amp;&amp; make
       <ul>
         <li><svg class="i" aria-hidden="true"><use href="#i-pen"/></svg><div>Writing anywhere else<small>except, in a linked git worktree, parts of the main repository's git data</small></div></li>
         <li><svg class="i" aria-hidden="true"><use href="#i-home"/></svg><div>The rest of your home directory</div></li>
-        <li><svg class="i" aria-hidden="true"><use href="#i-lock"/></svg><div>Credential stores<small><code>~/.ssh</code>, <code>~/.aws</code>, keychains, browser profiles and more</small></div></li>
+        <li><svg class="i" aria-hidden="true"><use href="#i-lock"/></svg><div>Credential stores<small>a fixed list: <code>~/.ssh</code>, <code>~/.aws</code>, keychains, common browser profiles and others</small></div></li>
         <li><svg class="i" aria-hidden="true"><use href="#i-net"/></svg><div>The network<small>unless you approve one command in the interactive UI; it can then reach any address</small></div></li>
       </ul>
     </div>
@@ -249,7 +249,7 @@ cd flywheel &amp;&amp; make
     </figure>
     <div>
       <ul class="ways">
-        <li>Drag an image onto the terminal, or type its path</li>
+        <li>Drag an image onto the terminal, or type its path: <code>./shot.png</code>, not a bare name</li>
         <li>Give an image URL (not in the static Linux build)</li>
         <li><code>/paste</code> a picture from the clipboard (local macOS session)</li>
       </ul>
@@ -274,7 +274,7 @@ cd flywheel &amp;&amp; make
   <h2>Results</h2>
   <div class="slot">
     <svg viewBox="0 0 420 110" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2"><path d="M30 8v92h370"/><path d="M30 31h370M30 54h370M30 77h370" stroke-dasharray="3 7"/></svg>
-    <h3>Benchmark in progress</h3>
+    <h3>Benchmark being prepared</h3>
     <p>A Terminal-Bench 2.1 run is being prepared, with the same local model in flywheel and in two other agents. No scored run has started, so there is no chart yet.</p>
     <p><a href="https://github.com/megasoft1978/flywheel/blob/main/bench/PROTOCOL.md">Draft protocol</a> and <a href="https://github.com/megasoft1978/flywheel/blob/main/docs/benchmarks.md">early informal runs, with their caveats</a></p>
   </div>
@@ -286,11 +286,11 @@ cd flywheel &amp;&amp; make
     <ul>
       <li><b>No sandbox on Linux.</b><span>Approved commands can write anywhere you can and use the network.</span></li>
       <li><b>A project <code>.env</code> is readable by the model.</b><span>So are other secrets in the places it may read.</span></li>
-      <li><b>One-shot approves commands automatically.</b><span>So does <code>bench</code>. Network access is the exception.</span></li>
-      <li><b>Use a VM for untrusted repositories.</b><span>Files in the project can change, including build scripts you may run later.</span></li>
+      <li><b>One-shot approves commands automatically.</b><span>One-shot means a prompt argument, <code>-f</code> or piped input. So does <code>bench</code>. Network access is the exception.</span></li>
+      <li><b>Use a VM for untrusted repositories and tasks.</b><span>Files in the project can change, including build scripts you may run later.</span></li>
     </ul>
   </div>
-  <p class="under">Without a sandbox, one-shot and <code>bench</code> refuse to run unless you pass <code>--unsafe</code>, which also turns off environment filtering. <a href="https://github.com/megasoft1978/flywheel/blob/main/docs/safety.md">Read the full safety page</a></p>
+  <p class="under"><code>--unsafe</code> turns off the sandbox, on macOS too, and environment filtering. Where there is no sandbox, one-shot and <code>bench</code> refuse to run without it. <a href="https://github.com/megasoft1978/flywheel/blob/main/docs/safety.md">Read the full safety page</a></p>
 </section>
 
 <section id="limits">

@@ -46,6 +46,9 @@ flywheel -f task.md                 # task from a file
 flywheel setup                      # engine + model, asks first
 ```
 
+**One-shot** is a run given its task up front: a prompt argument, `-f FILE` or piped input. It
+approves commands automatically, as does `bench`; network access is excepted and cannot be granted.
+
 | flag | meaning | default |
 |---|---|---|
 | `-C DIR` | working directory | current |
