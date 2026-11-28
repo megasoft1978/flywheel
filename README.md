@@ -3,7 +3,7 @@
 **A terminal coding agent in C for a model running on your Mac.**
 
 The tested setup is Qwen3.8-27B served locally by Splash with a DFlash2 drafter. No cloud
-account and no API key. flywheel is about 7k lines of C (plus vendored cJSON): the macOS build
+account and no API key. flywheel is about 11k lines of C (plus vendored cJSON): the macOS build
 links only `libcurl`, and the Linux build is static.
 
 ![flywheel fixing a Python bug in the terminal, with approval dialogs](docs/demo.gif)
@@ -409,8 +409,8 @@ applies unless `--unsafe` is also given.
   network, and for `bench` grading scripts.
 - Go and Rust gates are experimental.
 - The harness was tuned on the private suite below.
-- Not yet measured against OpenCode with the same model, or against Claude Haiku 5.5 run as an
-  agent. The planned protocol is in [`bench/PROTOCOL.md`](bench/PROTOCOL.md).
+- No Terminal-Bench 2.1 results yet, and no comparison with other agents on the same model. The
+  planned protocol is in [`bench/PROTOCOL.md`](bench/PROTOCOL.md).
 
 ## Benchmarks
 
