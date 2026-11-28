@@ -4114,9 +4114,214 @@ static void test_fail_closed(void) {
     sandbox_disable_for_test(false);
 }
 
-int main(void) {
+/* the placeholder in uv's cache is still a link to /dev/null */
+static bool uv_mark(const char *tmp) {
+    char p[PATH_MAX + 64], to[64];
+    snprintf(p, sizeof p, "%s/cache/uv/sdists-v9/.git", tmp);
+    ssize_t n = readlink(p, to, sizeof to);
+    return n == 9 && !memcmp(to, "/dev/null", 9);
+}
+
+static char self[PATH_MAX];
+
+/* this program again, as a process of its own, so that its exit cleanup runs:
+   one command, then `after` on the host with the command's TMPDIR in $T */
+static int sbx_exit(const char *cwd, const char *after) {
+    g_cfg.cwd = str_dup(cwd);
+    char *o = run_bash("printf %s \"$TMPDIR\"", cwd, 10);
+    if (setenv("T", o, 1) || system(after)) return 1;
+    fputs(o, stdout);
+    free(o);
+    return 0;
+}
+
+/* the TMPDIR that process had, "" if it failed */
+static void exited(const char *cwd, const char *after, char *tmp, size_t cap) {
+    char cmd[4 * PATH_MAX];
+    snprintf(cmd, sizeof cmd, "'%s' --sbx-exit '%s' '%s'", self, cwd, after);
+    FILE *f = popen(cmd, "r");
+    size_t n = f ? fread(tmp, 1, cap - 1, f) : 0;
+    tmp[n] = 0;
+    if (!f || pclose(f)) *tmp = 0;
+}
+
+/* common tools inside the sandbox, and what had to be there for them */
+static void test_sandbox_tools(void) {
+    char base[PATH_MAX], home[PATH_MAX], proj[PATH_MAX], tmp[PATH_MAX], cmd[2000];
+    char *old = review_dirs(base, home, proj);
+    if (!old) { T("mkdtemp", false); return; }
+    in_dir(proj);
+
+    /* uv opens a .git in its cache for writing, which no command may create */
+    char *o = run_bash("printf %s \"$TMPDIR\"", proj, 10);
+    snprintf(tmp, sizeof tmp, "%s", o);
+    free(o);
+    works(": >> \"$TMPDIR/cache/uv/sdists-v9/.git\"");
+    T("uv placeholder there", uv_mark(tmp));
+    shown("git -C \"$TMPDIR/cache/uv/sdists-v9\" rev-parse --git-dir 2>&1", "not a git repository");
+
+    /* it cannot be filled, moved or replaced, nor can anything above it */
+    static const char *const attacks[] = {
+        "echo 'gitdir: /tmp/x' > \"$G\"", "rm -f \"$G\"; echo 'gitdir: x' > \"$G\"",
+        "ln -sfn x \"$G\"", "mv \"$G\" \"$G.old\"",
+        "echo 'gitdir: x' > \"$TMPDIR/f\"; mv -f \"$TMPDIR/f\" \"$G\"",
+        "mv \"$TMPDIR/cache/uv/sdists-v9\" \"$TMPDIR/s\"", "mv \"$TMPDIR/cache/uv\" \"$TMPDIR/u\"",
+        "mv \"$TMPDIR/cache\" \"$TMPDIR/c\"", "mv \"$TMPDIR/CACHE\" \"$TMPDIR/C2\"",
+        "mv \"$TMPDIR\" \"$TMPDIR.moved\"", "rm -rf \"$TMPDIR/cache\"", NULL};
+    for (int i = 0; attacks[i]; i++) {
+        snprintf(cmd, sizeof cmd, "G=\"$TMPDIR/cache/uv/sdists-v9/.git\"; %s", attacks[i]);
+        quiet(cmd);
+        T(attacks[i], uv_mark(tmp));
+    }
+    /* and it opens no way to a .git or .envrc anywhere */
+    quiet("G=\"$TMPDIR/cache/uv/sdists-v9/.git\"; mkdir \"$TMPDIR/n\"; mv \"$G\" \"$TMPDIR/n/.git\";"
+          " cp -R \"$TMPDIR/cache/uv/sdists-v9\" \"$TMPDIR/n/copy\"; cp -R \"$G\" ./.git;"
+          " mv \"$G\" ./.envrc; echo x > \"$TMPDIR/cache/uv/.git\";"
+          " echo x > \"$TMPDIR/cache/uv/sdists-v9/.envrc\";"
+          " git init -q \"$TMPDIR/cache/uv/sdists-v9/r\"");
+    T("no .git from the placeholder", gone(tmp, "n/.git") && gone(tmp, "n/copy/.git")
+      && gone(proj, ".git") && gone(proj, ".envrc"));
+    T("no .git or .envrc next to it", gone(tmp, "cache/uv/.git")
+      && gone(tmp, "cache/uv/sdists-v9/.envrc") && gone(tmp, "cache/uv/sdists-v9/r/.git"));
+    /* nor cloned: a copy of the link in the project could not be removed */
+    put(under(base, "clone.c"), "#include <stdio.h>\n#include <sys/clonefile.h>\n"
+        "int main(int c, char **v) {\n"
+        "    if (c != 3 || clonefile(v[1], v[2], 0)) { perror(\"clonefile\"); return 1; }\n"
+        "    return 0;\n}\n");
+    snprintf(cmd, sizeof cmd, "cc -o clone '%s/clone.c'", base);
+    host(proj, cmd);
+    works("echo x > \"$TMPDIR/plain\" && ./clone \"$TMPDIR/plain\" cloned-plain");
+    static const char *const sources[] = {"", "/cache", "/cache/uv", "/cache/uv/sdists-v9", NULL};
+    for (int i = 0; sources[i]; i++) {
+        snprintf(cmd, sizeof cmd, "./clone \"$TMPDIR%s\" cloned%d 2>&1", sources[i], i);
+        shown(cmd, "Operation not permitted");
+        snprintf(cmd, sizeof cmd, "cloned%d", i);
+        T(sources[i], gone(proj, cmd));
+    }
+    /* nor any other directory that can be read: it may hold a .git of its own */
+    put(under(base, "out2/d/.git/x"), "OUTSIDE\n");
+    snprintf(cmd, sizeof cmd, "cat '%s/out2/d/.git/x'", base);
+    shown(cmd, "OUTSIDE");
+    snprintf(cmd, sizeof cmd, "./clone '%s/out2/d' cloned-other 2>&1", base);
+    shown(cmd, "Operation not permitted");
+    T("no clone of a directory outside the project", gone(proj, "cloned-other"));
+    /* while cp -c, which clones file by file, keeps working */
+    works("mkdir -p tree/a && echo x > tree/a/f && cp -c tree/a/f cp-file && cp -Rc tree cp-tree"
+          " && cmp tree/a/f cp-file && cmp tree/a/f cp-tree/a/f");
+    if (out_has("command -v uv >/dev/null && echo has-uv", "has-uv"))
+        works("uv venv --offline v && uv pip list --offline --python v");
+    else printf("unit: SKIP uv (not installed)\n");
+
+    /* a grader's TMPDIR is its own, and has it too */
+    char work[PATH_MAX + 16], script[PATH_MAX + 16], *out = NULL, *err = NULL;
+    snprintf(work, sizeof work, "%s/work", base);
+    mkdir(work, 0700);
+    snprintf(script, sizeof script, "%s/work/s.sh", base);
+    put(script, ": >> \"$TMPDIR/cache/uv/sdists-v9/.git\" && echo made-ok\n");
+    T("grader opens uv's placeholder", run_script(script, "a", "b", work, proj, 20, &out, &err)
+      && out && strstr(out, "made-ok"));
+    free(out);
+    free(err);
+
+    /* pipx asks whether its other home is there: looked up, never listed or read */
+    shown("echo \"[$PIPX_HOME]\"", "[]");
+    put(under(home, "Library/Application Support/pipx/venvs/x/pipx_metadata.json"), "TOPSECRET");
+    put(under(home, "Library/Application Support/other/f"), "TOPSECRET");
+    put(under(home, ".local/bin/f"), "x\n");          /* pipx has made it long since */
+    works("test -d \"$HOME/Library/Application Support/pipx\"");
+    works("test \"$PIPX_HOME\" = \"$TMPDIR/pipx\"");
+    hidden("cd \"$HOME/Library/Application Support\"; cat pipx/venvs/x/pipx_metadata.json other/f");
+    shown("ls \"$HOME/Library/Application Support/pipx\" 2>&1", "Operation not permitted");
+    shown("ls \"$HOME/Library/Application Support\" 2>&1", "Operation not permitted");
+    shown("stat \"$HOME/Library/Application Support/pipx/venvs\" 2>&1", "Operation not permitted");
+    shown("stat \"$HOME/Library/Application Support/other\" 2>&1", "Operation not permitted");
+    quiet("cd \"$HOME/Library/Application Support\"; echo x > pipx/planted; mv pipx \"$TMPDIR/p\"");
+    T("pipx folder not written or moved", gone(home, "Library/Application Support/pipx/planted")
+      && !gone(home, "Library/Application Support/pipx/venvs"));
+    if (out_has("command -v pipx >/dev/null && echo has-pipx", "has-pipx"))
+        works("pipx --version && pipx list");
+    else printf("unit: SKIP pipx (not installed)\n");
+
+    /* git below a repository's root stays shut out, and says why */
+    char repo[PATH_MAX + 16], sub[PATH_MAX + 32];
+    snprintf(repo, sizeof repo, "%s/work/repo", home);
+    snprintf(sub, sizeof sub, "%s/sub", repo);
+    put(under(home, "work/repo/sub/f"), "x\n");
+    host(repo, "git init -q .");
+    in_dir(sub);
+    shown("git status", "[sandbox: the project is inside a git repository");
+    shown("git diff", "[sandbox: the project is inside a git repository");
+    shown("ls .. 2>&1", "Operation not permitted");
+    T("no hint without the error", !out_has("true", "[sandbox:"));
+    /* nor when git has a root of its own here, or starting there would open a home */
+    static const char *const fail = "echo 'fatal: not a git repository'";
+    shown(fail, "[sandbox: the project is inside");
+    char nested[PATH_MAX + 48], other[PATH_MAX + 32], dot[PATH_MAX + 16], aside[PATH_MAX + 16];
+    snprintf(nested, sizeof nested, "%s/nested", sub);
+    put(under(home, "work/repo/sub/nested/f"), "x\n");
+    host(nested, "git init -q .");
+    in_dir(nested);
+    T("no hint at a nested repository's root", !out_has(fail, "[sandbox:"));
+    snprintf(other, sizeof other, "%s/plain", home);
+    put(under(home, "plain/f"), "x\n");
+    host(home, "git init -q .");
+    in_dir(other);
+    T("no hint when the root is home", !out_has(fail, "[sandbox:"));
+    snprintf(dot, sizeof dot, "%s/.git", home);
+    snprintf(aside, sizeof aside, "%s/home.git", base);
+    rename(dot, aside);
+    host(base, "git init -q .");        /* base holds the home */
+    T("no hint when the root holds home", !out_has(fail, "[sandbox:"));
+    snprintf(dot, sizeof dot, "%s/.git", base);
+    snprintf(aside, sizeof aside, "%s/base.git", base);
+    rename(dot, aside);
+    put(under(base, "out/sub/f"), "x\n");        /* outside every home git can read */
+    snprintf(other, sizeof other, "%s/out", base);
+    host(other, "git init -q .");
+    snprintf(other, sizeof other, "%s/out/sub", base);
+    in_dir(other);
+    T("no hint outside every home", !out_has(fail, "[sandbox:"));
+    in_dir(proj);
+    T("no hint outside a repository", !out_has("git status", "[sandbox:"));
+
+    /* at exit the placeholder goes, and nothing a link stands in for */
+    char left[PATH_MAX];
+    struct stat st;
+    exited(proj, "true", left, sizeof left);
+    T("exit removes TMPDIR", *left && lstat(left, &st));
+    put(under(base, "victim/uv/sdists-v9/.git"), "keep\n");
+    snprintf(cmd, sizeof cmd, "mv \"$T/cache\" \"$T.aside\" && ln -s \"%s/victim\" \"$T/cache\"", base);
+    exited(proj, cmd, left, sizeof left);
+    T("exit follows no link", *left && !gone(base, "victim/uv/sdists-v9/.git"));
+    if (*left) {        /* what that exit rightly left behind */
+        static const char *const rest[] = {"/cache", "", ".aside/uv/sdists-v9/.git",
+            ".aside/uv/sdists-v9", ".aside/uv", ".aside", NULL};
+        for (int i = 0; rest[i]; i++) {
+            snprintf(cmd, sizeof cmd, "%s%s", left, rest[i]);
+            if (unlink(cmd)) rmdir(cmd);
+        }
+    }
+    exited(proj, "rm \"$T/cache/uv/sdists-v9/.git\" && echo keep > \"$T/cache/uv/sdists-v9/.git\"",
+           left, sizeof left);
+    T("exit removes only its own link", *left && !gone(left, "cache/uv/sdists-v9/.git"));
+    if (*left) {
+        snprintf(cmd, sizeof cmd, "%s/cache/uv/sdists-v9/.git", left);
+        unlink(cmd);
+        for (char *e; (e = strrchr(cmd, '/')) && e >= cmd + strlen(left); ) {
+            *e = 0;
+            rmdir(cmd);
+        }
+    }
+
+    setenv("HOME", old, 1);
+    free(old);
+}
+
+int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     memset(&g_cfg, 0, sizeof g_cfg);
+    if (argc == 4 && !strcmp(argv[1], "--sbx-exit")) return sbx_exit(argv[2], argv[3]);
+    if (!realpath(argv[0], self)) return 1;
     snprintf(fakehome, sizeof fakehome, "/tmp/fwhomeXXXXXX");
     snprintf(projdir, sizeof projdir, "/tmp/fwprojXXXXXX");
     if (!mkdtemp(fakehome) || !mkdtemp(projdir)) return 1;
@@ -4200,6 +4405,7 @@ int main(void) {
         test_home_links();
         test_home_path();
         test_repo_above();
+        test_sandbox_tools();
     }
     else printf("unit: SKIP sandbox tests (no sandbox here)\n");
     test_fail_closed();

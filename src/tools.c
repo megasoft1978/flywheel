@@ -2306,6 +2306,10 @@ static bool module_dir(const char *proj, char home[4][PATH_MAX], int n, char *mo
            && points_back(mod, proj);
 }
 
+/* pipx asks whether its other default home is there and stops if it may not:
+   that one entry can be looked up, never listed, and nothing in it read */
+#define SBX_PIPX "Library/Application Support/pipx"
+
 static bool sb_home_reads(Sb *b, const Areas *areas, const char *proj, const char *tmp,
                           const Linked *linked, const char *ro) {
     char home[4][PATH_MAX];
@@ -2333,6 +2337,9 @@ static bool sb_home_reads(Sb *b, const Areas *areas, const char *proj, const cha
         for (int i = 0; i < n; i++)
             sb_read(&r, home[i], false);        /* itself only ever looked up */
         if (!each_home_read(&r, proj, home, n)) return false;
+        char pipx[PATH_MAX];
+        for (int i = 0; meta && i < n; i++)
+            if (join(pipx, home[i], SBX_PIPX)) sb_read(&r, pipx, false);
         sb_add(b, ")");
     }
     b->from = b->n;
@@ -2489,6 +2496,22 @@ static void sb_names(Sb *b, const char *proj, bool repo, const char *other) {
     sb_add(b, ")");
 }
 
+/* uv opens a .git in its cache for writing and fails when it cannot. No command
+   may create one, so TMPDIR starts with it, as a link to /dev/null: opening it
+   needs no rule of its own, and it can never name a repository. The name rules
+   keep the link itself; this keeps it where uv looks. */
+#define SBX_UV_GIT "cache/uv/sdists-v9/.git"
+
+static void sb_uv_git(Sb *b, const char *tmp) {
+    char p[PATH_MAX];
+    if (snprintf(p, sizeof p, "%s/%s", tmp, SBX_UV_GIT) >= (int)sizeof p) b->full = true;
+    b->from = b->n;
+    sb_add(b, "(deny file-write-unlink");
+    sb_pin(b, p);
+    sb_pin_above(b, p);
+    sb_add(b, ")");
+}
+
 /* malloc'd profile, NULL if it cannot be built whole: the command is then not
    run. tmp, mark and ro (one more place to read, never to write) may be NULL. */
 static char *sbx_profile(const char *cwd, const char *tmp, bool net, const char *mark,
@@ -2538,6 +2561,10 @@ static char *sbx_profile(const char *cwd, const char *tmp, bool net, const char 
     sb_add(&b, ")");
     sb_project(&b, &areas, repo, linked ? &w : NULL);
     sb_names(&b, proj, repo, other);
+    if (tmp) sb_uv_git(&b, rtmp);
+    /* a directory clone brings what is inside past the name rules, a .git the
+       command then cannot remove; files are still cloned (cp -c) */
+    sb_add(&b, "(deny file-clone (vnode-type DIRECTORY))");
     /* names this command's processes, so that all of them can be found later */
     if (mark) {
         char rule[160];
@@ -2591,8 +2618,37 @@ bool sandbox_on(void) { return !g_cfg.unsafe && sandbox_available(); }
 static char sbx_tmp[PATH_MAX];
 static pid_t sbx_owner;
 
+/* in a new TMPDIR, before any command has seen it. A failure only costs uv. */
+static void sbx_tmp_fill(const char *tmp) {
+    char p[PATH_MAX];
+    if (snprintf(p, sizeof p, "%s/%s", tmp, SBX_UV_GIT) >= (int)sizeof p) return;
+    for (char *s = p + strlen(tmp) + 1; (s = strchr(s, '/')); *s++ = '/') {
+        *s = 0;
+        mkdir(p, 0700);
+    }
+    if (symlink("/dev/null", p)) return;
+}
+
+/* Commands wrote in there: no link is followed, so that a directory replaced by
+   one cannot lead the removal elsewhere, and only our own .git goes. */
 static void sbx_tmp_remove(void) {
-    if (getpid() == sbx_owner) rmdir(sbx_tmp);   /* only if nothing was left in it */
+    if (getpid() != sbx_owner || !*sbx_tmp) return;
+    char part[] = SBX_UV_GIT, to[16], *name[4] = {part};
+    for (int i = 1; i < 4; i++) {
+        name[i] = strchr(name[i - 1], '/');
+        *name[i]++ = 0;
+    }
+    const int dir = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
+    int fd[4] = {open(sbx_tmp, dir)}, d = 0;
+    while (d < 3 && fd[d] >= 0 && (fd[d + 1] = openat(fd[d], name[d], dir)) >= 0) d++;
+    if (d == 3 && readlinkat(fd[d], name[d], to, sizeof to) == 9 && !memcmp(to, "/dev/null", 9))
+        unlinkat(fd[d], name[d], 0);
+    for (; d > 0; d--) {
+        close(fd[d]);
+        unlinkat(fd[d - 1], name[d - 1], AT_REMOVEDIR);
+    }
+    if (fd[0] >= 0) close(fd[0]);
+    rmdir(sbx_tmp);   /* only if nothing else was left in it */
 }
 
 /* this process's private TMPDIR, NULL if it cannot be made */
@@ -2605,11 +2661,12 @@ static const char *sbx_tmpdir(void) {
     snprintf(sbx_tmp, sizeof sbx_tmp, "%s%sfwsbx-XXXXXX", base,
              base[strlen(base) - 1] == '/' ? "" : "/");
     if (!mkdtemp(sbx_tmp)) { *sbx_tmp = 0; return NULL; }
+    sbx_tmp_fill(sbx_tmp);
     if (!sbx_owner) { sbx_owner = getpid(); atexit(sbx_tmp_remove); }
     return sbx_tmp;
 }
 
-#define SBX_NENV 10
+#define SBX_NENV 11
 
 static bool through_link(const char *path) {
     char p[PATH_MAX];
@@ -2689,6 +2746,9 @@ static char *sbx_path(const char *v, const char *cwd, const char *tmp) {
 
 /* the whole environment of a command: nothing else is inherited (tokens, agent
    sockets). The cache variables keep build tools out of the home directory. */
+/* Where that folder exists pipx also makes it its home, which commands cannot
+   read, so they are given one in TMPDIR, and a man page folder there too, the one
+   it makes in the real home being closed as well. */
 static void sbx_env(char **env, const char *cwd, const char *tmp) {
     static const char *const keep[] = {"PATH", "HOME", "LANG", "TERM", NULL};
     static const char *const redirect[][2] = {{"TMPDIR", ""}, {"XDG_CACHE_HOME", "/cache"},
@@ -2706,6 +2766,18 @@ static void sbx_env(char **env, const char *cwd, const char *tmp) {
         size_t len = strlen(redirect[i][0]) + strlen(tmp) + strlen(redirect[i][1]) + 2;
         env[n] = malloc(len);
         snprintf(env[n++], len, "%s=%s%s", redirect[i][0], tmp, redirect[i][1]);
+    }
+    const char *home = getenv("HOME");
+    char pipx[PATH_MAX];
+    struct stat st;
+    if (home && *home == '/' && join(pipx, home, SBX_PIPX) && !stat(pipx, &st)) {
+        static const char *const own[][2] = {{"PIPX_HOME", "/pipx"},
+            {"PIPX_MAN_DIR", "/pipx/man"}};
+        for (int i = 0; i < 2; i++) {
+            size_t len = strlen(own[i][0]) + strlen(tmp) + strlen(own[i][1]) + 2;
+            env[n] = malloc(len);
+            snprintf(env[n++], len, "%s=%s%s", own[i][0], tmp, own[i][1]);
+        }
     }
     env[n] = NULL;
 }
@@ -2782,6 +2854,26 @@ static void sbx_detach(void) {
     long max = sysconf(_SC_OPEN_MAX);
     for (int fd = 3; fd < (max > 0 && max < 65536 ? max : 65536); fd++) close(fd);
     setsid();
+}
+
+/* cwd is below the root of a repository under a home, which commands cannot
+   read: git there reports that there is none. A root that is or holds a home is
+   left out: starting there would open all of it. */
+static bool below_repo(const char *cwd) {
+    char p[PATH_MAX], git[PATH_MAX], home[4][PATH_MAX];
+    struct stat st;
+    int n = homes(home);
+    if (!realpath(cwd, p) || !join(git, p, ".git") || !lstat(git, &st)) return false;
+    for (char *s; (s = strrchr(p, '/')) && s != p; ) {
+        *s = 0;
+        if (!join(git, p, ".git") || lstat(git, &st)) continue;
+        for (int i = 0; i < n; i++)
+            if (covers(p, home[i])) return false;
+        for (int i = 0; i < n; i++)
+            if (path_under(home[i], p)) return true;
+        return false;
+    }
+    return false;
 }
 
 static char *run_command(const char *cmd, const char *cwd, int timeout_s, int *code, bool net) {
@@ -2899,11 +2991,14 @@ static char *run_command(const char *cmd, const char *cwd, int timeout_s, int *c
             : swept && !timed
             ? "[sandbox: background processes of a network command end with it; they were"
               " stopped]\n" : "";
-        if (*denied || *stopped) {
-            size_t cap = strlen(out) + strlen(denied) + strlen(stopped) + 2;
+        const char *above = strstr(out, "ot a git repository") && below_repo(cwd)
+            ? "[sandbox: the project is inside a git repository whose root is above it; commands"
+              " cannot read that, so git does not work here — start at the repository root]\n" : "";
+        if (*denied || *stopped || *above) {
+            size_t cap = strlen(out) + strlen(denied) + strlen(stopped) + strlen(above) + 2;
             char *t = malloc(cap);
-            snprintf(t, cap, "%s%s%s%s", out, out[strlen(out) - 1] == '\n' ? "" : "\n", denied,
-                     stopped);
+            snprintf(t, cap, "%s%s%s%s%s", out, out[strlen(out) - 1] == '\n' ? "" : "\n", denied,
+                     stopped, above);
             free(out);
             out = t;
         }
@@ -2939,6 +3034,7 @@ bool run_script(const char *script, const char *a1, const char *a2, const char *
                  || mkdir(tmp, 0700) || !realpath(ro, rro))
             no = "error: cannot create the script's directories — not executed";
         if (no) { *err = str_dup(no); return false; }
+        sbx_tmp_fill(tmp);
         sbx_mark(mark, sizeof mark);
         if (!(prof = sbx_setup(work, tmp, false, mark, rro, why, sizeof why))) {
             *err = str_dup(why);
