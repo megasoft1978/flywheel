@@ -224,12 +224,13 @@ static void detect_project_meta(void) {
     clean_line(g_stat.proj_name, sizeof g_stat.proj_name,
                (base && base[1]) ? base + 1 : g_cfg.cwd);
     g_stat.git_branch[0] = 0;
-    char *br = run_bash("git rev-parse --abbrev-ref HEAD 2>/dev/null", g_cfg.cwd, 2);
+    int code;
+    char *br = run_bash_status("git rev-parse --abbrev-ref HEAD 2>/dev/null", g_cfg.cwd, 2, &code);
     if (br) {
         char *nl = strchr(br, '\n');
         if (nl) *nl = 0;
-        if (*br && strcmp(br, "HEAD") && strncmp(br, "(no output)", 11) && strncmp(br, "fatal:", 6) &&
-            strncmp(br, "error:", 6) && !strstr(br, "exit ")) {
+        /* anything but exit 0 leaves an error or timeout text, not a name */
+        if (!code && *br && strcmp(br, "HEAD") && strcmp(br, "(no output)")) {
             clean_line(g_stat.git_branch, 61, br);
         }
         free(br);
@@ -354,7 +355,7 @@ static void term_raw(bool on) {
    must not keep us alive: never block, and give up after half a second. */
 static void modes_off(void) {
     static const char off[] = "\030\033[?2026l\033]8;;\033\\\033[0m" MOUSE_OFF_SEQ
-                              "\033[?2004l\033[?1047l\033[?25h\033[r\033[999;1H\n";
+                              "\033[?2004l\033[?1047l\033[?7h\033[?25h\033[r\033[999;1H\n";
     int fl = fcntl(1, F_GETFL);
     if (fl < 0) return;
     fcntl(1, F_SETFL, fl | O_NONBLOCK);
@@ -3252,8 +3253,11 @@ static void tui_pump(void) {
     if (now - lastr >= 0.08) { lastr = now; if (working) render_screen(); }
 }
 
+extern bool http_offer_network;   /* http.c */
+
 void tui_repl(void) {
     if (!in_reserve(0)) return;
+    http_offer_network = true;
     signal(SIGWINCH, on_winch);
     catch_fatal();
     detect_project_meta();

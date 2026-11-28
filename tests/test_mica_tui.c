@@ -1719,7 +1719,21 @@ static void once_case(const char *dir, int sig, const char *signame) {
     int st = raw_wait(&r, true);
     raw_check(died_by(st, sig), signame, "really died of the signal");
     raw_check(raw_count(&r, RESTORE_START) == 1, signame, "restore sequence written exactly once");
+    /* the signal may land inside a status bar draw, which has autowrap off */
+    const char *at = strstr(r.out, RESTORE_START);
+    raw_check(at && strstr(at, "\033[?7h"), signame, "restore turns autowrap back on");
     raw_end(&r, st);
+}
+
+/* The status bar is drawn with autowrap off, and on again after it. */
+static void wrap_case(const char *dir) {
+    static RawTty r;
+    raw_check(raw_start(&r, dir), "status bar", "ready");
+    const char *off = strstr(r.out, "\033[?7l"), *on = off ? strstr(off, "\033[?7h") : NULL;
+    raw_check(off != NULL, "status bar", "drawn with autowrap off");
+    raw_check(on != NULL, "status bar", "autowrap back on after the draw");
+    kill(r.fw, SIGTERM);
+    raw_end(&r, raw_wait(&r, true));
 }
 
 /* Nobody reads the pty and its queue is full: one SIGTERM must still end it. */
@@ -1799,6 +1813,7 @@ static void signal_tests(const char *dir, const char *cmd) {
     once_case(dir, SIG(SIGABRT));
     once_case(dir, SIG(SIGFPE));
     once_case(dir, SIG(SIGILL));
+    wrap_case(dir);
     stuck_case(dir);
     background_case(dir);
 #undef SIG
@@ -1843,6 +1858,13 @@ static void sandbox_tests(const char *dir, const char *cmd) {
         pump(s, 300);
         CHECK(s, "net: denied, not run", !made(dir, "net-file"));
         mica_session_destroy(s);
+
+        /* a one-shot run has nobody to ask, so it is not offered either */
+        snprintf(full, sizeof full, "cd '%s' && %s hello </dev/null >/dev/null 2>&1", dir, cmd);
+        g_net_schema = -1;
+        int rc = system(full);
+        CHECK((MicaSession *)NULL, "one-shot: request reached the server", rc != -1 && g_net_schema >= 0);
+        CHECK((MicaSession *)NULL, "one-shot: network not offered", g_net_schema == 0);
     }
 
     snprintf(full, sizeof full, "%s --unsafe", cmd);
@@ -1876,6 +1898,37 @@ static void sandbox_tests(const char *dir, const char *cmd) {
     CHECK(s, "narrow: badge", bottom_has(s, "NOT SANDBOXED"));
     assert_box_borders(s, "narrow: borders with badge");
     mica_session_destroy(s);
+}
+
+/* ---------- branch name in the input box ---------- */
+
+/* A git of our own, first on PATH; --unsafe keeps PATH as it is. */
+static void branch_case(const char *dir, const char *cmd, const char *name, const char *script,
+                        const char *want) {
+    char path[1300], full[3600], label[128];
+    snprintf(path, sizeof path, "%s/fakebin", dir);
+    mkdir(path, 0755);
+    snprintf(path, sizeof path, "%s/fakebin/git", dir);
+    FILE *f = fopen(path, "w");
+    assert(f != NULL);
+    fprintf(f, "#!/bin/sh\n%s\n", script);
+    fclose(f);
+    chmod(path, 0755);
+    snprintf(full, sizeof full, "PATH='%s/fakebin':\"$PATH\"; export PATH; %s --unsafe", dir, cmd);
+    MicaSession *s = mica_session_create(dir, full, 24, 80);
+    assert(s != NULL);
+    bool ready = wait_for_text(s, "ready", 6000);
+    pump(s, 150);
+    snprintf(label, sizeof label, "branch: %s", name);
+    CHECK(s, label, ready && (want ? find_row(s, want) >= 0 : find_row(s, "\xe2\x8e\x87") < 0));
+    mica_session_destroy(s);
+    unlink(path);
+}
+
+static void branch_tests(const char *dir, const char *cmd) {
+    branch_case(dir, cmd, "shown when git succeeds", "echo good-branch", "\xe2\x8e\x87 good-branch)");
+    branch_case(dir, cmd, "none when git fails", "echo bogus; exit 1", NULL);
+    branch_case(dir, cmd, "none when git hangs", "exec sleep 10", NULL);
 }
 
 int main(int argc, char **argv) {
@@ -2258,6 +2311,7 @@ int main(int argc, char **argv) {
     image_tests(cmd);
     signal_tests(testdir, cmd);
     sandbox_tests(testdir, cmd);
+    branch_tests(testdir, cmd);
     stop_mock_server(srv_th);
 
     char rm[1200];

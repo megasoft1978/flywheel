@@ -308,6 +308,8 @@ static ChatResp *chat_failed(const char *why) {
     return r;
 }
 
+bool http_offer_network;   /* set by the TUI: only it can ask the user */
+
 ChatResp *chat(Msgs *msgs, StreamCb *cb) {
     char url[512];
     snprintf(url, sizeof url, "%s/chat/completions", g_cfg.endpoint);
@@ -328,8 +330,9 @@ ChatResp *chat(Msgs *msgs, StreamCb *cb) {
     cJSON *cmd = cJSON_CreateObject();
     cJSON_AddStringToObject(cmd, "type", "string");
     cJSON_AddItemToObject(props, "command", cmd);
-    /* agent.c reads it only when commands are sandboxed */
-    if (sandbox_on()) {
+    /* agent.c reads it only when commands are sandboxed, and refuses it when
+       there is nobody to ask */
+    if (sandbox_on() && http_offer_network) {
         cJSON *net = cJSON_CreateObject();
         cJSON_AddStringToObject(net, "type", "boolean");
         cJSON_AddStringToObject(net, "description",
