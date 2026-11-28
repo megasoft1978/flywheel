@@ -328,6 +328,14 @@ ChatResp *chat(Msgs *msgs, StreamCb *cb) {
     cJSON *cmd = cJSON_CreateObject();
     cJSON_AddStringToObject(cmd, "type", "string");
     cJSON_AddItemToObject(props, "command", cmd);
+    /* agent.c reads it only when commands are sandboxed */
+    if (sandbox_on()) {
+        cJSON *net = cJSON_CreateObject();
+        cJSON_AddStringToObject(net, "type", "boolean");
+        cJSON_AddStringToObject(net, "description",
+            "Set to true only if this command needs external network access. The user must approve it every time; without it the command has no external network.");
+        cJSON_AddItemToObject(props, "network", net);
+    }
     cJSON_AddItemToObject(params, "properties", props);
     cJSON *req = cJSON_CreateArray();
     cJSON_AddItemToArray(req, cJSON_CreateString("command"));

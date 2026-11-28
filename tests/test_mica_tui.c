@@ -272,6 +272,8 @@ static bool handle_images(int cfd, const char *body, const char *last_msg) {
 
 static volatile int g_models_delay_ms;      /* hold /models, to press keys during it */
 
+static volatile int g_net_schema = -1;     /* last chat request offered "network" */
+
 static void handle_client(int cfd) {
     static char req[2 << 20];
     size_t got = 0;
@@ -311,6 +313,8 @@ static void handle_client(int cfd) {
     const char *body = hdr_end ? hdr_end + 4 : req;
     const char *sse_hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
     send_all(cfd, sse_hdr, strlen(sse_hdr));
+
+    g_net_schema = strstr(body, "\"network\":{\"type\":\"boolean\"") != NULL;
 
     /* Inspect only the LAST message in the conversation array */
     const char *last_msg = body;
@@ -383,6 +387,13 @@ static void handle_client(int cfd) {
         }
         /* Emit a tool call needing approval that produces 6 lines of output (collapsed by default) */
         send_sse_chunk(cfd, "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"seq 1 6 | sed 's/^/out-line-/'\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":15}}");
+        send_all(cfd, "data: [DONE]\n\n", 14);
+        close(cfd);
+        return;
+    }
+
+    if (strstr(last_msg, "WANTNET")) {
+        send_sse_chunk(cfd, "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_n\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"touch net-file\\\",\\\"network\\\":true}\"}}]},\"finish_reason\":\"tool_calls\"}]}");
         send_all(cfd, "data: [DONE]\n\n", 14);
         close(cfd);
         return;
@@ -1793,6 +1804,80 @@ static void signal_tests(const char *dir, const char *cmd) {
 #undef SIG
 }
 
+/* ---------- network approval, sandbox badge ---------- */
+
+static bool bottom_has(MicaSession *s, const char *needle) {
+    char line[1024];
+    get_row_text(s, mica_session_rows(s) - 1, line, sizeof line);
+    return strstr(line, needle) != NULL;
+}
+
+static void sandbox_tests(const char *dir, const char *cmd) {
+    char full[2100];
+    MicaSession *s;
+    if (system("/usr/bin/sandbox-exec -p '(version 1)(allow default)' /usr/bin/true >/dev/null 2>&1")) {
+        printf("SKIP sandboxed TUI checks: no working sandbox here\n");
+    } else {
+        s = mica_session_create(dir, cmd, 24, 80);
+        assert(s != NULL);
+        CHECK(s, "boxed: ready", wait_for_text(s, "ready", 3000));
+        pump(s, 150);
+        CHECK(s, "boxed: no sandbox badge", find_row(s, "NOT SANDBOXED") < 0);
+        free(mica_session_take_notification(s));
+        submit(s, "WANTNET");
+        CHECK(s, "net: modal", wait_for_text(s, "Network access request", 4000));
+        pump(s, 150);
+        CHECK(s, "net: schema offers network", g_net_schema == 1);
+        CHECK(s, "net: own title", find_row(s, "Network access request") >= 0 && find_row(s, "Bash command") < 0);
+        CHECK(s, "net: shows the command", find_row(s, "touch net-file") >= 0);
+        CHECK(s, "net: asks for external network", find_row(s, "external network access") >= 0);
+        CHECK(s, "net: no internal header line", find_row(s, "# allow NETWORK") < 0);
+        CHECK(s, "net: yes or no only, No selected",
+              find_row(s, "\xe2\x96\xb8 2. No") >= 0 && find_row(s, "ask again") < 0);
+        char *notif = mica_session_take_notification(s);
+        CHECK(s, "net: notification names the network", notif && strstr(notif, "network") && strstr(notif, "approval"));
+        free(notif);
+        CHECK(s, "boxed: no badge in a modal", find_row(s, "NOT SANDBOXED") < 0);
+        mica_session_key(s, VTERM_KEY_ESCAPE, VTERM_MOD_NONE);
+        CHECK(s, "net: Esc denies", wait_for_text(s, "\xe2\x9c\x93 done", 4000));
+        pump(s, 300);
+        CHECK(s, "net: denied, not run", !made(dir, "net-file"));
+        mica_session_destroy(s);
+    }
+
+    snprintf(full, sizeof full, "%s --unsafe", cmd);
+    s = mica_session_create(dir, full, 24, 80);
+    assert(s != NULL);
+    CHECK(s, "unsafe: ready", wait_for_text(s, "ready", 3000));
+    pump(s, 150);
+    CHECK(s, "unsafe: badge on the idle bar", bottom_has(s, "NOT SANDBOXED") && bottom_has(s, "ready"));
+    assert_box_borders(s, "unsafe: borders with badge");
+    CHECK(s, "unsafe: modal", open_modal(s, "WANTNET"));
+    pump(s, 150);
+    CHECK(s, "unsafe: network not offered", g_net_schema == 0);
+    CHECK(s, "unsafe: ordinary command prompt",
+          find_row(s, "Bash command") >= 0 && find_row(s, "Network access request") < 0);
+    CHECK(s, "unsafe: badge under a modal", bottom_has(s, "NOT SANDBOXED"));
+    close_modal(s);
+    pump(s, 300);
+    CHECK(s, "unsafe: badge after the modal", bottom_has(s, "NOT SANDBOXED"));
+    submit(s, "SLOW_TEST");
+    CHECK(s, "unsafe: working", wait_for_text(s, "tick-3", 4000));
+    CHECK(s, "unsafe: badge while working", bottom_has(s, "NOT SANDBOXED"));
+    mica_session_key(s, VTERM_KEY_ESCAPE, VTERM_MOD_NONE);
+    pump(s, 600);
+    mica_session_destroy(s);
+
+    /* narrow: the badge stays, the bar is clipped and never scrolls the screen */
+    s = mica_session_create(dir, full, 24, 40);
+    assert(s != NULL);
+    CHECK(s, "narrow: ready", wait_for_text(s, "ready", 3000));
+    pump(s, 150);
+    CHECK(s, "narrow: badge", bottom_has(s, "NOT SANDBOXED"));
+    assert_box_borders(s, "narrow: borders with badge");
+    mica_session_destroy(s);
+}
+
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     const char *fw_bin = (argc > 1) ? argv[1] : "./flywheel";
@@ -2172,6 +2257,7 @@ int main(int argc, char **argv) {
     copy_tests(testdir, cmd);
     image_tests(cmd);
     signal_tests(testdir, cmd);
+    sandbox_tests(testdir, cmd);
     stop_mock_server(srv_th);
 
     char rm[1200];
