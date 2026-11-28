@@ -4122,6 +4122,29 @@ static bool uv_mark(const char *tmp) {
     return n == 9 && !memcmp(to, "/dev/null", 9);
 }
 
+static char self[PATH_MAX];
+
+/* this program again, as a process of its own, so that its exit cleanup runs:
+   one command, then `after` on the host with the command's TMPDIR in $T */
+static int sbx_exit(const char *cwd, const char *after) {
+    g_cfg.cwd = str_dup(cwd);
+    char *o = run_bash("printf %s \"$TMPDIR\"", cwd, 10);
+    if (setenv("T", o, 1) || system(after)) return 1;
+    fputs(o, stdout);
+    free(o);
+    return 0;
+}
+
+/* the TMPDIR that process had, "" if it failed */
+static void exited(const char *cwd, const char *after, char *tmp, size_t cap) {
+    char cmd[4 * PATH_MAX];
+    snprintf(cmd, sizeof cmd, "'%s' --sbx-exit '%s' '%s'", self, cwd, after);
+    FILE *f = popen(cmd, "r");
+    size_t n = f ? fread(tmp, 1, cap - 1, f) : 0;
+    tmp[n] = 0;
+    if (!f || pclose(f)) *tmp = 0;
+}
+
 /* common tools inside the sandbox, and what had to be there for them */
 static void test_sandbox_tools(void) {
     char base[PATH_MAX], home[PATH_MAX], proj[PATH_MAX], tmp[PATH_MAX], cmd[2000];
@@ -4160,6 +4183,21 @@ static void test_sandbox_tools(void) {
       && gone(proj, ".git") && gone(proj, ".envrc"));
     T("no .git or .envrc next to it", gone(tmp, "cache/uv/.git")
       && gone(tmp, "cache/uv/sdists-v9/.envrc") && gone(tmp, "cache/uv/sdists-v9/r/.git"));
+    /* nor cloned: a copy of the link in the project could not be removed */
+    put(under(base, "clone.c"), "#include <stdio.h>\n#include <sys/clonefile.h>\n"
+        "int main(int c, char **v) {\n"
+        "    if (c != 3 || clonefile(v[1], v[2], 0)) { perror(\"clonefile\"); return 1; }\n"
+        "    return 0;\n}\n");
+    snprintf(cmd, sizeof cmd, "cc -o clone '%s/clone.c'", base);
+    host(proj, cmd);
+    works("echo x > \"$TMPDIR/plain\" && ./clone \"$TMPDIR/plain\" cloned-plain");
+    static const char *const sources[] = {"", "/cache", "/cache/uv", "/cache/uv/sdists-v9", NULL};
+    for (int i = 0; sources[i]; i++) {
+        snprintf(cmd, sizeof cmd, "./clone \"$TMPDIR%s\" cloned%d 2>&1", sources[i], i);
+        shown(cmd, "Operation not permitted");
+        snprintf(cmd, sizeof cmd, "cloned%d", i);
+        T(sources[i], gone(proj, cmd));
+    }
     if (out_has("command -v uv >/dev/null && echo has-uv", "has-uv"))
         works("uv venv --offline v && uv pip list --offline --python v");
     else printf("unit: SKIP uv (not installed)\n");
@@ -4205,16 +4243,59 @@ static void test_sandbox_tools(void) {
     shown("git diff", "[sandbox: the project is inside a git repository");
     shown("ls .. 2>&1", "Operation not permitted");
     T("no hint without the error", !out_has("true", "[sandbox:"));
+    /* nor when git has a root of its own here, or starting there would open a home */
+    static const char *const fail = "echo 'fatal: not a git repository'";
+    shown(fail, "[sandbox: the project is inside");
+    char nested[PATH_MAX + 48], other[PATH_MAX + 32], dot[PATH_MAX + 16], aside[PATH_MAX + 16];
+    snprintf(nested, sizeof nested, "%s/nested", sub);
+    put(under(home, "work/repo/sub/nested/f"), "x\n");
+    host(nested, "git init -q .");
+    in_dir(nested);
+    T("no hint at a nested repository's root", !out_has(fail, "[sandbox:"));
+    snprintf(other, sizeof other, "%s/plain", home);
+    put(under(home, "plain/f"), "x\n");
+    host(home, "git init -q .");
+    in_dir(other);
+    T("no hint when the root is home", !out_has(fail, "[sandbox:"));
+    snprintf(dot, sizeof dot, "%s/.git", home);
+    snprintf(aside, sizeof aside, "%s/home.git", base);
+    rename(dot, aside);
+    host(base, "git init -q .");        /* base holds the home */
+    T("no hint when the root holds home", !out_has(fail, "[sandbox:"));
+    snprintf(dot, sizeof dot, "%s/.git", base);
+    snprintf(aside, sizeof aside, "%s/base.git", base);
+    rename(dot, aside);
+    put(under(base, "out/sub/f"), "x\n");        /* outside every home git can read */
+    snprintf(other, sizeof other, "%s/out", base);
+    host(other, "git init -q .");
+    snprintf(other, sizeof other, "%s/out/sub", base);
+    in_dir(other);
+    T("no hint outside every home", !out_has(fail, "[sandbox:"));
     in_dir(proj);
     T("no hint outside a repository", !out_has("git status", "[sandbox:"));
+
+    /* at exit the placeholder goes, and nothing a link stands in for */
+    char left[PATH_MAX];
+    struct stat st;
+    exited(proj, "true", left, sizeof left);
+    T("exit removes TMPDIR", *left && lstat(left, &st));
+    put(under(base, "victim/uv/sdists-v9/.git"), "keep\n");
+    snprintf(cmd, sizeof cmd, "mv \"$T/cache\" \"$T.aside\" && ln -s \"%s/victim\" \"$T/cache\"", base);
+    exited(proj, cmd, left, sizeof left);
+    T("exit follows no link", *left && !gone(base, "victim/uv/sdists-v9/.git"));
+    exited(proj, "rm \"$T/cache/uv/sdists-v9/.git\" && echo keep > \"$T/cache/uv/sdists-v9/.git\"",
+           left, sizeof left);
+    T("exit removes only its own link", *left && !gone(left, "cache/uv/sdists-v9/.git"));
 
     setenv("HOME", old, 1);
     free(old);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     memset(&g_cfg, 0, sizeof g_cfg);
+    if (argc == 4 && !strcmp(argv[1], "--sbx-exit")) return sbx_exit(argv[2], argv[3]);
+    if (!realpath(argv[0], self)) return 1;
     snprintf(fakehome, sizeof fakehome, "/tmp/fwhomeXXXXXX");
     snprintf(projdir, sizeof projdir, "/tmp/fwprojXXXXXX");
     if (!mkdtemp(fakehome) || !mkdtemp(projdir)) return 1;
