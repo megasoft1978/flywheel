@@ -12,7 +12,11 @@
 #include <signal.h>
 #include <wchar.h>
 #include <errno.h>
+#include <poll.h>
 #include <time.h>
+#ifdef __APPLE__
+#include <libproc.h>
+#endif
 
 /* claude-code-style TUI v4 (Mica / libvterm & xterm compatible):
    - structured transcript buffer with atomic full-viewport rendering
@@ -28,12 +32,16 @@
    - UTF-8 / emoji width via wcwidth(), soft-wrapped input (up to 4 visible rows)
    - Alt+Enter (and Shift+Enter where the terminal sends it) multiline
    - bracketed paste (?2004h) taken literally, with [paste#N] collapse
-   - SIGWINCH live resize with full transcript re-wrap; Esc aborts streams */
+   - SIGWINCH live resize with full transcript re-wrap; Esc aborts streams
+   - the terminal is restored when a signal or a crash ends the process */
 
 static struct termios saved_t;
 static int rows = 24, cols = 80;
 static char status[256] = "ready";
-static bool raw_on, working;
+static volatile sig_atomic_t raw_on;   /* saved_t holds the mode to restore */
+static volatile sig_atomic_t tui_up;   /* escape modes may be on */
+static pid_t tui_pid;
+static bool working;
 static bool mouse_on = true;      /* mouse reporting wanted; toggled by /mouse */
 /* one message (collapsed pastes expanded) may hold this much; anything larger
    is refused whole, with a notice in the status bar */
@@ -326,17 +334,83 @@ static void term_raw(bool on) {
         t.c_lflag &= ~(ICANON | ECHO | ISIG | IEXTEN);
         t.c_iflag &= ~(IXON | ICRNL);
         t.c_cc[VMIN] = 0; t.c_cc[VTIME] = 1;
+        raw_on = true;   /* before the change: a signal from here on must undo it */
         tcsetattr(0, TCSANOW, &t);
         /* bracketed paste + SGR click/wheel mouse reporting */
         fputs("\033[?2004h", stdout);
         if (mouse_on) fputs(MOUSE_ON_SEQ, stdout);
         fflush(stdout);
-        raw_on = true;
     } else if (!on && raw_on) {
         fputs(MOUSE_OFF_SEQ "\033[?2004l", stdout);
         fflush(stdout);
         tcsetattr(0, TCSANOW, &saved_t);
         raw_on = false;
+    }
+}
+
+/* CAN drops a half-written sequence; then sync, link, colors, mouse, paste,
+   alternate screen and hidden cursor (a command writing to /dev/tty can leave
+   those), scroll region, and the cursor to the last row. A pty nobody reads
+   must not keep us alive: never block, and give up after half a second. */
+static void modes_off(void) {
+    static const char off[] = "\030\033[?2026l\033]8;;\033\\\033[0m" MOUSE_OFF_SEQ
+                              "\033[?2004l\033[?1047l\033[?25h\033[r\033[999;1H\n";
+    int fl = fcntl(1, F_GETFL);
+    if (fl < 0) return;
+    fcntl(1, F_SETFL, fl | O_NONBLOCK);
+    size_t at = 0;
+    for (int stalls = 0; at < sizeof off - 1 && stalls < 10;) {
+        ssize_t w = write(1, off + at, sizeof off - 1 - at);
+        if (w > 0) { at += (size_t)w; continue; }
+        stalls++;
+        struct pollfd p = {.fd = 1, .events = POLLOUT};
+        poll(&p, 1, 50);
+    }
+    fcntl(1, F_SETFL, fl);   /* the shell shares this open file */
+}
+
+/* A fatal signal: turn every mode off, then die of the same signal. Only
+   async-signal-safe calls (proc_listchildpids is a bare system call). */
+static void on_fatal(int sig) {
+    if (getpid() == tui_pid) {   /* not a forked child that has not exec'd yet */
+#ifdef __APPLE__
+        if (sig == SIGTERM || sig == SIGHUP) {
+            /* each tool command leads its own group, so it would outlive us */
+            pid_t kid[64] = {0};
+            proc_listchildpids(tui_pid, kid, sizeof kid);
+            for (size_t i = 0; i < sizeof kid / sizeof *kid; i++)
+                if (kid[i] > 1 && getpgid(kid[i]) == kid[i]) killpg(kid[i], SIGKILL);
+        }
+#endif
+        /* In the background the terminal is someone else's by now. An error
+           (a dead or foreign tty) restores anyway. */
+        pid_t fg = tcgetpgrp(0);
+        if (fg < 0 || fg == getpgrp()) {
+            if (raw_on) tcsetattr(0, TCSANOW, &saved_t);
+            if (tui_up) modes_off();
+        }
+    }
+    signal(sig, SIG_DFL);   /* macOS ignores SA_RESETHAND for SIGILL */
+    raise(sig);             /* SA_NODEFER: the default action, now */
+    _exit(128 + sig);
+}
+
+static void catch_fatal(void) {
+    static const int sigs[] = {SIGTERM, SIGHUP, SIGQUIT, SIGSEGV, SIGBUS, SIGABRT, SIGFPE, SIGILL};
+    static char stack[1 << 16];   /* a stack overflow leaves no room on the normal one */
+    stack_t ss = {.ss_sp = stack, .ss_size = sizeof stack};
+    sigaltstack(&ss, NULL);
+    struct sigaction sa = {0};
+    sa.sa_handler = on_fatal;
+    sa.sa_flags = SA_RESETHAND | SA_NODEFER | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    sigaddset(&sa.sa_mask, SIGTTOU);   /* tcsetattr from the background must not stop us */
+    tui_pid = getpid();
+    tui_up = 1;
+    for (size_t i = 0; i < sizeof sigs / sizeof *sigs; i++) {
+        struct sigaction old;
+        if (sigaction(sigs[i], NULL, &old) == 0 && old.sa_handler != SIG_IGN)   /* keep nohup */
+            sigaction(sigs[i], &sa, NULL);
     }
 }
 
@@ -3155,6 +3229,7 @@ static void tui_pump(void) {
 void tui_repl(void) {
     if (!in_reserve(0)) return;
     signal(SIGWINCH, on_winch);
+    catch_fatal();
     detect_project_meta();
     term_raw(true);
     get_size();
@@ -3194,4 +3269,5 @@ void tui_repl(void) {
     term_raw(false);
     printf("\033[r\033[%d;1H\n", rows);
     fflush(stdout);
+    tui_up = 0;
 }
