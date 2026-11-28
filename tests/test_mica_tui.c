@@ -273,6 +273,7 @@ static bool handle_images(int cfd, const char *body, const char *last_msg) {
 static volatile int g_models_delay_ms;      /* hold /models, to press keys during it */
 
 static volatile int g_net_schema = -1;     /* last chat request offered "network" */
+static volatile int g_models_one;          /* /models lists a single model */
 
 static void handle_client(int cfd) {
     static char req[2 << 20];
@@ -305,6 +306,9 @@ static void handle_client(int cfd) {
                            "{\"data\":[{\"id\":\"mock/qwen\",\"vision\":true},"
                            "{\"id\":\"mock/qwen-alt\",\"vision\":false}]}";
         if (g_models_delay_ms) usleep((useconds_t)g_models_delay_ms * 1000);
+        if (g_models_one)
+            resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+                   "{\"data\":[{\"id\":\"mock/solo\"}]}";
         send_all(cfd, resp, strlen(resp));
         close(cfd);
         return;
@@ -1931,6 +1935,39 @@ static void branch_tests(const char *dir, const char *cmd) {
     branch_case(dir, cmd, "none when git hangs", "exec sleep 10", NULL);
 }
 
+/* ---------- first run: no model named, or no server ---------- */
+
+static void startup_tests(const char *dir, const char *fw) {
+    char cmd[2048];
+    snprintf(cmd, sizeof cmd, "unset FW_MODEL FW_ENDPOINT; exec '%s' -e http://127.0.0.1:%d/v1",
+             fw, g_srv_port);
+    g_models_one = 1;
+    MicaSession *s = mica_session_create(dir, cmd, 24, 80);
+    assert(s != NULL);
+    bool ready = wait_for_text(s, "ready", 6000);
+    pump(s, 150);
+    CHECK(s, "the only model served is used", ready && find_row(s, "mock/solo") >= 0);
+    CHECK(s, "a reachable server draws no setup hint", find_row(s, "flywheel setup") < 0);
+    mica_session_destroy(s);
+    g_models_one = 0;
+
+    snprintf(cmd, sizeof cmd, "unset FW_MODEL FW_ENDPOINT; exec '%s' -e http://127.0.0.1:1/v1 -W 1", fw);
+    s = mica_session_create(dir, cmd, 40, 80);
+    assert(s != NULL);
+    CHECK(s, "no server: said at startup", wait_for_text(s, "run `flywheel setup`", 6000) &&
+          find_row(s, "cannot reach the server at http://127.0.0.1:1/v1") >= 0 &&
+          find_row(s, "offline") >= 0);
+    pump(s, 150);
+    int first = find_last_row(s, "flywheel setup");
+    type_str(s, "hi");
+    mica_session_key(s, VTERM_KEY_ENTER, VTERM_MOD_NONE);
+    bool failed = wait_for_text(s, "\xe2\x9c\x97", 8000);
+    pump(s, 300);
+    CHECK(s, "no server: said again when a task fails",
+          failed && find_last_row(s, "flywheel setup") > first);
+    mica_session_destroy(s);
+}
+
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     const char *fw_bin = (argc > 1) ? argv[1] : "./flywheel";
@@ -2312,6 +2349,7 @@ int main(int argc, char **argv) {
     signal_tests(testdir, cmd);
     sandbox_tests(testdir, cmd);
     branch_tests(testdir, cmd);
+    startup_tests(testdir, abs_fw);
     stop_mock_server(srv_th);
 
     char rm[1200];

@@ -488,6 +488,8 @@ static void test_copy_file(void) {
 
 static int nreq;   /* request number inside the server process */
 static const char *req_dump;   /* if set, the server appends every request there */
+/* if set, the answer to GET /v1/models, which then does not count as a request */
+static const char *models_reply;
 
 /* serve reply(n) to the n-th request until killed */
 static pid_t serve(const char *(*reply)(int)) {
@@ -519,7 +521,8 @@ static pid_t serve(const char *(*reply)(int)) {
         }
         FILE *dump = req_dump ? fopen(req_dump, "a") : NULL;
         if (dump) { fwrite(req, 1, len, dump); fclose(dump); }
-        const char *r = reply(nreq++);
+        const char *r = models_reply && !strncmp(req, "GET /v1/models ", 15) ? models_reply
+                                                                            : reply(nreq++);
         if (write(c, r, strlen(r)) < 0) _exit(1);
         close(c);
     }
@@ -634,7 +637,7 @@ static void test_agent(void) {
     if (!mkdtemp(dir)) { T("mkdtemp", false); return; }
     free(g_cfg.cwd);
     g_cfg.cwd = str_dup(dir);
-    g_cfg.maxturns = 20; g_cfg.maxtok = 100; g_cfg.cmd_timeout = 5; g_cfg.gate_every = 0; g_cfg.max_gates = 0;
+    g_cfg.maxturns = 20; g_cfg.cmd_timeout = 5; g_cfg.gate_every = 0; g_cfg.max_gates = 0;
     free(g_cfg.model);
     g_cfg.model = str_dup("m");
     Ui ui = {.interactive = true};
@@ -811,6 +814,7 @@ static void test_agent_strict(void) {
 static int run_status;   /* exit code of the last run */
 
 static unsigned run_limit = 20;   /* seconds a run may take */
+static bool run_err;              /* capture stderr with stdout */
 static char *run_flywheel(bool tty, char *const *argv) {
     static char out[65536];
     int rd = -1, wr = -1, fds[2];
@@ -825,7 +829,7 @@ static char *run_flywheel(bool tty, char *const *argv) {
     if (!pid) {
         alarm(run_limit);
         int nul = open("/dev/null", O_RDWR);
-        dup2(nul, 0); dup2(wr, 1); dup2(nul, 2);
+        dup2(nul, 0); dup2(wr, 1); dup2(run_err ? wr : nul, 2);
         close(rd); close(wr);
         const char *bin = getenv("FW_BIN");
         execv(bin ? bin : "./flywheel", argv);
@@ -1007,9 +1011,28 @@ static void fake_tool(const char *dir, const char *name, const char *body) {
     chmod(p, 0755);
 }
 
+/* leave only the project file that makes cwd a project of this profile */
+static const Profile *profile_in(const char *cwd, const char *prof) {
+    static const char *const marks[][2] = {{"ts", "package.json"}, {"python", "requirements.txt"},
+                                           {"go", "go.mod"}, {"rust", "Cargo.toml"}};
+    char p[300];
+    for (int i = 0; i < 4; i++) {
+        snprintf(p, sizeof p, "%s/%s", cwd, marks[i][1]);
+        unlink(p);
+    }
+    for (int i = 0; i < 4; i++)
+        if (!strcmp(marks[i][0], prof)) {
+            snprintf(p, sizeof p, "%s/%s", cwd, marks[i][1]);
+            put(p, "");
+        }
+    const Profile *found = profile_detect(cwd);
+    T("profile detected from project files", !strcmp(found->name, prof));
+    return found;
+}
+
 static bool gate(const char *prof, const char *cwd, const char *must_contain) {
     bool failed;
-    char *o = gate_run(profile_detect(cwd, prof), cwd, 20, &failed);
+    char *o = gate_run(profile_in(cwd, prof), cwd, 20, &failed);
     if (must_contain) T(must_contain, strstr(o, must_contain) != NULL);
     T("gate output bounded", strlen(o) <= 1800);
     free(o);
@@ -1154,8 +1177,7 @@ static void test_gate_approval(void) {
     free(g_cfg.cwd);
     g_cfg.cwd = str_dup(dir);
     perm_free();
-    char *prof = g_cfg.profile;
-    g_cfg.profile = (char *)"go";
+    profile_in(dir, "go");
     int gates = g_cfg.max_gates, every = g_cfg.gate_every, turns = g_cfg.maxturns;
     g_cfg.max_gates = 0;
     g_cfg.gate_every = 0;
@@ -1240,7 +1262,6 @@ static void test_gate_approval(void) {
     perm_free();
 
     g_cfg.gate_every = every; g_cfg.max_gates = gates; g_cfg.maxturns = turns;
-    g_cfg.profile = prof;
     setenv("PATH", oldpath, 1);
     free(oldpath);
 }
@@ -1420,8 +1441,7 @@ static void test_truth(void) {
     snprintf(tr, sizeof tr, "%s/tr.jsonl", dir);
     free(g_cfg.cwd);
     g_cfg.cwd = str_dup(dir);
-    char *prof = g_cfg.profile;
-    g_cfg.profile = (char *)"go";
+    profile_in(dir, "go");
     int gates = g_cfg.max_gates, turns = g_cfg.maxturns, to = g_cfg.cmd_timeout;
     g_cfg.max_gates = 0; g_cfg.maxturns = 8; g_cfg.cmd_timeout = 1;
     Ui u = {.interactive = true};
@@ -1480,11 +1500,10 @@ static void test_truth(void) {
     msgs_free(&m);
 
     bool failed_;
-    char *o = gate_run(profile_detect(dir, "go"), dir, 1, &failed_);
+    char *o = gate_run(profile_detect(dir), dir, 1, &failed_);
     T("gate: timeout is not a pass", failed_);
     free(o);
 
-    g_cfg.profile = prof;
     g_cfg.max_gates = gates; g_cfg.maxturns = turns; g_cfg.cmd_timeout = to;
     setenv("PATH", oldpath, 1);
     free(oldpath);
@@ -1517,8 +1536,6 @@ static void test_loopedit(void) {
     snprintf(p, sizeof p, "%s/f.txt", dir);
     free(g_cfg.cwd);
     g_cfg.cwd = str_dup(dir);
-    char *prof = g_cfg.profile;
-    g_cfg.profile = (char *)"generic";
     static const char *const names[] = {
         "successive rewrites of one file are kept", "successive edits of one file are kept",
         "identical writes are still a loop", "identical edits are still a loop",
@@ -1534,7 +1551,6 @@ static void test_loopedit(void) {
         T(names[loop_kind], (strstr(sum, "prunes=0 ") != NULL) == (loop_kind < 2));
         msgs_free(&m);
     }
-    g_cfg.profile = prof;
 }
 
 /* ---------- -W bounds commands and gates ---------- */
@@ -1560,7 +1576,7 @@ static const char *wall_run(Msgs *m, Ui *ui, int ncalls, const char *const *call
 static void test_wall_limit(void) {
     char dir[] = "/tmp/fwwallXXXXXX";
     if (!mkdtemp(dir)) { T("mkdtemp", false); return; }
-    char *oldpath = str_dup(getenv("PATH")), *prof = g_cfg.profile;
+    char *oldpath = str_dup(getenv("PATH"));
     char path[4096], ran[600], second[600], third[600], tr[600], body[700], sum[256];
     snprintf(path, sizeof path, "%s:%s", dir, oldpath);
     setenv("PATH", path, 1);
@@ -1584,7 +1600,6 @@ static void test_wall_limit(void) {
         "bash", "{\"command\":\"sleep 15\"}",
         "bash", "{\"command\":\"echo x > second\"}",
         "write_file", "{\"path\":\"third\",\"content\":\"x\"}"};
-    g_cfg.profile = (char *)"generic";
     const char *fin = wall_run(&m, &u, 3, batch, sum, sizeof sum, &secs);
     T("-W cuts a running command", secs <= 5);
     T("-W: the cut command says why", has_msg(&m, "tool", "wall clock limit"));
@@ -1603,7 +1618,7 @@ static void test_wall_limit(void) {
     T("-W: command approved too late is not run", access(second, F_OK) != 0 && !strcmp(fin, "wall"));
     msgs_free(&m);
 
-    g_cfg.profile = (char *)"go";
+    profile_in(dir, "go");
     snprintf(body, sizeof body, "echo x >> '%s'; sleep 15; exit 0", ran);
     fake_tool(dir, "go", body);
     static const char *const wr[] = {"write_file", "{\"path\":\"a.go\",\"content\":\"x\"}"};
@@ -1642,7 +1657,6 @@ static void test_wall_limit(void) {
 
     g_cfg.wall = 0;
     g_cfg.transcript = NULL;
-    g_cfg.profile = prof;
     g_cfg.max_gates = gates; g_cfg.gate_every = every; g_cfg.maxturns = turns; g_cfg.cmd_timeout = limit;
     setenv("PATH", oldpath, 1);
     free(oldpath);
@@ -1663,7 +1677,7 @@ static void test_connect_timeout(void) {
 #endif
 
 static void test_cli_values(void) {
-    static const char *const flags[] = {"-e", "-m", "-P", "-f", "-T", "-W", "--sys", "--transcript", "-C", NULL};
+    static const char *const flags[] = {"-e", "-m", "-f", "-T", "-W", "-t", "--transcript", "-C", NULL};
     for (int i = 0; flags[i]; i++) {
         char *av[] = {"flywheel", (char *)flags[i], NULL};
         run_flywheel(false, av);
@@ -1675,12 +1689,285 @@ static void test_cli_values(void) {
 
     bad_reply = OK_HDR STOPPED "data: [DONE]\n\n";
     pid_t srv = serve(reply_fixed);
-    char *q[] = {"flywheel", "-C", "/tmp", "-P", "generic", "-e", g_cfg.endpoint,
+    char dir[] = "/tmp/fwcliXXXXXX";   /* empty: no check to run */
+    if (!mkdtemp(dir)) { T("mkdtemp", false); stop(srv); return; }
+    char *q[] = {"flywheel", "-C", dir, "-e", g_cfg.endpoint,
                  "describe the codebase layout",
                  sandbox_available() ? NULL : "--unsafe", NULL};
     char *o = run_flywheel(false, q);
     T("one-shot question finishes in one turn", strstr(o, "finish=done turns=1 ") != NULL);
     stop(srv);
+}
+
+/* ---------- the command line: what was removed, hidden and added ---------- */
+
+#define DEFAULT_HELP \
+    "flywheel: coding agent for a model running on your machine\n" \
+    "  flywheel              interactive session\n" \
+    "  flywheel \"task\"       run one task and exit\n" \
+    "  flywheel -f task.md   run a task from a file\n" \
+    "  flywheel setup        install the engine and model, start the server\n" \
+    "  -C DIR     work in DIR\n" \
+    "  -m MODEL   model\n" \
+    "  -e URL     server (default http://127.0.0.1:8312/v1)\n" \
+    "  --unsafe   no sandbox; containers and VMs only\n" \
+    "  --version, --help     (--help all lists more)\n"
+
+static void test_help_version(void) {
+    char *v[] = {"flywheel", "--version", NULL};
+    char *o = run_flywheel(false, v);
+    T("--version", run_status == 0 && !strcmp(o, "flywheel v" FW_VERSION "\n") &&
+      !strcmp(FW_VERSION, "0.2"));
+    static const char *const spell[] = {"--help", "-h"};
+    for (int i = 0; i < 2; i++) {
+        char *h[] = {"flywheel", (char *)spell[i], NULL};
+        o = run_flywheel(false, h);
+        T("default help, exactly", run_status == 0 && !strcmp(o, DEFAULT_HELP));
+    }
+    char *a[] = {"flywheel", "--help", "all", NULL};
+    o = run_flywheel(false, a);
+    T("--help all starts with the default", run_status == 0 && !strncmp(o, DEFAULT_HELP, strlen(DEFAULT_HELP)));
+    static const char *const more[] = {"flywheel init", "bench SUITE TAG", "  -q ", "  -T N",
+        "  -W SEC", "  -t SEC", "--transcript FILE", "--allow-outside-writes", "--yes",
+        "FW_MODEL", "maxturns, wall, cmd_timeout"};
+    for (size_t i = 0; i < sizeof more / sizeof *more; i++) T(more[i], strstr(o, more[i]) != NULL);
+    static const char *const gone[] = {"-K ", "-P ", "--temp", "--topp", "--pp", "--think",
+        "--gates", "--sys", "--no-color", "think_budget", "maxtok"};
+    for (size_t i = 0; i < sizeof gone / sizeof *gone; i++) T(gone[i], !strstr(o, gone[i]));
+}
+
+static void test_removed_flags(void) {
+    static const char *const gone[] = {"-K", "-P", "--temp", "--topp", "--pp", "--think",
+        "--gates", "--sys", "--no-color"};
+    run_err = true;
+    for (size_t i = 0; i < sizeof gone / sizeof *gone; i++) {
+        char want[64];
+        snprintf(want, sizeof want, "flywheel: %s was removed", gone[i]);
+        /* before the task and after it */
+        char *a[] = {"flywheel", "-e", "http://127.0.0.1:1/v1", (char *)gone[i], "1", "hi", NULL};
+        char *b[] = {"flywheel", "-e", "http://127.0.0.1:1/v1", "hi", (char *)gone[i], NULL};
+        char *o = run_flywheel(false, a);
+        T(want, run_status == 2 && strstr(o, want) && !strstr(o, "finish="));
+        o = run_flywheel(false, b);
+        T(want, run_status == 2 && strstr(o, want) && !strstr(o, "finish="));
+    }
+    run_err = false;
+}
+
+static int occurs(const char *s, const char *what) {
+    int n = 0;
+    for (; s && (s = strstr(s, what)); s++) n++;
+    return n;
+}
+
+/* one run of the binary against the stub; *sent gets every request (malloc'd) */
+static char *stub_run(const char *dir, char *const *extra, char **sent) {
+    static char dump[300];
+    snprintf(dump, sizeof dump, "%s/requests", dir);
+    unlink(dump);
+    bad_reply = OK_HDR STOPPED "data: [DONE]\n\n";
+    req_dump = dump;
+    pid_t srv = serve(reply_fixed);
+    char *av[24] = {"flywheel", "-C", (char *)dir, "-e", g_cfg.endpoint};
+    int n = 5;
+    while (*extra && n < 21) av[n++] = *extra++;
+    if (!sandbox_available()) av[n++] = "--unsafe";
+    av[n] = NULL;
+    char *o = run_flywheel(false, av);
+    stop(srv);
+    req_dump = NULL;
+    *sent = slurp(dump);
+    unlink(dump);
+    if (!*sent) *sent = str_dup("");
+    return o;
+}
+
+static void write_config(const char *text) {
+    char p[600];
+    snprintf(p, sizeof p, "%s/.config", fakehome);
+    mkdir(p, 0755);
+    snprintf(p, sizeof p, "%s/.config/flywheel", fakehome);
+    mkdir(p, 0755);
+    snprintf(p, sizeof p, "%s/.config/flywheel/config", fakehome);
+    if (text) put(p, text);
+    else unlink(p);
+}
+
+static void test_old_config(void) {
+    char dir[] = "/tmp/fwcfgXXXXXX", *sent;
+    if (!mkdtemp(dir)) { T("mkdtemp", false); return; }
+    char *old = str_dup(getenv("FW_MODEL"));
+    unsetenv("FW_MODEL");   /* it would win over the config */
+    write_config("model=cfgmodel\ntemp=0.7\ntop_p = 0.5\npp=1\nthink_budget=99\n"
+                 "maxtok=5\ngates=9\nprofile=go\n");
+    run_err = true;
+    char *hi[] = {"say hi", NULL};
+    char *o = stub_run(dir, hi, &sent);
+    run_err = false;
+    T("old config: still runs", run_status == 0 && strstr(o, "finish=done turns=1 "));
+    T("old config: one note naming the keys", occurs(o, "removed config settings") == 1 &&
+      strstr(o, "flywheel: ignoring removed config settings: temp top_p pp think_budget maxtok gates profile\n"));
+    T("old config: the kept key applies", strstr(sent, "\"model\":\"cfgmodel\""));
+    T("old config: removed keys change nothing",
+      strstr(sent, "\"max_tokens\":12000") && strstr(sent, "\"temperature\":0,") &&
+      !strstr(sent, "top_p") && !strstr(sent, "presence_penalty") &&
+      !strstr(sent, "thinking_token_budget"));
+    free(sent);
+    write_config("model=cfgmodel\n");
+    run_err = true;
+    o = stub_run(dir, hi, &sent);
+    run_err = false;
+    T("current config: no note", run_status == 0 && !strstr(o, "removed config"));
+    free(sent);
+    write_config(NULL);
+    if (old) setenv("FW_MODEL", old, 1);
+    free(old);
+}
+
+/* the flags bench-tb/flywheel_agent.py passes, which --help does not list */
+static void test_hidden_flags(void) {
+    char dir[] = "/tmp/fwhidXXXXXX", tr[64], task[64], *sent;
+    if (!mkdtemp(dir)) { T("mkdtemp", false); return; }
+    snprintf(tr, sizeof tr, "%s/tr.jsonl", dir);
+    snprintf(task, sizeof task, "%s/task.md", dir);
+    put(task, "say hi\n");
+    char *av[] = {"-q", "--allow-outside-writes", "--unsafe", "-f", task, "-T", "20000",
+                  "-W", "600", "-t", "180", "--transcript", tr, NULL};
+    char *o = stub_run(dir, av, &sent);
+    T("hidden flags still work", strstr(o, "finish=") && !access(tr, F_OK) && strstr(sent, "say hi"));
+    free(sent);
+}
+
+#define MODELS(list) "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"data\":[" list "]}"
+
+static void sends_model(const char *name, const char *dir, const char *models,
+                        char *const *extra, const char *want, bool asks) {
+    char frag[128], *sent;
+    snprintf(frag, sizeof frag, "\"model\":\"%s\"", want);
+    models_reply = models;
+    stub_run(dir, extra, &sent);
+    models_reply = NULL;
+    T(name, run_status == 0 && strstr(sent, frag));
+    T(name, occurs(sent, "GET /v1/models ") == (asks ? 1 : 0));
+    free(sent);
+}
+
+static void test_model_pick(void) {
+    char dir[] = "/tmp/fwpickXXXXXX";
+    if (!mkdtemp(dir)) { T("mkdtemp", false); return; }
+    char *old = str_dup(getenv("FW_MODEL"));
+    unsetenv("FW_MODEL");
+    char *hi[] = {"say hi", NULL};
+    char *with_m[] = {"-m", "mine", "say hi", NULL};
+    const char *one = MODELS("{\"id\":\"solo/model-4bit\"}");
+    sends_model("the only model is used", dir, one, hi, "solo/model-4bit", true);
+    sends_model("two models: the default", dir, MODELS("{\"id\":\"a\"},{\"id\":\"b\"}"), hi,
+                "local/qwen-pi4", true);
+    sends_model("no models: the default", dir, MODELS(""), hi, "local/qwen-pi4", true);
+    sends_model("no /models: the default", dir, "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n",
+                hi, "local/qwen-pi4", true);
+    sends_model("junk /models: the default", dir, OK_HDR "not json", hi, "local/qwen-pi4", true);
+    sends_model("unprintable name: the default", dir, MODELS("{\"id\":\"x\\u001b[2J\"}"), hi,
+                "local/qwen-pi4", true);
+    sends_model("-m wins, nothing asked", dir, one, with_m, "mine", false);
+    setenv("FW_MODEL", "fromenv", 1);
+    sends_model("FW_MODEL wins, nothing asked", dir, one, hi, "fromenv", false);
+    unsetenv("FW_MODEL");
+    write_config("model=fromconfig\n");
+    sends_model("config wins, nothing asked", dir, one, hi, "fromconfig", false);
+    write_config(NULL);
+
+    char *init[] = {"init", NULL};
+    char *sent;
+    models_reply = one;
+    char *o = stub_run(dir, init, &sent);
+    models_reply = NULL;
+    T("init reports the picked model", strstr(o, "model 'solo/model-4bit'") != NULL);
+    free(sent);
+    if (old) setenv("FW_MODEL", old, 1);
+    free(old);
+}
+
+static void test_no_server(void) {
+    static const char *const nobody = "http://127.0.0.1:1/v1";
+    /* both transports tell a refused connection from a server's refusal */
+    g_cfg.model = g_cfg.model ? g_cfg.model : str_dup("m");
+    free(g_cfg.endpoint);
+    g_cfg.endpoint = str_dup(nobody);
+    Msgs m;
+    msgs_init(&m);
+    msgs_push(&m, "user", "hi");
+    StreamCb cb = {.stream = true};
+    ChatResp *r = chat(&m, &cb);
+    T("chat: nobody there is unreachable", r && r->error && http_unreachable);
+    chat_resp_free(r);
+    char *g = http_get("/models");
+    T("get: nobody there is unreachable", !g && http_unreachable);
+    free(g);
+    bad_reply = "HTTP/1.1 503 Unavailable\r\nConnection: close\r\n\r\nbusy";
+    pid_t p = serve(reply_fixed);
+    r = chat(&m, &cb);
+    T("chat: an error status is a server", r && r->error && !http_unreachable);
+    chat_resp_free(r);
+    g = http_get("/models");
+    T("get: an error status is a server", !g && !http_unreachable);
+    free(g);
+    msgs_free(&m);
+    stop(p);
+
+    char dir[] = "/tmp/fwnosrvXXXXXX";
+    if (!mkdtemp(dir)) { T("mkdtemp", false); return; }
+    char *old = str_dup(getenv("FW_MODEL"));
+    unsetenv("FW_MODEL");   /* the /models probe fails too */
+    char *av[] = {"flywheel", "-C", dir, "-e", (char *)nobody, "-W", "1", "hi",
+                  sandbox_available() ? NULL : "--unsafe", NULL};
+    run_err = true;
+    char *o = run_flywheel(false, av);
+    T("one-shot says the server is unreachable", run_status == 1 &&
+      strstr(o, "flywheel: cannot reach the server at http://127.0.0.1:1/v1\n"));
+    T("and suggests setup or -e", strstr(o, "`flywheel setup`") && strstr(o, "-e "));
+    bad_reply = "HTTP/1.1 400 Bad\r\nConnection: close\r\n\r\nno";
+    p = serve(reply_fixed);
+    av[4] = g_cfg.endpoint;
+    o = run_flywheel(false, av);
+    T("a server's error is not 'unreachable'", run_status == 1 && strstr(o, "status 400") &&
+      !strstr(o, "cannot reach"));
+    stop(p);
+    run_err = false;
+    if (old) setenv("FW_MODEL", old, 1);
+    free(old);
+}
+
+/* temperature 0 and a fixed limit, until the loop breaker raises it for a while */
+static void test_loop_sampling(void) {
+    char dir[] = "/tmp/fwsampXXXXXX", dump[64];
+    if (!mkdtemp(dir)) { T("mkdtemp", false); return; }
+    snprintf(dump, sizeof dump, "%s.requests", dir);
+    free(g_cfg.cwd);
+    g_cfg.cwd = str_dup(dir);
+    Ui u = {.interactive = true};
+    Msgs m;
+    static const char *const same[] = {"bash", "{\"command\":\"true\"}"};
+    new_task(&m);
+    req_dump = dump;
+    run_agent(&m, "tool_calls", 1, same, 6, &u);
+    req_dump = NULL;
+    msgs_free(&m);
+    char *sent = slurp(dump);
+    const char *first = sent ? strstr(sent, "\"temperature\":") : NULL;
+    T("sampling: starts at temperature 0", first && !strncmp(first, "\"temperature\":0,", 16));
+    T("sampling: fixed token limit", sent && strstr(sent, "\"max_tokens\":12000"));
+    T("sampling: the loop breaker warms it", sent &&
+      strstr(sent, "\"temperature\":0.5,\"top_p\":0.95,\"presence_penalty\":0.25"));
+    char seq[64] = "";   /* one letter a request: cool or warm */
+    size_t n = 0;
+    for (const char *s = sent; s && n < sizeof seq - 1 && (s = strstr(s, "\"temperature\":")); s++)
+        seq[n++] = !strncmp(s, "\"temperature\":0,", 16) ? 'c' : 'w';
+    T("sampling: warm for two turns, then cool again", strstr(seq, "cwwc") && !strstr(seq, "www"));
+    T("sampling: top_p only while warm",
+      occurs(sent, "\"top_p\"") == occurs(sent, "\"temperature\":0.5"));
+    free(sent);
+    unlink(dump);
 }
 
 /* ---------- second review round ---------- */
@@ -1728,7 +2015,7 @@ static void test_review2_optout(void) {
     for (int i = 0; outside[i]; i++) T(outside[i], deny_check(outside[i], cwd) == NULL);
     for (int i = 0; still[i]; i++) T(still[i], deny_check(still[i], cwd) != NULL);
     g_cfg.outside_writes = false;
-    char *argv[] = {"flywheel", "--allow-outside-writes", "-h", NULL};
+    char *argv[] = {"flywheel", "--allow-outside-writes", "-h", "all", NULL};
     char *out = run_flywheel(false, argv);
     T("flag is accepted", run_status == 0 && strstr(out, "--allow-outside-writes"));
 }
@@ -4326,6 +4613,8 @@ int main(int argc, char **argv) {
     snprintf(projdir, sizeof projdir, "/tmp/fwprojXXXXXX");
     if (!mkdtemp(fakehome) || !mkdtemp(projdir)) return 1;
     setenv("HOME", fakehome, 1);   /* never touch the real rules */
+    /* binary runs name no -m: without this each would first ask /models */
+    setenv("FW_MODEL", "m", 1);
     g_cfg.unsafe = !sandbox_available();   /* else commands run sandboxed */
     g_cfg.cwd = str_dup(projdir);
     setenv("HOME", "/home/fwdeny", 1);   /* HOME outside /tmp for the ~ and $HOME cases */
@@ -4360,6 +4649,13 @@ int main(int argc, char **argv) {
     test_gate();
     test_agent_review();
     test_cli_values();
+    test_help_version();
+    test_removed_flags();
+    test_old_config();
+    test_hidden_flags();
+    test_model_pick();
+    test_no_server();
+    test_loop_sampling();
     setenv("HOME", "/home/fwdeny", 1);
     test_review2_deny();
     test_review2_optout();

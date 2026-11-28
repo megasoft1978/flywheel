@@ -111,7 +111,7 @@ static char *bash_out(const char *cmd, bool net, bool interactive, time_t wall0)
 #define WALL_SKIP "error: wall clock limit reached — not executed"
 
 const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
-    const Profile *prof = profile_detect(g_cfg.cwd, g_cfg.profile);
+    const Profile *prof = profile_detect(g_cfg.cwd);
     Recent rec = {0};
     int prunes = 0, gates = 0, resets = 0, toks = 0, ptoks = 0, calls = 0, turns = 0;
     double secs = 0;
@@ -134,9 +134,8 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
     for (int turn = 0; turn < g_cfg.maxturns; turn++) {
         if (wall_over(wall0)) { finish = "wall"; break; }
         if (g_abort) { finish = "aborted"; break; }
-        double base_t = g_cfg.temp, base_pp = g_cfg.pp;
-        if (escape_turns > 0) { g_cfg.temp = base_t > g_cfg.loop_temp ? base_t : g_cfg.loop_temp;
-                                if (g_cfg.pp < 0.25) g_cfg.pp = 0.25; escape_turns--; }
+        g_cfg.loop_escape = escape_turns > 0;
+        if (escape_turns > 0) escape_turns--;
         char stbuf[128];
         snprintf(stbuf, sizeof stbuf, "turn %d · %d tok", turn, toks);
         emit(ui, ui->emit_status, stbuf);
@@ -170,8 +169,7 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
             if (g_abort || wall_over(wall0)) break;
         }
         g_cfg.req_timeout = 0;
-        g_cfg.temp = base_t;
-        g_cfg.pp = base_pp;
+        g_cfg.loop_escape = false;
         if (!r || r->error) {
             static char ferr[224];
             snprintf(ferr, sizeof ferr, "error:%.200s", r && r->error ? r->error : "null");

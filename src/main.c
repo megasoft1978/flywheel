@@ -20,41 +20,37 @@ static void on_sigint(int s) { (void)s; g_abort = 1; }
 /* a handler, not SIG_IGN: exec'd commands get the default SIGPIPE back */
 static void on_sigpipe(int s) { (void)s; }
 
-static void usage(FILE *f) {
-    fprintf(f,
-"flywheel — C agent harness for local OpenAI-compatible engines\n"
+#define DEFAULT_ENDPOINT "http://127.0.0.1:8312/v1"
+#define DEFAULT_MODEL "local/qwen-pi4"
+
+static void usage(FILE *f, bool all) {
+    fputs(
+"flywheel: coding agent for a model running on your machine\n"
+"  flywheel              interactive session\n"
+"  flywheel \"task\"       run one task and exit\n"
+"  flywheel -f task.md   run a task from a file\n"
+"  flywheel setup        install the engine and model, start the server\n"
+"  -C DIR     work in DIR\n"
+"  -m MODEL   model\n"
+"  -e URL     server (default " DEFAULT_ENDPOINT ")\n"
+"  --unsafe   no sandbox; containers and VMs only\n"
+"  --version, --help     (--help all lists more)\n", f);
+    if (!all) return;
+    fputs(
 "\n"
-"  flywheel                          interactive REPL (claude-code style)\n"
-"  flywheel init                     set up .flywheel.md for this project\n"
-"  flywheel setup                    install engine + download model (interactive)\n"
-"  flywheel \"fix the bug in x.ts\"     one-shot task\n"
-"  flywheel -f prompt.md             one-shot from file\n"
-"  flywheel [flags] bench SUITE TAG [task-id ...]   run a bench suite\n"
-"\n"
-"config: ~/.config/flywheel/config (key=value: endpoint, model, profile,\n"
-"        maxturns, wall, cmd_timeout, maxtok, temp, top_p, pp, think_budget)\n"
-"\n"
-"options:\n"
-"  -e URL     endpoint          (def http://127.0.0.1:8312/v1, env FW_ENDPOINT)\n"
-"  -m MODEL   model name        (def local/qwen-pi4, env FW_MODEL)\n"
-"  -C DIR     working dir       (def cwd)\n"
-"  -P PROF    ts|python|go|rust|generic (def auto-detect)\n"
-"  -f FILE    task file (a deliverable: files are expected)\n"
-"  -T N       max turns         (def 60)\n"
-"  -W SEC     wall clock        (def 0=off)\n"
-"  -t SEC     bash cmd timeout  (def 30)\n"
-"  -K N       max tokens/resp   (def 12000)\n"
-"  --temp X --topp X --pp X     sampling (def 0, 0.95, 0)\n"
-"  --think N  thinking budget   (def 0=server default)\n"
-"  --gates N  verify passes     (def 1)\n"
-"  --transcript FILE            JSONL log\n"
-"  --sys TEXT  extra system-prompt text\n"
-"  -q         quiet (non-interactive)\n"
-"  --allow-outside-writes       throwaway containers only: commands may write\n"
-"                               outside the working dir\n"
-"  --unsafe                     run commands without the sandbox (macOS) and\n"
-"                               with your full environment; required for one-shot\n"
-"                               and bench where there is no sandbox\n");
+"  flywheel init         write .flywheel.md project notes, check the server\n"
+"  flywheel [options] bench SUITE TAG [task-id ...]   run a bench suite\n"
+"  -q         quiet one-shot output\n"
+"  -T N       max turns (default 60)\n"
+"  -W SEC     wall clock limit (default 0 = none)\n"
+"  -t SEC     command timeout (default 30)\n"
+"  -y, --yes  setup: answer yes to every question\n"
+"  --transcript FILE        append a JSONL log\n"
+"  --allow-outside-writes   throwaway containers only: commands may write\n"
+"                           outside the working directory\n"
+"  environment: FW_ENDPOINT, FW_MODEL\n"
+"  config: ~/.config/flywheel/config, key=value lines:\n"
+"          endpoint, model, maxturns, wall, cmd_timeout\n", f);
 }
 
 /* one-shot and bench approve everything, so they need something to contain it */
@@ -133,10 +129,9 @@ static char *build_system(const Profile *prof, bool interactive) {
               "arguments and the user will be asked."
             : "\nCommands are sandboxed: write only inside the working directory or $TMPDIR (not /tmp). "
               "There is no network.";
-    const char *extra = g_cfg.sys_extra ? g_cfg.sys_extra : "";
-    size_t cap = strlen(base) + sizeof untrusted + strlen(box) + strlen(proj) + strlen(extra) + 1;
+    size_t cap = strlen(base) + sizeof untrusted + strlen(box) + strlen(proj) + 1;
     char *sys = malloc(cap);
-    snprintf(sys, cap, "%s%s%s%s%s", base, untrusted, box, proj, extra);
+    snprintf(sys, cap, "%s%s%s%s", base, untrusted, box, proj);
     return sys;
 }
 
@@ -184,6 +179,11 @@ static void load_config(void) {
     snprintf(path, sizeof path, "%s/.config/flywheel/config", home);
     char *c = read_file(path);
     if (!c) return;
+    /* settings that older versions read: ignored, and said so once */
+    static const char *const gone[] = {"temp", "top_p", "pp", "think_budget", "maxtok",
+                                       "gates", "profile"};
+    const int ngone = (int)(sizeof gone / sizeof *gone);
+    unsigned seen = 0;
     for (char *ln = strtok(c, "\n"); ln; ln = strtok(NULL, "\n")) {
         if (*ln == '#' || !strchr(ln, '=')) continue;
         char *eq = strchr(ln, '=');
@@ -192,24 +192,72 @@ static void load_config(void) {
         char *e = ln + strlen(ln) - 1;
         while (e > ln && (*e == ' ' || *e == '\r')) *e-- = 0;
         if (!strcmp(ln, "endpoint")) { free(g_cfg.endpoint); g_cfg.endpoint = str_dup(eq); }
-        else if (!strcmp(ln, "model")) { free(g_cfg.model); g_cfg.model = str_dup(eq); }
-        else if (!strcmp(ln, "profile")) g_cfg.profile = str_dup(eq);
+        else if (!strcmp(ln, "model")) {
+            free(g_cfg.model);
+            g_cfg.model = str_dup(eq);
+            g_cfg.pick_model = false;
+        }
         else if (!strcmp(ln, "maxturns")) g_cfg.maxturns = atoi(eq);
         else if (!strcmp(ln, "wall")) g_cfg.wall = atoi(eq);
         else if (!strcmp(ln, "cmd_timeout")) g_cfg.cmd_timeout = atoi(eq);
-        else if (!strcmp(ln, "maxtok")) g_cfg.maxtok = atoi(eq);
-        else if (!strcmp(ln, "temp")) g_cfg.temp = atof(eq);
-        else if (!strcmp(ln, "top_p")) g_cfg.top_p = atof(eq);
-        else if (!strcmp(ln, "pp")) g_cfg.pp = atof(eq);
-        else if (!strcmp(ln, "think_budget")) g_cfg.think_budget = atoi(eq);
-        else if (!strcmp(ln, "gates")) g_cfg.max_gates = atoi(eq);
+        else for (int k = 0; k < ngone; k++)
+            if (!strcmp(ln, gone[k])) seen |= 1u << k;
     }
     free(c);
+    if (!seen) return;
+    fputs("flywheel: ignoring removed config settings:", stderr);
+    for (int k = 0; k < ngone; k++)
+        if (seen & (1u << k)) fprintf(stderr, " %s", gone[k]);
+    fputc('\n', stderr);
 }
 
 char *fw_build_system(bool interactive) {
-    const Profile *prof = profile_detect(g_cfg.cwd, g_cfg.profile);
+    const Profile *prof = profile_detect(g_cfg.cwd);
     return build_system(prof, interactive);
+}
+
+/* ---- the model and the server ---- */
+
+static char *picked;   /* the model fw_pick_model took from the server */
+
+/* the name is printed to terminals: plain visible ASCII only */
+static bool plain_name(const char *s) {
+    size_t n = 0;
+    while (s[n] > ' ' && s[n] < 0x7F) n++;
+    return n && n < 200 && !s[n];
+}
+
+/* Decided once, by the first /models answer asked for: later calls change
+   nothing, so a model chosen with /model stays. */
+void fw_pick_model(const char *models) {
+    if (!g_cfg.pick_model) return;
+    g_cfg.pick_model = false;
+    cJSON *root = models ? cJSON_Parse(models) : NULL;
+    cJSON *data = root ? cJSON_GetObjectItemCaseSensitive(root, "data") : NULL;
+    cJSON *id = cJSON_IsArray(data) && cJSON_GetArraySize(data) == 1
+        ? cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(data, 0), "id") : NULL;
+    if (cJSON_IsString(id) && plain_name(id->valuestring)) {
+        free(g_cfg.model);
+        g_cfg.model = str_dup(id->valuestring);
+        free(picked);
+        picked = str_dup(id->valuestring);
+    }
+    cJSON_Delete(root);
+}
+
+/* for the modes that do not otherwise ask for /models at startup */
+static void probe_model(void) {
+    if (!g_cfg.pick_model) return;
+    char *models = http_get("/models");
+    fw_pick_model(models);
+    free(models);
+}
+
+void fw_no_server(char *out, size_t cap) {
+    char *ep = clean_text(g_cfg.endpoint, false, true);
+    snprintf(out, cap, "cannot reach the server at %.300s\n"
+             "  run `flywheel setup` to install and start one, or point -e at yours", ep);
+    free(ep);
 }
 
 /* ---- setup: engine + model bootstrap, always confirmed first ---- */
@@ -326,13 +374,14 @@ int fw_do_setup(void) {
             rc |= hf_download(DRAFT_REPO, ddir);
     } else printf("drafter: %s " GREEN "ok" RESET "\n", ddir);
 
-    /* 3. serve */
+    /* 3. serve: a name taken from some server is not one to start here */
+    const char *model = picked && !strcmp(picked, g_cfg.model) ? DEFAULT_MODEL : g_cfg.model;
     struct stat st;
     char cj[1200]; snprintf(cj, sizeof cj, "%s/config.json", mdir);
     if (have_cmd("splash") && stat(cj, &st) == 0) {
         char *models = http_get("/models");
-        if (models && strstr(models, g_cfg.model)) {
-            printf("serve: %s already " GREEN "up" RESET "\n", g_cfg.model);
+        if (models && strstr(models, model)) {
+            printf("serve: %s already " GREEN "up" RESET "\n", model);
             free(models);
         } else {
             free(models);
@@ -341,13 +390,13 @@ int fw_do_setup(void) {
                 "nohup splash serve --model %s --model-dir '%s' --draft-model '%s' "
                 "--port 8312 --max-concurrent-requests 1 "
                 "--thinking-token-budget 1024 --no-webui >/tmp/flywheel-serve.log 2>&1 &",
-                g_cfg.model, mdir, ddir);
+                model, mdir, ddir);
             if (confirm("start the server now? (detached, tuned flags)", true)) {
                 system(sc);
                 for (int i = 0; i < 90; i++) {
                     sleep(1);
                     char *m2 = http_get("/models");
-                    bool ok = m2 && strstr(m2, g_cfg.model);
+                    bool ok = m2 && strstr(m2, model);
                     free(m2);
                     if (ok) { printf("serve: " GREEN "ready" RESET " :8312\n"); return rc; }
                 }
@@ -361,7 +410,7 @@ int fw_do_setup(void) {
 }
 
 int fw_do_init(void) {
-    const Profile *prof = profile_detect(g_cfg.cwd, g_cfg.profile);
+    const Profile *prof = profile_detect(g_cfg.cwd);
     printf("profile: %s\n", prof->name);
     printf("gate:    %s\n", prof->gate_cmd ? prof->gate_cmd : "(none)");
     char md[1024];
@@ -392,6 +441,7 @@ int fw_do_init(void) {
         if (isatty(0) && confirm("run `flywheel setup` to install engine + model?", true))
             return fw_do_setup();
     } else {
+        fw_pick_model(models);
         bool found = strstr(models, g_cfg.model) != NULL;
         printf("engine:  %s — up, model '%s' %s\n", g_cfg.endpoint, g_cfg.model,
                found ? GREEN "found" RESET : YELLOW "NOT served" RESET);
@@ -427,32 +477,41 @@ int main(int argc, char **argv) {
        UTF-8 so wcwidth/mbrtowc decode emoji + box glyphs correctly */
     if (wcwidth(0x26A1) < 1) setlocale(LC_CTYPE, "en_US.UTF-8");
     memset(&g_cfg, 0, sizeof g_cfg);
-    g_cfg.endpoint = str_dup("http://127.0.0.1:8312/v1");
-    g_cfg.model = str_dup("local/qwen-pi4");
+    g_cfg.endpoint = str_dup(DEFAULT_ENDPOINT);
+    g_cfg.model = str_dup(DEFAULT_MODEL);
+    g_cfg.pick_model = true;
     g_cfg.maxturns = 60; g_cfg.wall = 0; g_cfg.cmd_timeout = 30;
-    g_cfg.maxtok = 12000; g_cfg.gate_every = 8; g_cfg.max_gates = 1;
-    g_cfg.temp = 0.0; g_cfg.top_p = 0.95; g_cfg.pp = 0.0; g_cfg.loop_temp = 0.5;
-    g_cfg.color = isatty(1);
+    g_cfg.gate_every = 8; g_cfg.max_gates = 1;
     char cwd[1024];
     if (!getcwd(cwd, sizeof cwd)) strcpy(cwd, ".");
     g_cfg.cwd = str_dup(cwd);
     load_config();
     if (getenv("FW_ENDPOINT")) { free(g_cfg.endpoint); g_cfg.endpoint = str_dup(getenv("FW_ENDPOINT")); }
-    if (getenv("FW_MODEL")) { free(g_cfg.model); g_cfg.model = str_dup(getenv("FW_MODEL")); }
+    if (getenv("FW_MODEL")) {
+        free(g_cfg.model);
+        g_cfg.model = str_dup(getenv("FW_MODEL"));
+        g_cfg.pick_model = false;
+    }
 
     const char *subcmd = NULL;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         #define REQ (i + 1 < argc ? argv[++i] : NULL)
-        static const char *const valued[] = {"-e", "-m", "-P", "-f", "-T", "-W", "-t", "-K",
-            "--temp", "--topp", "--pp", "--think", "--gates", "--transcript", "--sys", NULL};
+        static const char *const removed[] = {"-K", "-P", "--temp", "--topp", "--pp", "--think",
+            "--gates", "--sys", "--no-color", NULL};
+        for (int k = 0; removed[k]; k++)
+            if (!strcmp(a, removed[k])) {
+                fprintf(stderr, "flywheel: %s was removed (see flywheel --help)\n", a);
+                return 2;
+            }
+        static const char *const valued[] = {"-e", "-m", "-f", "-T", "-W", "-t", "--transcript", NULL};
         for (int k = 0; valued[k]; k++)
             if (!strcmp(a, valued[k]) && i + 1 >= argc) {
                 fprintf(stderr, "flywheel: %s needs a value\n", a);
                 return 2;
             }
         if (!strcmp(a, "-e")) g_cfg.endpoint = str_dup(REQ);
-        else if (!strcmp(a, "-m")) g_cfg.model = str_dup(REQ);
+        else if (!strcmp(a, "-m")) { g_cfg.model = str_dup(REQ); g_cfg.pick_model = false; }
         else if (!strcmp(a, "-C")) {
             const char *dir = REQ;
             char *real = dir ? realpath(dir, NULL) : NULL;
@@ -465,26 +524,21 @@ int main(int argc, char **argv) {
             free(g_cfg.cwd);
             g_cfg.cwd = real;
         }
-        else if (!strcmp(a, "-P")) g_cfg.profile = str_dup(REQ);
         else if (!strcmp(a, "-f")) g_cfg.prompt_file = str_dup(REQ);
         else if (!strcmp(a, "-T")) g_cfg.maxturns = atoi(REQ);
         else if (!strcmp(a, "-W")) g_cfg.wall = atoi(REQ);
         else if (!strcmp(a, "-t")) g_cfg.cmd_timeout = atoi(REQ);
-        else if (!strcmp(a, "-K")) g_cfg.maxtok = atoi(REQ);
-        else if (!strcmp(a, "--temp")) g_cfg.temp = atof(REQ);
-        else if (!strcmp(a, "--topp")) g_cfg.top_p = atof(REQ);
-        else if (!strcmp(a, "--pp")) g_cfg.pp = atof(REQ);
-        else if (!strcmp(a, "--think")) g_cfg.think_budget = atoi(REQ);
-        else if (!strcmp(a, "--gates")) g_cfg.max_gates = atoi(REQ);
         else if (!strcmp(a, "--transcript")) g_cfg.transcript = str_dup(REQ);
-        else if (!strcmp(a, "--sys")) g_cfg.sys_extra = str_dup(REQ);
-        else if (!strcmp(a, "--no-color")) g_cfg.color = false;
         else if (!strcmp(a, "-q")) g_cfg.quiet = true;
         /* command line only: no config key, env var or project file sets it */
         else if (!strcmp(a, "--allow-outside-writes")) g_cfg.outside_writes = true;
         else if (!strcmp(a, "--unsafe")) g_cfg.unsafe = true;
         else if (!strcmp(a, "-y") || !strcmp(a, "--yes")) g_cfg.yes = true;
-        else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(stdout); return 0; }
+        else if (!strcmp(a, "-h") || !strcmp(a, "--help")) {
+            usage(stdout, i + 1 < argc && !strcmp(argv[i + 1], "all"));
+            return 0;
+        }
+        else if (!strcmp(a, "--version")) { puts("flywheel v" FW_VERSION); return 0; }
         else if (!strcmp(a, "init") || !strcmp(a, "setup")) subcmd = a;
         else if (!strcmp(a, "bench")) {
             if (refuse_unsandboxed()) return 2;
@@ -496,6 +550,7 @@ int main(int argc, char **argv) {
             #ifndef FW_MINI_HTTP
             curl_global_init(CURL_GLOBAL_DEFAULT);
             #endif
+            probe_model();
             int rc = fw_do_bench(argc - i - 1, argv + i + 1);
             #ifndef FW_MINI_HTTP
             curl_global_cleanup();
@@ -503,11 +558,8 @@ int main(int argc, char **argv) {
             return rc;
         }
         else if (a[0] != '-') g_cfg.once = str_dup(a);
-        else { fprintf(stderr, "unknown flag: %s\n", a); usage(stderr); return 2; }
+        else { fprintf(stderr, "unknown flag: %s\n", a); usage(stderr, false); return 2; }
         #undef REQ
-    }
-    if (!g_cfg.color) {
-        /* strip color: redefine as empty via env trick — simplest: codes stay but that's fine on pipe */
     }
 
     signal(SIGINT, on_sigint);
@@ -516,7 +568,7 @@ int main(int argc, char **argv) {
     #endif
     if (subcmd) return !strcmp(subcmd, "init") ? fw_do_init() : fw_do_setup();
 
-    const Profile *prof = profile_detect(g_cfg.cwd, g_cfg.profile);
+    const Profile *prof = profile_detect(g_cfg.cwd);
 
     char *prompt = NULL;
     if (g_cfg.prompt_file) {
@@ -532,6 +584,7 @@ int main(int argc, char **argv) {
 
     if (prompt) {
         if (refuse_unsandboxed()) return 2;
+        probe_model();
         /* non-interactive one-shot. Only a task file promises a deliverable;
            anything else may be a plain question */
         if (!g_cfg.prompt_file) {
@@ -559,6 +612,12 @@ int main(int argc, char **argv) {
         char *safe = tty_text(sum, false);   /* finish carries server text */
         printf("\n" GREEN "●" RESET " flywheel: %s\n", safe);
         free(safe);
+        if (strcmp(fin, "done") && http_unreachable) {
+            char note[512];
+            fw_no_server(note, sizeof note);
+            fflush(stdout);
+            fprintf(stderr, "flywheel: %s\n", note);
+        }
         msgs_free(&msgs);
         #ifndef FW_MINI_HTTP
         curl_global_cleanup();

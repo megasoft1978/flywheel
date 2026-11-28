@@ -2210,6 +2210,15 @@ static void refresh_system(void) {
     g_msgs->v[0].content = ns;
 }
 
+static void push_no_server(void) {
+    char note[512], b[560];
+    fw_no_server(note, sizeof note);
+    snprintf(b, sizeof b, YELLOW "  %s" RESET, note);
+    TItem *r = item_new(T_RAW);
+    item_append(r, b);
+    render_screen();
+}
+
 void tui_run_task(const char *prompt) {
     scroll_off = 0;
     msgs_push(g_msgs, "user", prompt);
@@ -2275,6 +2284,7 @@ void tui_run_task(const char *prompt) {
     }
     TItem *d = item_new(T_RAW);
     item_append(d, done);
+    if (strcmp(fin, "done") && http_unreachable) push_no_server();
     set_status("ready");
     render_screen();
     if (wall_dt > 15.0) {
@@ -2795,7 +2805,7 @@ static void run_slash(const char *cmd) {
         }
     } else if (!strcmp(cmd, "/status")) {
         char b[600];
-        const Profile *prof = profile_detect(g_cfg.cwd, g_cfg.profile);
+        const Profile *prof = profile_detect(g_cfg.cwd);
         char *models = http_get("/models");
         char e[200], m[200];
         snprintf(b, sizeof b, "  engine: %s %s · model: " CYAN "%s" RESET " · profile: %s · msgs: %d",
@@ -2848,9 +2858,11 @@ static void card_line(MdBuf *m, int inner_w, const char *body) {
 }
 
 static void push_welcome_card(const Profile *prof) {
-    /* Ping engine once for online badge + context_length */
+    /* Ping engine once for online badge, model pick + context_length */
     bool online = false;
     char *mj = http_get("/models");
+    bool gone = !mj && http_unreachable;
+    fw_pick_model(mj);
     if (mj) {
         online = true;
         cJSON *root = cJSON_Parse(mj);
@@ -2903,6 +2915,7 @@ static void push_welcome_card(const Profile *prof) {
 
     push_raw(card.b);
     free(card.b);
+    if (gone) push_no_server();
 }
 
 /* what is searched for images: the input as typed, with one-line pastes (a long
@@ -3239,7 +3252,7 @@ void tui_repl(void) {
     term_raw(true);
     get_size();
 
-    const Profile *prof = profile_detect(g_cfg.cwd, g_cfg.profile);
+    const Profile *prof = profile_detect(g_cfg.cwd);
     push_welcome_card(prof);
 
     if (!project_init_done()) {

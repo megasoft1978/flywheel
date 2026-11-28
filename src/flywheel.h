@@ -15,7 +15,6 @@ typedef struct {
     char *endpoint;      /* e.g. http://127.0.0.1:8312/v1 */
     char *model;
     char *cwd;           /* working dir for bash tool */
-    char *profile;       /* ts|python|go|rust|generic|NULL=auto */
     char *prompt_file;   /* -f */
     char *once;          /* positional one-shot prompt */
     char *transcript;    /* path for JSONL transcript, NULL = off */
@@ -23,18 +22,12 @@ typedef struct {
     int   wall;          /* seconds, default 0=off */
     int   cmd_timeout;   /* default 30 */
     int   req_timeout;   /* seconds left for one request, 0=default (set from -W) */
-    int   maxtok;        /* default 12000 */
     int   gate_every;    /* default 8, 0=off */
     int   max_gates;     /* default 1 */
-    double temp;         /* default 0.0 */
-    double top_p;        /* default 0.95 */
-    double pp;           /* presence penalty, default 0.0 */
-    double loop_temp;    /* escape temp, default 0.5 */
-    int   think_budget;  /* 0=server default */
-    bool  color;
+    bool  loop_escape;   /* set by the loop breaker: sample warmer */
+    bool  pick_model;    /* no -m, FW_MODEL or config model: not yet picked */
     bool  quiet;         /* once-mode: minimal output */
     bool  yes;           /* auto-confirm setup prompts */
-    char *sys_extra;     /* appended to system prompt */
     bool  outside_writes;/* --allow-outside-writes only: throwaway containers */
     bool  unsafe;        /* --unsafe only: run commands without the sandbox */
 } Cfg;
@@ -102,6 +95,7 @@ ChatResp *chat(Msgs *, StreamCb *);   /* NULL on curl/parse error -> ->error */
 void      chat_resp_free(ChatResp *);
 char     *http_get(const char *path); /* GET endpoint+path, malloc'd body or NULL */
 char     *http_get_url(const char *url); /* GET absolute URL, malloc'd body or NULL */
+extern bool http_unreachable; /* the last request found no server to connect to */
 
 /* tools.c */
 bool  sandbox_available(void);        /* a working kernel sandbox (macOS only) */
@@ -167,7 +161,7 @@ typedef struct {
     const char *persona;         /* system-prompt engineer phrase */
     const char *write_exts;      /* unused v1 */
 } Profile;
-const Profile *profile_detect(const char *cwd, const char *force);
+const Profile *profile_detect(const char *cwd);
 /* runs the profile's check; *failed from its exit status. Never NULL. */
 char *gate_run(const Profile *, const char *cwd, int timeout_s, bool *failed);
 
@@ -212,6 +206,9 @@ void g_msgs_link(Msgs *);                           /* share conversation with t
 int   fw_do_init(void);
 int   fw_do_setup(void);
 char *fw_build_system(bool interactive);
+/* models = a /models body or NULL; takes the only model served, if none was given */
+void  fw_pick_model(const char *models);
+void  fw_no_server(char *out, size_t cap);          /* what to tell the user */
 
 /* bench.c — suite runner; argv[0]=suite-dir, argv[1]=tag, rest=task ids */
 int   fw_copy_file(const char *src, const char *dst);  /* binary-safe, keeps mode */

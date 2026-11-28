@@ -309,8 +309,22 @@ static ChatResp *chat_failed(const char *why) {
 }
 
 bool http_offer_network;   /* set by the TUI: only it can ask the user */
+bool http_unreachable;
+
+#ifndef FW_MINI_HTTP
+static bool no_server(CURLcode rc) {
+    return rc == CURLE_COULDNT_CONNECT || rc == CURLE_COULDNT_RESOLVE_HOST;
+}
+#endif
+
+/* sampling is fixed (temperature 0); only the loop breaker changes it */
+#define MAX_TOKENS 12000
+#define LOOP_TEMP 0.5
+#define LOOP_TOP_P 0.95
+#define LOOP_PENALTY 0.25
 
 ChatResp *chat(Msgs *msgs, StreamCb *cb) {
+    http_unreachable = false;
     char url[512];
     snprintf(url, sizeof url, "%s/chat/completions", g_cfg.endpoint);
 
@@ -399,12 +413,12 @@ ChatResp *chat(Msgs *msgs, StreamCb *cb) {
     cJSON_AddItemToArray(tools, te);
 
     cJSON_AddItemToObject(body, "tools", tools);
-    cJSON_AddNumberToObject(body, "max_tokens", g_cfg.maxtok);
-    cJSON_AddNumberToObject(body, "temperature", g_cfg.temp);
-    if (g_cfg.temp > 0) cJSON_AddNumberToObject(body, "top_p", g_cfg.top_p);
-    if (g_cfg.pp > 0) cJSON_AddNumberToObject(body, "presence_penalty", g_cfg.pp);
-    if (g_cfg.think_budget > 0)
-        cJSON_AddNumberToObject(body, "thinking_token_budget", g_cfg.think_budget);
+    cJSON_AddNumberToObject(body, "max_tokens", MAX_TOKENS);
+    cJSON_AddNumberToObject(body, "temperature", g_cfg.loop_escape ? LOOP_TEMP : 0);
+    if (g_cfg.loop_escape) {
+        cJSON_AddNumberToObject(body, "top_p", LOOP_TOP_P);
+        cJSON_AddNumberToObject(body, "presence_penalty", LOOP_PENALTY);
+    }
     if (cb && cb->stream) {
         cJSON_AddTrueToObject(body, "stream");
         cJSON *so = cJSON_CreateObject();
@@ -458,6 +472,11 @@ ChatResp *chat(Msgs *msgs, StreamCb *cb) {
 #endif
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double secs = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+#ifdef FW_MINI_HTTP
+    http_unreachable = mrc && !strcmp(merr, "connect failed");
+#else
+    http_unreachable = no_server(rc);
+#endif
 
 #ifdef FW_MINI_HTTP
     bool broken = mrc != 0;
@@ -524,6 +543,7 @@ char *http_get(const char *path) {
 }
 
 char *http_get_url(const char *url) {
+    http_unreachable = false;
 #ifdef FW_MINI_HTTP
     return fw_mini_get(url);
 #else
@@ -537,6 +557,9 @@ char *http_get_url(const char *url) {
     curl_easy_setopt(h, CURLOPT_TIMEOUT, 5L);
     curl_easy_setopt(h, CURLOPT_FAILONERROR, 1L);
     CURLcode rc = curl_easy_perform(h);
+    double connected = 0;   /* stays 0 when the time limit ended the connect */
+    curl_easy_getinfo(h, CURLINFO_CONNECT_TIME, &connected);
+    http_unreachable = no_server(rc) || (rc == CURLE_OPERATION_TIMEDOUT && connected <= 0);
     curl_easy_cleanup(h);
     if (a.fatal[0]) fprintf(stderr, "http get: %s\n", a.fatal);
     if (rc != CURLE_OK || a.fatal[0]) { free(a.raw.buf); return NULL; }

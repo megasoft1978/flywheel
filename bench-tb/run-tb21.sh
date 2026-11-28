@@ -28,7 +28,7 @@ DIGEST="$(sed -n 's/^# dataset-digest: //p' "$ALL_TASKS_FILE")"
 ENDPOINT="${TB_ENDPOINT:-http://host.docker.internal:8312/v1}"       # from containers
 HOST_ENDPOINT="${TB_HOST_ENDPOINT:-http://127.0.0.1:8312/v1}"        # Terminus 2 runs on the host
 MODEL_NAME="local/qwen-pi4"
-# Model settings: flywheel's defaults (src/main.c). See PROTOCOL.md for what cannot be matched.
+# Model settings: flywheel's fixed values (src/http.c). See PROTOCOL.md for what cannot be matched.
 TEMPERATURE=0
 MAX_TOKENS=12000
 OPENCODE_VERSION="1.19.6"                 # config keys below were checked against this source

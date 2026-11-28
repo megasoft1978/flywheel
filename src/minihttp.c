@@ -358,6 +358,7 @@ char *fw_mini_get(const char *url) {
     char err[128] = "";
     int status = 0;
     int rc = mini_request("GET", url, NULL, 0, get_cb, &a, 8, &status, err, sizeof err);
+    http_unreachable = rc != 0 && !strcmp(err, "connect failed");
     if (a.fatal) fprintf(stderr, "http get: %s (limit %zu bytes)\n", a.fatal, (size_t)FW_MAX_GET);
     if (rc != 0 || a.fatal || status < 200 || status >= 300) { free(a.body.buf); return NULL; }
     return a.body.buf ? a.body.buf : str_dup("");

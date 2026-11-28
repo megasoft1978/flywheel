@@ -31,12 +31,7 @@ static bool exists(const char *cwd, const char *f) {
     return stat(p, &st) == 0;
 }
 
-const Profile *profile_detect(const char *cwd, const char *force) {
-    if (force) {
-        for (size_t i = 0; i < sizeof PROFILES / sizeof PROFILES[0]; i++)
-            if (!strcmp(PROFILES[i].name, force)) return &PROFILES[i];
-        return &PROFILES[4];
-    }
+const Profile *profile_detect(const char *cwd) {
     if (exists(cwd, "package.json")) return &PROFILES[0];
     if (exists(cwd, "pyproject.toml") || exists(cwd, "setup.py") || exists(cwd, "requirements.txt"))
         return &PROFILES[1];

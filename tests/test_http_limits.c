@@ -306,7 +306,6 @@ static void test_mini(void) {
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     g_cfg.model = str_dup("m");
-    g_cfg.maxtok = 16;
     g_cfg.req_timeout = 10;
     test_tool_calls();
     test_sizes();
