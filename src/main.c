@@ -227,12 +227,12 @@ static bool plain_name(const char *s) {
     return n && n < 200 && !s[n];
 }
 
-/* Decided once, by the first /models answer asked for: later calls change
-   nothing, so a model chosen with /model stays. */
+/* Decided once, by the first /models answer received: no answer leaves it
+   open; later calls change nothing, and /model closes it too. */
 void fw_pick_model(const char *models) {
-    if (!g_cfg.pick_model) return;
+    if (!g_cfg.pick_model || !models) return;
     g_cfg.pick_model = false;
-    cJSON *root = models ? cJSON_Parse(models) : NULL;
+    cJSON *root = cJSON_Parse(models);
     cJSON *data = root ? cJSON_GetObjectItemCaseSensitive(root, "data") : NULL;
     cJSON *id = cJSON_IsArray(data) && cJSON_GetArraySize(data) == 1
         ? cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(data, 0), "id") : NULL;

@@ -2220,6 +2220,11 @@ static void push_no_server(void) {
 }
 
 void tui_run_task(const char *prompt) {
+    if (g_cfg.pick_model) {             /* the server did not answer at startup */
+        char *models = http_get("/models");
+        fw_pick_model(models);
+        free(models);
+    }
     scroll_off = 0;
     msgs_push(g_msgs, "user", prompt);
     TItem *u = item_new(T_USER);
@@ -2757,6 +2762,7 @@ static void run_slash(const char *cmd) {
         push_raw(b);
     } else if (!strncmp(cmd, "/model", 6)) {
         if (cmd[6] == ' ' && cmd[7]) {
+            g_cfg.pick_model = false;
             free(g_cfg.model);
             g_cfg.model = str_dup(cmd + 7);
             char b[300], m[256];
@@ -2764,6 +2770,7 @@ static void run_slash(const char *cmd) {
             push_raw(b);
         } else {
             /* Fetch served models and show interactive picker if >1, else show current */
+            g_cfg.pick_model = false;
             char *mj = http_get("/models");
             const char *mnames[16];
             int nm = 0;

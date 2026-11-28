@@ -274,6 +274,8 @@ static volatile int g_models_delay_ms;      /* hold /models, to press keys durin
 
 static volatile int g_net_schema = -1;     /* last chat request offered "network" */
 static volatile int g_models_one;          /* /models lists a single model */
+static volatile int g_models_fail;         /* /models answers 503 */
+static char g_chat_model[64];              /* "model" of the last chat request */
 
 static void handle_client(int cfd) {
     static char req[2 << 20];
@@ -309,6 +311,8 @@ static void handle_client(int cfd) {
         if (g_models_one)
             resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
                    "{\"data\":[{\"id\":\"mock/solo\"}]}";
+        if (g_models_fail)
+            resp = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         send_all(cfd, resp, strlen(resp));
         close(cfd);
         return;
@@ -319,6 +323,9 @@ static void handle_client(int cfd) {
     send_all(cfd, sse_hdr, strlen(sse_hdr));
 
     g_net_schema = strstr(body, "\"network\":{\"type\":\"boolean\"") != NULL;
+    const char *model = strstr(body, "\"model\":\"");
+    if (model) snprintf(g_chat_model, sizeof g_chat_model, "%.*s",
+                        (int)strcspn(model + 9, "\""), model + 9);
 
     /* Inspect only the LAST message in the conversation array */
     const char *last_msg = body;
@@ -1949,6 +1956,29 @@ static void startup_tests(const char *dir, const char *fw) {
     CHECK(s, "the only model served is used", ready && find_row(s, "mock/solo") >= 0);
     CHECK(s, "a reachable server draws no setup hint", find_row(s, "flywheel setup") < 0);
     mica_session_destroy(s);
+
+    /* /models down at startup: the pick waits for an answer, and never
+       replaces a model chosen with /model in the meantime */
+    for (int chosen = 0; chosen < 2; chosen++) {
+        g_models_fail = 1;
+        s = mica_session_create(dir, cmd, 24, 80);
+        assert(s != NULL);
+        ready = wait_for_text(s, "ready", 6000);
+        pump(s, 150);
+        if (chosen) {
+            type_str(s, "/model mock/chosen\r");
+            ready = ready && wait_for_text(s, "model: mock/chosen", 3000);
+        }
+        g_models_fail = 0;
+        g_chat_model[0] = 0;
+        type_str(s, "hi");
+        mica_session_key(s, VTERM_KEY_ENTER, VTERM_MOD_NONE);
+        bool done = wait_for_text(s, "\xe2\x9c\x93 done", 8000);
+        CHECK(s, chosen ? "an explicit /model choice survives a late /models answer"
+                        : "a model listed after startup is used by the next task",
+              ready && done && !strcmp(g_chat_model, chosen ? "mock/chosen" : "mock/solo"));
+        mica_session_destroy(s);
+    }
     g_models_one = 0;
 
     snprintf(cmd, sizeof cmd, "unset FW_MODEL FW_ENDPOINT; exec '%s' -e http://127.0.0.1:1/v1 -W 1", fw);

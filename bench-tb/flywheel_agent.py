@@ -73,7 +73,7 @@ def wall_limit_sec(budget_sec: float) -> int:
 class FlywheelAgent(BaseAgent):
     def __init__(self, *args, **kwargs):
         self._engine_url = kwargs.pop("engine_url", "http://host.docker.internal:8312/v1")
-        self._model = kwargs.pop("fw_model", None)
+        self._model = kwargs.pop("fw_model", "local/qwen-pi4")
         # set by run-tb21.sh to the same --timeout-multiplier that Harbor applies
         self._timeout_multiplier = float(kwargs.pop("timeout_multiplier", 1.0))
         super().__init__(*args, **kwargs)

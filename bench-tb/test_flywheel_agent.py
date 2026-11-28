@@ -39,7 +39,7 @@ class FakeEnvironment:
         self.exec_calls = []
 
     async def exec(self, command, env=None, timeout_sec=None):
-        self.exec_calls.append({"command": command, "timeout_sec": timeout_sec})
+        self.exec_calls.append({"command": command, "env": env, "timeout_sec": timeout_sec})
         return SimpleNamespace(stdout="FW_EXIT_0", stderr="")
 
     async def download_file(self, source, target):
@@ -115,6 +115,11 @@ class RunCommandTest(unittest.TestCase):
         self.assertIn(f"-T {MAX_TURNS} ", call["command"])
         self.assertIn(f"-t {CMD_TIMEOUT_SEC} ", call["command"])
         self.assertEqual(call["timeout_sec"], 3600 - WALL_MARGIN_SEC + 120)
+
+    def test_model_is_set_without_the_kwarg(self):
+        # unset, flywheel would pick whatever single model the server lists
+        call = self._run("bn-fit-modify", 1.0)
+        self.assertEqual(call["env"]["FW_MODEL"], "local/qwen-pi4")
 
     def test_multiplier_scales_the_wall_limit(self):
         call = self._run("adaptive-rejection-sampler", 0.5)
