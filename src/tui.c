@@ -224,12 +224,13 @@ static void detect_project_meta(void) {
     clean_line(g_stat.proj_name, sizeof g_stat.proj_name,
                (base && base[1]) ? base + 1 : g_cfg.cwd);
     g_stat.git_branch[0] = 0;
-    char *br = run_bash("git rev-parse --abbrev-ref HEAD 2>/dev/null", g_cfg.cwd, 2);
+    int code;
+    char *br = run_bash_status("git rev-parse --abbrev-ref HEAD 2>/dev/null", g_cfg.cwd, 2, &code);
     if (br) {
         char *nl = strchr(br, '\n');
         if (nl) *nl = 0;
-        if (*br && strcmp(br, "HEAD") && strncmp(br, "(no output)", 11) && strncmp(br, "fatal:", 6) &&
-            strncmp(br, "error:", 6) && !strstr(br, "exit ")) {
+        /* anything but exit 0 leaves an error or timeout text, not a name */
+        if (!code && *br && strcmp(br, "HEAD") && strcmp(br, "(no output)")) {
             clean_line(g_stat.git_branch, 61, br);
         }
         free(br);
@@ -354,7 +355,7 @@ static void term_raw(bool on) {
    must not keep us alive: never block, and give up after half a second. */
 static void modes_off(void) {
     static const char off[] = "\030\033[?2026l\033]8;;\033\\\033[0m" MOUSE_OFF_SEQ
-                              "\033[?2004l\033[?1047l\033[?25h\033[r\033[999;1H\n";
+                              "\033[?2004l\033[?1047l\033[?7h\033[?25h\033[r\033[999;1H\n";
     int fl = fcntl(1, F_GETFL);
     if (fl < 0) return;
     fcntl(1, F_SETFL, fl | O_NONBLOCK);
@@ -1267,15 +1268,30 @@ static void draw_input_top(int box_w) {
     fputs("╮" RESET, stdout);
 }
 
+/* Leads the bottom row in every state while commands run unsandboxed
+   (--unsafe or no working sandbox). Returns the columns it took. */
+static int draw_sandbox_badge(void) {
+    if (sandbox_on()) return 0;
+    static const char badge[] = " NOT SANDBOXED ";
+    int n = fit_bytes(badge, cols - 1);
+    printf(RED BOLD "\033[7m%.*s" RESET, n, badge);
+    if (n >= cols - 1) return n;
+    putchar(' ');
+    return n + 1;
+}
+
 static void draw_status_bar(void) {
     char scroll_tag[64] = "";
     if (scroll_off > 0) snprintf(scroll_tag, sizeof scroll_tag, " · ↑%d lines · End to jump", scroll_off);
     char qtag[32] = "";
     if (qn > 0) snprintf(qtag, sizeof qtag, " · ⎿%d queued", qn);
 
-    printf("\033[%d;1H" CLR_LINE, rows);
+    /* no autowrap: an overlong bar on the last row would scroll the screen */
+    printf("\033[%d;1H" CLR_LINE "\033[?7l", rows);
+    int used = draw_sandbox_badge();
+    int room = cols - used;       /* columns left for the bar */
     if (notice[0]) {
-        printf(YELLOW "%.*s" RESET, fit_bytes(notice, cols - 1), notice);
+        printf(YELLOW "%.*s" RESET "\033[?7h", fit_bytes(notice, room - 1), notice);
         return;
     }
     if (working) {
@@ -1293,6 +1309,7 @@ static void draw_status_bar(void) {
         if (tps >= 1.0) snprintf(tps_str, sizeof tps_str, " · " YELLOW "⚡ %.0f tok/s" RESET, tps);
         printf(CYAN BOLD "%s" RESET " %s " CYAN "%s" RESET DIM " · %.1fs · %s tok" RESET "%s" DIM "%s%s · esc interrupts" RESET,
                sp, ico, g_stat.phase, dt, tbuf, tps_str, scroll_tag, qtag);
+        fputs("\033[?7h", stdout);
         return;
     }
 
@@ -1305,7 +1322,7 @@ static void draw_status_bar(void) {
     const char *bar_col = pct >= 85 ? RED : (pct >= 60 ? YELLOW : GREEN);
 
     char bar[128] = "";
-    if (cols >= 64 && g_stat.last_ptoks > 0) {
+    if (room >= 64 && g_stat.last_ptoks > 0) {
         char pb[10];
         if (pct == 0) snprintf(pb, sizeof pb, "<1%%");
         else snprintf(pb, sizeof pb, "%d%%", pct);
@@ -1317,7 +1334,7 @@ static void draw_status_bar(void) {
     }
 
     char stats[160] = "";
-    if (g_stat.sess_turns > 0 && cols >= 72) {
+    if (g_stat.sess_turns > 0 && room >= 72) {
         char tb[24];
         fmt_toks(g_stat.sess_toks, tb, sizeof tb);
         if (g_stat.last_tps >= 1.0)
@@ -1327,8 +1344,8 @@ static void draw_status_bar(void) {
             snprintf(stats, sizeof stats, DIM " · %dt · %s tok" RESET, g_stat.sess_turns, tb);
     }
 
-    const char *hint = (cols >= 92 && !scroll_tag[0]) ? (DIM " · ^O cmds · /help" RESET) : "";
-    printf(GREEN "●" RESET " " DIM "%s" RESET "%s%s" DIM "%s%s" RESET "%s",
+    const char *hint = (room >= 92 && !scroll_tag[0]) ? (DIM " · ^O cmds · /help" RESET) : "";
+    printf(GREEN "●" RESET " " DIM "%s" RESET "%s%s" DIM "%s%s" RESET "%s\033[?7h",
            status, bar, stats, scroll_tag, qtag, hint);
 }
 static void draw_titled_top(const char *title, int box_w) {
@@ -1497,7 +1514,9 @@ static void render_screen(void) {
         }
         if (m->approval && paste_suspect)
             snprintf(line, sizeof line, " paste interrupted: Esc to deny");
-        printf("\033[%d;1H" CLR_LINE DIM "%.*s" RESET, rows, fit_bytes(line, cols - 1), line);
+        printf("\033[%d;1H" CLR_LINE, rows);
+        int used = draw_sandbox_badge();
+        printf(DIM "%.*s" RESET, fit_bytes(line, cols - 1 - used), line);
         /* Hide cursor on modal menu (or park at selected row) */
         printf("\033[%d;3H", m->opt_row_start + m->sel + 1);
     } else {
@@ -2120,11 +2139,16 @@ static bool can_remember(const char *cmd, const char *rule, bool gate) {
     return ok;
 }
 
+/* agent.c puts this line ahead of a command that asks for the network. A
+   command that merely starts with it gets the same, more cautious, prompt. */
+#define NET_ASK_HEAD "# allow NETWORK access for this one command\n"
+
 /* Claude-Code-style approval modal menu. */
 static bool ui_approve(const char *cmd, bool gate, void *ud) {
     (void)ud;
+    bool net = !gate && !strncmp(cmd, NET_ASK_HEAD, sizeof NET_ASK_HEAD - 1);
     /* OSC 9 notification for Mica attention indicator */
-    fputs("\033]9;flywheel: command approval needed\007", stdout);
+    printf("\033]9;flywheel: %s approval needed\007", net ? "network access" : "command");
     fflush(stdout);
 
     char *rule;
@@ -2142,8 +2166,11 @@ static bool ui_approve(const char *cmd, bool gate, void *ud) {
     opts[n++] = "Yes";
     if (remember) opts[n++] = opt2;
     opts[n++] = "No";
-    int pick = tui_choose_menu(gate ? "⚠ Project check (runs project code)" : "⚠ Bash command",
-                               cmd, "Do you want to proceed?", opts, n,
+    const char *title = gate ? "⚠ Project check (runs project code)"
+                      : net ? "⚠ Network access request" : "⚠ Bash command";
+    int pick = tui_choose_menu(title, net ? cmd + sizeof NET_ASK_HEAD - 1 : cmd,
+                               net ? "Allow external network access for this command?"
+                                   : "Do you want to proceed?", opts, n,
                                remember ? "yan" : "yn", true);
     if (pick == 0) {
         set_status("approved once");
@@ -3226,8 +3253,11 @@ static void tui_pump(void) {
     if (now - lastr >= 0.08) { lastr = now; if (working) render_screen(); }
 }
 
+extern bool http_offer_network;   /* http.c */
+
 void tui_repl(void) {
     if (!in_reserve(0)) return;
+    http_offer_network = true;
     signal(SIGWINCH, on_winch);
     catch_fatal();
     detect_project_meta();

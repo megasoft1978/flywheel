@@ -272,6 +272,8 @@ static bool handle_images(int cfd, const char *body, const char *last_msg) {
 
 static volatile int g_models_delay_ms;      /* hold /models, to press keys during it */
 
+static volatile int g_net_schema = -1;     /* last chat request offered "network" */
+
 static void handle_client(int cfd) {
     static char req[2 << 20];
     size_t got = 0;
@@ -311,6 +313,8 @@ static void handle_client(int cfd) {
     const char *body = hdr_end ? hdr_end + 4 : req;
     const char *sse_hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
     send_all(cfd, sse_hdr, strlen(sse_hdr));
+
+    g_net_schema = strstr(body, "\"network\":{\"type\":\"boolean\"") != NULL;
 
     /* Inspect only the LAST message in the conversation array */
     const char *last_msg = body;
@@ -383,6 +387,13 @@ static void handle_client(int cfd) {
         }
         /* Emit a tool call needing approval that produces 6 lines of output (collapsed by default) */
         send_sse_chunk(cfd, "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"seq 1 6 | sed 's/^/out-line-/'\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":15}}");
+        send_all(cfd, "data: [DONE]\n\n", 14);
+        close(cfd);
+        return;
+    }
+
+    if (strstr(last_msg, "WANTNET")) {
+        send_sse_chunk(cfd, "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_n\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"touch net-file\\\",\\\"network\\\":true}\"}}]},\"finish_reason\":\"tool_calls\"}]}");
         send_all(cfd, "data: [DONE]\n\n", 14);
         close(cfd);
         return;
@@ -1708,7 +1719,21 @@ static void once_case(const char *dir, int sig, const char *signame) {
     int st = raw_wait(&r, true);
     raw_check(died_by(st, sig), signame, "really died of the signal");
     raw_check(raw_count(&r, RESTORE_START) == 1, signame, "restore sequence written exactly once");
+    /* the signal may land inside a status bar draw, which has autowrap off */
+    const char *at = strstr(r.out, RESTORE_START);
+    raw_check(at && strstr(at, "\033[?7h"), signame, "restore turns autowrap back on");
     raw_end(&r, st);
+}
+
+/* The status bar is drawn with autowrap off, and on again after it. */
+static void wrap_case(const char *dir) {
+    static RawTty r;
+    raw_check(raw_start(&r, dir), "status bar", "ready");
+    const char *off = strstr(r.out, "\033[?7l"), *on = off ? strstr(off, "\033[?7h") : NULL;
+    raw_check(off != NULL, "status bar", "drawn with autowrap off");
+    raw_check(on != NULL, "status bar", "autowrap back on after the draw");
+    kill(r.fw, SIGTERM);
+    raw_end(&r, raw_wait(&r, true));
 }
 
 /* Nobody reads the pty and its queue is full: one SIGTERM must still end it. */
@@ -1788,9 +1813,122 @@ static void signal_tests(const char *dir, const char *cmd) {
     once_case(dir, SIG(SIGABRT));
     once_case(dir, SIG(SIGFPE));
     once_case(dir, SIG(SIGILL));
+    wrap_case(dir);
     stuck_case(dir);
     background_case(dir);
 #undef SIG
+}
+
+/* ---------- network approval, sandbox badge ---------- */
+
+static bool bottom_has(MicaSession *s, const char *needle) {
+    char line[1024];
+    get_row_text(s, mica_session_rows(s) - 1, line, sizeof line);
+    return strstr(line, needle) != NULL;
+}
+
+static void sandbox_tests(const char *dir, const char *cmd) {
+    char full[2100];
+    MicaSession *s;
+    if (system("/usr/bin/sandbox-exec -p '(version 1)(allow default)' /usr/bin/true >/dev/null 2>&1")) {
+        printf("SKIP sandboxed TUI checks: no working sandbox here\n");
+    } else {
+        s = mica_session_create(dir, cmd, 24, 80);
+        assert(s != NULL);
+        CHECK(s, "boxed: ready", wait_for_text(s, "ready", 3000));
+        pump(s, 150);
+        CHECK(s, "boxed: no sandbox badge", find_row(s, "NOT SANDBOXED") < 0);
+        free(mica_session_take_notification(s));
+        submit(s, "WANTNET");
+        CHECK(s, "net: modal", wait_for_text(s, "Network access request", 4000));
+        pump(s, 150);
+        CHECK(s, "net: schema offers network", g_net_schema == 1);
+        CHECK(s, "net: own title", find_row(s, "Network access request") >= 0 && find_row(s, "Bash command") < 0);
+        CHECK(s, "net: shows the command", find_row(s, "touch net-file") >= 0);
+        CHECK(s, "net: asks for external network", find_row(s, "external network access") >= 0);
+        CHECK(s, "net: no internal header line", find_row(s, "# allow NETWORK") < 0);
+        CHECK(s, "net: yes or no only, No selected",
+              find_row(s, "\xe2\x96\xb8 2. No") >= 0 && find_row(s, "ask again") < 0);
+        char *notif = mica_session_take_notification(s);
+        CHECK(s, "net: notification names the network", notif && strstr(notif, "network") && strstr(notif, "approval"));
+        free(notif);
+        CHECK(s, "boxed: no badge in a modal", find_row(s, "NOT SANDBOXED") < 0);
+        mica_session_key(s, VTERM_KEY_ESCAPE, VTERM_MOD_NONE);
+        CHECK(s, "net: Esc denies", wait_for_text(s, "\xe2\x9c\x93 done", 4000));
+        pump(s, 300);
+        CHECK(s, "net: denied, not run", !made(dir, "net-file"));
+        mica_session_destroy(s);
+
+        /* a one-shot run has nobody to ask, so it is not offered either */
+        snprintf(full, sizeof full, "cd '%s' && %s hello </dev/null >/dev/null 2>&1", dir, cmd);
+        g_net_schema = -1;
+        int rc = system(full);
+        CHECK((MicaSession *)NULL, "one-shot: request reached the server", rc != -1 && g_net_schema >= 0);
+        CHECK((MicaSession *)NULL, "one-shot: network not offered", g_net_schema == 0);
+    }
+
+    snprintf(full, sizeof full, "%s --unsafe", cmd);
+    s = mica_session_create(dir, full, 24, 80);
+    assert(s != NULL);
+    CHECK(s, "unsafe: ready", wait_for_text(s, "ready", 3000));
+    pump(s, 150);
+    CHECK(s, "unsafe: badge on the idle bar", bottom_has(s, "NOT SANDBOXED") && bottom_has(s, "ready"));
+    assert_box_borders(s, "unsafe: borders with badge");
+    CHECK(s, "unsafe: modal", open_modal(s, "WANTNET"));
+    pump(s, 150);
+    CHECK(s, "unsafe: network not offered", g_net_schema == 0);
+    CHECK(s, "unsafe: ordinary command prompt",
+          find_row(s, "Bash command") >= 0 && find_row(s, "Network access request") < 0);
+    CHECK(s, "unsafe: badge under a modal", bottom_has(s, "NOT SANDBOXED"));
+    close_modal(s);
+    pump(s, 300);
+    CHECK(s, "unsafe: badge after the modal", bottom_has(s, "NOT SANDBOXED"));
+    submit(s, "SLOW_TEST");
+    CHECK(s, "unsafe: working", wait_for_text(s, "tick-3", 4000));
+    CHECK(s, "unsafe: badge while working", bottom_has(s, "NOT SANDBOXED"));
+    mica_session_key(s, VTERM_KEY_ESCAPE, VTERM_MOD_NONE);
+    pump(s, 600);
+    mica_session_destroy(s);
+
+    /* narrow: the badge stays, the bar is clipped and never scrolls the screen */
+    s = mica_session_create(dir, full, 24, 40);
+    assert(s != NULL);
+    CHECK(s, "narrow: ready", wait_for_text(s, "ready", 3000));
+    pump(s, 150);
+    CHECK(s, "narrow: badge", bottom_has(s, "NOT SANDBOXED"));
+    assert_box_borders(s, "narrow: borders with badge");
+    mica_session_destroy(s);
+}
+
+/* ---------- branch name in the input box ---------- */
+
+/* A git of our own, first on PATH; --unsafe keeps PATH as it is. */
+static void branch_case(const char *dir, const char *cmd, const char *name, const char *script,
+                        const char *want) {
+    char path[1300], full[3600], label[128];
+    snprintf(path, sizeof path, "%s/fakebin", dir);
+    mkdir(path, 0755);
+    snprintf(path, sizeof path, "%s/fakebin/git", dir);
+    FILE *f = fopen(path, "w");
+    assert(f != NULL);
+    fprintf(f, "#!/bin/sh\n%s\n", script);
+    fclose(f);
+    chmod(path, 0755);
+    snprintf(full, sizeof full, "PATH='%s/fakebin':\"$PATH\"; export PATH; %s --unsafe", dir, cmd);
+    MicaSession *s = mica_session_create(dir, full, 24, 80);
+    assert(s != NULL);
+    bool ready = wait_for_text(s, "ready", 6000);
+    pump(s, 150);
+    snprintf(label, sizeof label, "branch: %s", name);
+    CHECK(s, label, ready && (want ? find_row(s, want) >= 0 : find_row(s, "\xe2\x8e\x87") < 0));
+    mica_session_destroy(s);
+    unlink(path);
+}
+
+static void branch_tests(const char *dir, const char *cmd) {
+    branch_case(dir, cmd, "shown when git succeeds", "echo good-branch", "\xe2\x8e\x87 good-branch)");
+    branch_case(dir, cmd, "none when git fails", "echo bogus; exit 1", NULL);
+    branch_case(dir, cmd, "none when git hangs", "exec sleep 10", NULL);
 }
 
 int main(int argc, char **argv) {
@@ -2172,6 +2310,8 @@ int main(int argc, char **argv) {
     copy_tests(testdir, cmd);
     image_tests(cmd);
     signal_tests(testdir, cmd);
+    sandbox_tests(testdir, cmd);
+    branch_tests(testdir, cmd);
     stop_mock_server(srv_th);
 
     char rm[1200];
