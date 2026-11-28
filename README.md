@@ -126,7 +126,9 @@ Project instructions come from the first of `.flywheel.md`, `AGENTS.md` or `CLAU
 
 ## Images
 
-In the interactive UI only (one-shot mode sends text only):
+In the interactive UI and in one-shot mode (`flywheel "describe ./shot.png"`), with the same rules.
+One-shot prints `✓ N image(s) attached` on stderr, or `flywheel: not sent: ...` and exits 2 when an image
+cannot be loaded:
 
 - Drag an image file onto the terminal, or type its path: absolute, `~/`, `./`, `../` or `file://`,
   ending in `.png`, `.jpg`, `.jpeg`, `.gif` or `.webp`. Shell escapes and quotes are understood.
@@ -143,8 +145,9 @@ searched, and nothing in a backtick code span or fence (also one left unclosed) 
 fetched. Naming an image file attaches it, even outside the project.
 
 Limits: 10 MB per file, and 64 images or 32 MB (encoded) per conversation. On macOS, images over
-1568 px on a side are downscaled. Images stay in the conversation until `/clear`, also one the server
-rejected, and while they do, a model without vision gets nothing.
+1568 px on a side are downscaled. Images stay in the conversation until `/clear`, and while they do, a
+model without vision gets nothing. If the server refuses a request with images (HTTP 400, 413, 415 or
+422), the images of that message are dropped, your text is kept, and the run says so; nothing is retried.
 
 The engine must serve the model with vision. `flywheel setup` starts it that way. A server started
 with `--language-only` (as earlier versions did) has to be stopped and started again; flywheel refuses
@@ -381,7 +384,7 @@ applies unless `--unsafe` is also given.
 
 ## Limits
 
-- Images go only from the interactive UI ([Images](#images)); no audio or video.
+- Images go only from typed or pasted input in the interactive UI and one-shot mode ([Images](#images)); no audio or video.
 - No API key support. The Linux build has no HTTPS.
 - No context compaction.
 - No sandbox on Linux yet.

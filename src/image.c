@@ -677,3 +677,67 @@ bool image_from_url(const char *url, ImagePart *out, char *err, size_t errcap) {
     return ok;
 }
 #endif
+
+/* one terminal-safe line for a message about user input */
+static void one_line(char *dst, size_t cap, const char *s) {
+    char *c = clean_text(s, false, false);
+    for (char *p = c; *p; p++) if (*p == '\n' || *p == '\t') *p = ' ';
+    snprintf(dst, cap, "%s", c);
+    free(c);
+}
+
+/* Load every reference into set, all or none: on failure set is unchanged and
+   why says which reference and what was wrong. conv (may be NULL) is the
+   conversation the limits count against. Shared by the TUI and one-shot mode. */
+bool image_attach_refs(const char *cwd, char **refs, int n, Images *set, const Msgs *conv,
+                       char *why, size_t cap) {
+    Images got = images_copy(set);
+    bool ok = true;
+    for (int i = 0; ok && i < n; i++) {
+        ImagePart p = {0};
+        char err[256] = "";
+        bool url = !strncasecmp(refs[i], "http://", 7) || !strncasecmp(refs[i], "https://", 8);
+        ok = url ? image_from_url(refs[i], &p, err, sizeof err)
+                 : image_from_file(cwd, refs[i], &p, err, sizeof err);
+        if (fw_tick_hook) fw_tick_hook();       /* a quick load never ticked */
+        const char *no = ok && !g_abort ? images_add(&got, &p, conv) : NULL;
+        if (g_abort) snprintf(err, sizeof err, "cancelled");
+        else if (no) snprintf(err, sizeof err, "%s", no);
+        if (g_abort || no) {
+            if (ok) image_part_free(&p);
+            ok = false;
+        }
+        if (!ok) {
+            char name[300], e[256];
+            one_line(name, sizeof name, refs[i]);
+            one_line(e, sizeof e, err);
+            snprintf(why, cap, "%s: %s", name, e);
+        }
+    }
+    if (ok) {
+        images_free(set);
+        *set = got;
+    } else images_free(&got);
+    return ok;
+}
+
+/* The server refused a request that carried images (400, 413, 415, 422). The
+   newest message with images is the likeliest cause: its images go, its text
+   stays, so later requests stop failing. A refusal again drops the next one.
+   note gets what was dropped for the user. False if nothing was dropped. */
+bool image_drop_rejected(Msgs *msgs, const char *err, char *note, size_t cap) {
+    int code = 0;
+    if (!err || strncmp(err, "status ", 7) || sscanf(err + 7, "%d", &code) != 1) return false;
+    if (code != 400 && code != 413 && code != 415 && code != 422) return false;
+    for (int i = msgs->n - 1; i >= 0; i--) {
+        Images *imgs = &msgs->v[i].images;
+        if (!imgs->n) continue;
+        char src[200] = "";
+        snprintf(src, sizeof src, "%s", imgs->v[0].source ? imgs->v[0].source : "image");
+        snprintf(note, cap, "server refused the image %s (status %d): dropped %d from your message, "
+                 "your text is kept", src, code, imgs->n);
+        images_free(imgs);
+        return true;
+    }
+    return false;
+}

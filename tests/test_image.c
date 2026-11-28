@@ -6,8 +6,10 @@
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdint.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <unistd.h>
 
 Cfg g_cfg;
 volatile sig_atomic_t g_abort;
@@ -495,6 +497,86 @@ static void test_msgs_parts(void) {
     msgs_free(&m);
 }
 
+/* the all-or-none loader shared by the TUI and one-shot mode */
+static void test_attach(void) {
+    put("ok.png", TINY, sizeof TINY);
+    char good[600], gone[600];
+    snprintf(good, sizeof good, "%s/ok.png", dir);
+    snprintf(gone, sizeof gone, "%s/missing.png", dir);
+    Images set = {0};
+    char why[600] = "";
+    char *refs[2] = {str_dup(good), str_dup(gone)};
+    T("missing file refuses the lot", !image_attach_refs(dir, refs, 2, &set, NULL, why, sizeof why));
+    T("all-or-none: nothing kept", set.n == 0);
+    T("reason names the file", strstr(why, "missing.png") != NULL);
+    free(refs[0]); free(refs[1]);
+    refs[0] = str_dup(good); refs[1] = str_dup(good);
+    T("two good refs attach", image_attach_refs(dir, refs, 2, &set, NULL, why, sizeof why));
+    T("both kept, sources set", set.n == 2 && set.v[0].url && set.v[1].source
+                                && !strcmp(set.v[1].source, good));
+    free(refs[0]); free(refs[1]);
+    images_free(&set);
+    drop("ok.png");
+}
+
+/* a rejected request drops the newest image, keeps the text, says so */
+static void test_drop_rejected(void) {
+    Msgs m;
+    msgs_init(&m);
+    msgs_push(&m, "system", "sys");
+    msgs_push(&m, "user", "first");
+    msgs_push(&m, "user", "second");
+    msgs_push(&m, "user", "third");
+    ImagePart p = part(8), q = part(8);
+    T("image on first", !images_add(&m.v[1].images, &p, NULL));
+    T("image on third", !images_add(&m.v[3].images, &q, NULL));
+    char note[300] = "";
+    T("client status 500 is not an image refusal", !image_drop_rejected(&m, "status 500 boom", note, sizeof note));
+    T("transient http error is not one", !image_drop_rejected(&m, "http: status 503", note, sizeof note));
+    T("auth error is not one", !image_drop_rejected(&m, "status 401 no key", note, sizeof note));
+    T("aborted is not one", !image_drop_rejected(&m, "aborted", note, sizeof note));
+    T("nothing dropped by those", m.v[1].images.n == 1 && m.v[3].images.n == 1);
+    T("400 drops the newest image", image_drop_rejected(&m, "status 400 bad image", note, sizeof note));
+    T("newest image gone", m.v[3].images.n == 0);
+    T("older image kept", m.v[1].images.n == 1);
+    T("text kept", !strcmp(m.v[3].content, "third") && !strcmp(m.v[3].role, "user"));
+    T("note says what was dropped", strstr(note, "/x/y.png") && strstr(note, "text is kept"));
+    T("413 drops the next one", image_drop_rejected(&m, "status 413 too large", note, sizeof note));
+    T("oldest gone too", m.v[1].images.n == 0 && m.v[1].content && !strcmp(m.v[1].content, "first"));
+    T("no images left: nothing to drop", !image_drop_rejected(&m, "status 400 x", note, sizeof note));
+    msgs_free(&m);
+}
+
+/* one-shot mode attaches the image named in the prompt and says so on stderr.
+   -T 0 stops before any request, so no server is needed. Needs FW_BIN. */
+static void test_oneshot(void) {
+    const char *bin = getenv("FW_BIN");
+    if (!bin) { printf("SKIP one-shot image test: FW_BIN not set\n"); return; }
+    put("shot.png", TINY, sizeof TINY);
+    char errf[800], err[4096] = "";
+    snprintf(errf, sizeof errf, "%s/oneshot.err", dir);
+    pid_t pid = fork();
+    if (pid == 0) {
+        int fd = open(errf, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        int nul = open("/dev/null", O_RDWR);
+        if (fd < 0 || nul < 0) _exit(126);
+        dup2(fd, 2); dup2(nul, 0); dup2(nul, 1);
+        setenv("HOME", dir, 1);
+        execl(bin, bin, "--unsafe", "-q", "-T", "0", "-C", dir, "-e", "http://127.0.0.1:9/v1",
+              "describe ./shot.png", (char *)NULL);
+        _exit(127);
+    }
+    int st = 0;
+    waitpid(pid, &st, 0);
+    FILE *f = fopen(errf, "rb");
+    size_t n = f ? fread(err, 1, sizeof err - 1, f) : 0;
+    if (f) fclose(f);
+    err[n] = 0;
+    T("one-shot: image attached notice on stderr", strstr(err, "1 image attached") != NULL);
+    drop("shot.png");
+    drop("oneshot.err");
+}
+
 int main(void) {
     const char *tmp = getenv("TMPDIR");
     snprintf(dir, sizeof dir, "%s/fw-test-image-XXXXXX", tmp && *tmp ? tmp : "/tmp");
@@ -509,6 +591,9 @@ int main(void) {
     test_addresses();
     test_url();
     test_msgs_parts();
+    test_attach();
+    test_drop_rejected();
+    test_oneshot();
     rmdir(dir);
     printf("image: %d passed, %d failed\n", passed, failed);
     return failed ? 1 : 0;

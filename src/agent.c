@@ -1,4 +1,5 @@
 #include "flywheel.h"
+#include "image.h"
 #include <time.h>
 
 #define MAXPRUNES 8
@@ -175,6 +176,11 @@ const char *agent_run(Msgs *msgs, Ui *ui, char *sum, size_t sumcap) {
             static char ferr[224];
             snprintf(ferr, sizeof ferr, "error:%.200s", r && r->error ? r->error : "null");
             finish = !g_abort && wall_over(wall0) ? "wall" : ferr;
+            /* a refused request with images in it: drop the rejected one so the
+               next request does not fail the same way; the user is told */
+            char note[320];
+            if (r && r->error && !g_abort && image_drop_rejected(msgs, r->error, note, sizeof note))
+                event(ui, "image", note);
             if (r) chat_resp_free(r);
             break;
         }

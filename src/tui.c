@@ -2118,6 +2118,7 @@ static void ui_event(const char *kind, const char *detail, void *ud) {
     if (!strcmp(kind, "prune")) snprintf(b, sizeof b, YELLOW "  ✂ loop pruned (%s)" RESET, detail);
     else if (!strcmp(kind, "reset")) snprintf(b, sizeof b, YELLOW "  ↺ context reset (%s)" RESET, detail);
     else if (!strcmp(kind, "gate")) snprintf(b, sizeof b, BLUE "  ○ %s" RESET, detail);
+    else if (!strcmp(kind, "image")) snprintf(b, sizeof b, YELLOW "  ⚠ %s" RESET, detail);
     else snprintf(b, sizeof b, "  %s %s", kind, detail);
     TItem *r = item_new(T_RAW);
     item_append(r, b);
@@ -2595,7 +2596,7 @@ static void load_end(void) {
 }
 
 /* true only when /models says the current model cannot take images */
-static bool vision_off(void) {
+bool vision_off(void) {
     char *mj = http_get("/models");
     cJSON *root = mj ? cJSON_Parse(mj) : NULL;
     free(mj);
@@ -2616,7 +2617,7 @@ static bool vision_off(void) {
     return off;
 }
 
-static void no_vision(char *why, size_t cap) {
+void no_vision(char *why, size_t cap) {
     char m[200];
     snprintf(why, cap, "model %s is serving without vision.\n  Restart the engine without "
              "--language-only (stop it, then run flywheel setup)\n  or pick another with /model.",
@@ -2625,33 +2626,7 @@ static void no_vision(char *why, size_t cap) {
 
 /* Load every reference into pending, all or none; false with the reason. */
 static bool attach_refs(char **refs, int n, char *why, size_t cap) {
-    Images got = images_copy(&pending);
-    bool ok = true;
-    for (int i = 0; ok && i < n; i++) {
-        ImagePart p = {0};
-        char err[256] = "";
-        bool url = !strncasecmp(refs[i], "http://", 7) || !strncasecmp(refs[i], "https://", 8);
-        ok = url ? image_from_url(refs[i], &p, err, sizeof err)
-                 : image_from_file(g_cfg.cwd, refs[i], &p, err, sizeof err);
-        if (fw_tick_hook) fw_tick_hook();       /* a quick load never ticked */
-        const char *no = ok && !g_abort ? images_add(&got, &p, g_msgs) : NULL;
-        if (g_abort) snprintf(err, sizeof err, "cancelled");
-        else if (no) snprintf(err, sizeof err, "%s", no);
-        if (g_abort || no) {
-            if (ok) image_part_free(&p);
-            ok = false;
-        }
-        if (!ok) {
-            char name[300], e[256];
-            snprintf(why, cap, "%s: %s", clean_line(name, sizeof name, refs[i]),
-                     clean_line(e, sizeof e, err));
-        }
-    }
-    if (ok) {
-        images_free(&pending);
-        pending = got;
-    } else images_free(&got);
-    return ok;
+    return image_attach_refs(g_cfg.cwd, refs, n, &pending, g_msgs, why, cap);
 }
 
 /* osascript writes the clipboard picture to path; no shell */
