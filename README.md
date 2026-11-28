@@ -182,6 +182,11 @@ untrusted repository or task in a VM.
   second spellings the rules would miss) or `/dev` (other than `/dev/null`) is refused. If the rules cannot be built, a store is a link that cannot be followed (a loop), or a protected file or git
   directory cannot be followed or read (a loop, or no permission), the command is not run and the
   file tools do not write; the message names the path.
+- One `.git` is already there: uv opens `$TMPDIR/cache/uv/sdists-v9/.git` for writing and fails
+  when it cannot. It is made before any command runs, as a link to `/dev/null`, so what uv writes
+  is discarded and it never names a repository. No rule is opened for it: it cannot be written
+  as a file, removed, renamed or replaced, and neither can the directories above it up to
+  `$TMPDIR`.
 - What `core.hooksPath` names is closed like `.git/hooks`, also to the file tools and before it
   exists; for husky's `.husky/_`, all of `.husky`. Every value in the system, global, repository,
   worktree and submodule configs counts, also one that another overrides, and every `include` and
@@ -234,6 +239,8 @@ untrusted repository or task in a VM.
   `pipx_metadata.json` of pipx environments and `~/.cargo/registry/credentials*` (they can hold
   index or registry logins). `~/.cargo/git/db` **stays readable**, and a git dependency's URL there
   may carry a token.
+- Of `~/Library/Application Support/pipx` only the metadata of the folder itself can be looked up
+  (pipx refuses to start otherwise): it cannot be listed, and nothing in it read.
 - **Outside your home directory everything you can read stays readable**, and so does every file in
   the places above that is not on the store list (`.env` files in the project, tokens written into
   a git config or a dependency's clone URL). Its contents can reach the model.
@@ -246,7 +253,8 @@ untrusted repository or task in a VM.
   `GOCACHE` and `npm_config_cache` point into the private temporary directory. A `PATH` entry that
   passes through a link and is, or leads, under your home is passed on as where it leads; entries
   whose way touches a place commands may write (the project, `TMPDIR`, a linked worktree's
-  repository folders) are passed on unchanged.
+  repository folders) are passed on unchanged. When `~/Library/Application Support/pipx` exists,
+  `PIPX_HOME` and `PIPX_MAN_DIR` are set to directories in `$TMPDIR`.
 
 What stops working inside it:
 
@@ -260,7 +268,8 @@ What stops working inside it:
   checkout: its git directory is outside the project and unreadable (from a subdirectory git would
   also have to list the repository root). Start flywheel at the repository root. In a submodule
   `status` and `log` work. Hooks, `core.hooksPath` directories and object alternates under `$HOME`
-  outside the project cannot be read.
+  outside the project cannot be read. When git fails in a subdirectory of a repository, the tool
+  output says why.
 - `git init`, and anything that writes `.git/config` or hooks: `git config`, `git remote add`,
   `git push -u`, `git branch -u`, hook installers such as husky or `pre-commit install`.
   Neither can anything that changes a `core.hooksPath` directory, such as editing `.husky/` or a
@@ -280,8 +289,11 @@ What stops working inside it:
   `PATH` meets `EPERM`: a link under `$HOME` that could not be resolved, or a closed directory that
   holds the name looked up. Take that entry off `PATH` (or, for scripts, use
   `npm run --script-shell=/bin/bash`).
-- `pipx` fails when `~/Library/Application Support/pipx` exists: it checks that
-  folder and is refused.
+- `pipx` with `~/Library/Application Support/pipx` does not see what you installed there: it works
+  in an empty home in `$TMPDIR`. It also needs `~/.local/bin` to exist.
+- `uv cache clean` stops at the `.git` link in uv's cache and fails. The link is placed for the
+  cache layout `sdists-v9`; a uv with another one would fail as before. A grader or command that
+  sets its own `UV_CACHE_DIR` or `TMPDIR` has no link there.
 - Tools that need a denied file: private registry logins in `~/.npmrc`, `~/.m2/settings.xml`,
   `~/.gradle/gradle.properties` and the like.
 - `git fetch`/`push` (offline; over SSH it also fails with network approved, as keys and

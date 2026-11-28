@@ -4114,6 +4114,104 @@ static void test_fail_closed(void) {
     sandbox_disable_for_test(false);
 }
 
+/* the placeholder in uv's cache is still a link to /dev/null */
+static bool uv_mark(const char *tmp) {
+    char p[PATH_MAX + 64], to[64];
+    snprintf(p, sizeof p, "%s/cache/uv/sdists-v9/.git", tmp);
+    ssize_t n = readlink(p, to, sizeof to);
+    return n == 9 && !memcmp(to, "/dev/null", 9);
+}
+
+/* common tools inside the sandbox, and what had to be there for them */
+static void test_sandbox_tools(void) {
+    char base[PATH_MAX], home[PATH_MAX], proj[PATH_MAX], tmp[PATH_MAX], cmd[2000];
+    char *old = review_dirs(base, home, proj);
+    if (!old) { T("mkdtemp", false); return; }
+    in_dir(proj);
+
+    /* uv opens a .git in its cache for writing, which no command may create */
+    char *o = run_bash("printf %s \"$TMPDIR\"", proj, 10);
+    snprintf(tmp, sizeof tmp, "%s", o);
+    free(o);
+    works(": >> \"$TMPDIR/cache/uv/sdists-v9/.git\"");
+    T("uv placeholder there", uv_mark(tmp));
+    shown("git -C \"$TMPDIR/cache/uv/sdists-v9\" rev-parse --git-dir 2>&1", "not a git repository");
+
+    /* it cannot be filled, moved or replaced, nor can anything above it */
+    static const char *const attacks[] = {
+        "echo 'gitdir: /tmp/x' > \"$G\"", "rm -f \"$G\"; echo 'gitdir: x' > \"$G\"",
+        "ln -sfn x \"$G\"", "mv \"$G\" \"$G.old\"",
+        "echo 'gitdir: x' > \"$TMPDIR/f\"; mv -f \"$TMPDIR/f\" \"$G\"",
+        "mv \"$TMPDIR/cache/uv/sdists-v9\" \"$TMPDIR/s\"", "mv \"$TMPDIR/cache/uv\" \"$TMPDIR/u\"",
+        "mv \"$TMPDIR/cache\" \"$TMPDIR/c\"", "mv \"$TMPDIR/CACHE\" \"$TMPDIR/C2\"",
+        "mv \"$TMPDIR\" \"$TMPDIR.moved\"", "rm -rf \"$TMPDIR/cache\"", NULL};
+    for (int i = 0; attacks[i]; i++) {
+        snprintf(cmd, sizeof cmd, "G=\"$TMPDIR/cache/uv/sdists-v9/.git\"; %s", attacks[i]);
+        quiet(cmd);
+        T(attacks[i], uv_mark(tmp));
+    }
+    /* and it opens no way to a .git or .envrc anywhere */
+    quiet("G=\"$TMPDIR/cache/uv/sdists-v9/.git\"; mkdir \"$TMPDIR/n\"; mv \"$G\" \"$TMPDIR/n/.git\";"
+          " cp -R \"$TMPDIR/cache/uv/sdists-v9\" \"$TMPDIR/n/copy\"; cp -R \"$G\" ./.git;"
+          " mv \"$G\" ./.envrc; echo x > \"$TMPDIR/cache/uv/.git\";"
+          " echo x > \"$TMPDIR/cache/uv/sdists-v9/.envrc\";"
+          " git init -q \"$TMPDIR/cache/uv/sdists-v9/r\"");
+    T("no .git from the placeholder", gone(tmp, "n/.git") && gone(tmp, "n/copy/.git")
+      && gone(proj, ".git") && gone(proj, ".envrc"));
+    T("no .git or .envrc next to it", gone(tmp, "cache/uv/.git")
+      && gone(tmp, "cache/uv/sdists-v9/.envrc") && gone(tmp, "cache/uv/sdists-v9/r/.git"));
+    if (out_has("command -v uv >/dev/null && echo has-uv", "has-uv"))
+        works("uv venv --offline v && uv pip list --offline --python v");
+    else printf("unit: SKIP uv (not installed)\n");
+
+    /* a grader's TMPDIR is its own, and has it too */
+    char work[PATH_MAX + 16], script[PATH_MAX + 16], *out = NULL, *err = NULL;
+    snprintf(work, sizeof work, "%s/work", base);
+    mkdir(work, 0700);
+    snprintf(script, sizeof script, "%s/work/s.sh", base);
+    put(script, ": >> \"$TMPDIR/cache/uv/sdists-v9/.git\" && echo made-ok\n");
+    T("grader opens uv's placeholder", run_script(script, "a", "b", work, proj, 20, &out, &err)
+      && out && strstr(out, "made-ok"));
+    free(out);
+    free(err);
+
+    /* pipx asks whether its other home is there: looked up, never listed or read */
+    shown("echo \"[$PIPX_HOME]\"", "[]");
+    put(under(home, "Library/Application Support/pipx/venvs/x/pipx_metadata.json"), "TOPSECRET");
+    put(under(home, "Library/Application Support/other/f"), "TOPSECRET");
+    put(under(home, ".local/bin/f"), "x\n");          /* pipx has made it long since */
+    works("test -d \"$HOME/Library/Application Support/pipx\"");
+    works("test \"$PIPX_HOME\" = \"$TMPDIR/pipx\"");
+    hidden("cd \"$HOME/Library/Application Support\"; cat pipx/venvs/x/pipx_metadata.json other/f");
+    shown("ls \"$HOME/Library/Application Support/pipx\" 2>&1", "Operation not permitted");
+    shown("ls \"$HOME/Library/Application Support\" 2>&1", "Operation not permitted");
+    shown("stat \"$HOME/Library/Application Support/pipx/venvs\" 2>&1", "Operation not permitted");
+    shown("stat \"$HOME/Library/Application Support/other\" 2>&1", "Operation not permitted");
+    quiet("cd \"$HOME/Library/Application Support\"; echo x > pipx/planted; mv pipx \"$TMPDIR/p\"");
+    T("pipx folder not written or moved", gone(home, "Library/Application Support/pipx/planted")
+      && !gone(home, "Library/Application Support/pipx/venvs"));
+    if (out_has("command -v pipx >/dev/null && echo has-pipx", "has-pipx"))
+        works("pipx --version && pipx list");
+    else printf("unit: SKIP pipx (not installed)\n");
+
+    /* git below a repository's root stays shut out, and says why */
+    char repo[PATH_MAX + 16], sub[PATH_MAX + 32];
+    snprintf(repo, sizeof repo, "%s/work/repo", home);
+    snprintf(sub, sizeof sub, "%s/sub", repo);
+    put(under(home, "work/repo/sub/f"), "x\n");
+    host(repo, "git init -q .");
+    in_dir(sub);
+    shown("git status", "[sandbox: the project is inside a git repository");
+    shown("git diff", "[sandbox: the project is inside a git repository");
+    shown("ls .. 2>&1", "Operation not permitted");
+    T("no hint without the error", !out_has("true", "[sandbox:"));
+    in_dir(proj);
+    T("no hint outside a repository", !out_has("git status", "[sandbox:"));
+
+    setenv("HOME", old, 1);
+    free(old);
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     memset(&g_cfg, 0, sizeof g_cfg);
@@ -4200,6 +4298,7 @@ int main(void) {
         test_home_links();
         test_home_path();
         test_repo_above();
+        test_sandbox_tools();
     }
     else printf("unit: SKIP sandbox tests (no sandbox here)\n");
     test_fail_closed();
