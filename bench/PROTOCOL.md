@@ -103,7 +103,7 @@ Cannot match, and to be disclosed with the results:
     number is not neutral between harnesses; that note is printed under the tables and on the
     charts
   - dev-10, shown only as development tasks, never as the held-out score
-- Development set: the 10 tasks in the README pilot table, in `bench-tb/tb21-dev-tasks.txt`.
+- Development set: the 10 tasks in the pilot table of `docs/benchmarks.md`, in `bench-tb/tb21-dev-tasks.txt`.
   All 10 names are in the 2.1 list; 26 tasks changed from 2.0. The harvester requires that
   committed list (except with `--synthetic`), checks 89/10/79 and marks dev rows in the grid.
 - Classification, in this order:

@@ -52,7 +52,7 @@ approves commands automatically, as does `bench`; network access is excepted and
 | flag | meaning | default |
 |---|---|---|
 | `-C DIR` | working directory | current |
-| `-m MODEL` | model name | `local/qwen-pi4` |
+| `-m MODEL` | model name | the server's only model, else `local/qwen-pi4` |
 | `-e URL` | endpoint | `http://127.0.0.1:8312/v1` |
 | `-f FILE` | task from a file | |
 | `--unsafe` | no sandbox, full environment; see [Safety](safety.md). Goes before `bench` | off |
@@ -67,6 +67,7 @@ approves commands automatically, as does `bench`; network access is excepted and
 | `-W SEC` | wall clock for the task: cuts model requests, commands and checks; ends as `wall` | off |
 | `--transcript FILE` | JSONL log of the run | off |
 | `-q` | quiet, for non-interactive runs | off |
+| `-y`, `--yes` | `setup`: answer yes to every question | off |
 | `--allow-outside-writes` | throwaway containers only, see [Safety](safety.md) | off |
 | `init` | writes `.flywheel.md` for the current project | |
 | `bench <suite-dir> <tag>` | run a benchmark suite | |
