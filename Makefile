@@ -55,7 +55,7 @@ test: $(BIN) test-unit test-mica test-http
 
 # built twice: libcurl transport and the FW_MINI_HTTP one
 UNIT_SRC = tests/test_unit.c src/tools.c src/args.c src/sim.c src/util.c src/msgs.c \
-           src/agent.c src/http.c src/profile.c src/bench.c third_party/cjson/cJSON.c
+           src/agent.c src/http.c src/profile.c src/bench.c src/image.c third_party/cjson/cJSON.c
 
 $(TESTDIR)/test_unit: $(UNIT_SRC)
 	$(CC) $(CFLAGS) -Isrc -Ithird_party/cjson -o $@ $^ -lcurl
@@ -82,8 +82,8 @@ $(TESTDIR)/test_image_mini: $(IMAGE_SRC) src/image.h src/flywheel.h
 	$(CC) $(CFLAGS) -D_DARWIN_C_SOURCE -DFW_IMAGE_TEST -DFW_MINI_HTTP -Isrc -Ithird_party/cjson -o $@ $(IMAGE_SRC)
 
 .PHONY: test-image
-test-image: $(TESTDIR)/test_image $(TESTDIR)/test_image_mini
-	./$(TESTDIR)/test_image
+test-image: $(BIN) $(TESTDIR)/test_image $(TESTDIR)/test_image_mini
+	FW_BIN=./$(BIN) ./$(TESTDIR)/test_image
 	./$(TESTDIR)/test_image_mini
 
 test: test-image

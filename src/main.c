@@ -1,5 +1,6 @@
 #define _DARWIN_C_SOURCE 1   /* O_NOFOLLOW */
 #include "flywheel.h"
+#include "image.h"
 #ifndef FW_MINI_HTTP
 #include <curl/curl.h>
 #endif
@@ -170,6 +171,7 @@ static void p_status(const char *s, void *ud) { (void)s; (void)ud; }
 static void p_event(const char *k, const char *d, void *ud) { (void)ud;
     if (!strcmp(k, "prune")) printf(YELLOW "  ⚡ loop pruned (%s)" RESET "\n", d);
     else if (!strcmp(k, "reset")) printf(YELLOW "  ⚡ context reset (%s)" RESET "\n", d);
+    else if (!strcmp(k, "image")) printf(YELLOW "  ⚠ %s" RESET "\n", d);
     fflush(stdout);
 }
 
@@ -400,6 +402,23 @@ int fw_do_init(void) {
     return 0;
 }
 
+/* images named in a typed one-shot prompt attach as in the TUI: same finder, loader,
+   limits and vision check. Refusal goes to stderr; the notice is the TUI's. */
+static bool oneshot_images(const char *prompt, Images *out) {
+    char *refs[IMG_MAX_COUNT + 1];
+    bool only = false;
+    int n = image_find_refs(g_cfg.cwd, prompt, refs, IMG_MAX_COUNT + 1, &only);
+    if (!n) return true;
+    char why[600] = "";
+    bool ok = !vision_off();
+    if (!ok) no_vision(why, sizeof why);
+    else ok = image_attach_refs(g_cfg.cwd, refs, n, out, NULL, why, sizeof why);
+    for (int i = 0; i < n; i++) free(refs[i]);
+    if (!ok) fprintf(stderr, "flywheel: not sent: %s\n", why);
+    else fprintf(stderr, "\xe2\x9c\x93 %d image%s attached\n", out->n, out->n == 1 ? "" : "s");
+    return ok;
+}
+
 int main(int argc, char **argv) {
     signal(SIGPIPE, on_sigpipe);
     setlocale(LC_CTYPE, "");
@@ -522,9 +541,15 @@ int main(int argc, char **argv) {
             free(sysp);
             sysp = s;
         }
+        Images imgs = {0};
+        /* only what the user typed: not a task file or stdin, and (as in the
+           TUI) not a block of several lines */
+        bool typed = !g_cfg.prompt_file && g_cfg.once && !strchr(prompt, '\n');
+        if (typed && !oneshot_images(prompt, &imgs)) { free(sysp); return 2; }
         Msgs msgs; msgs_init(&msgs);
         msgs_push(&msgs, "system", sysp);
         msgs_push(&msgs, "user", prompt);
+        msgs.v[msgs.n - 1].images = imgs;
         Ui ui = {.emit_text = p_text, .emit_think = p_think, .emit_tool = p_tool,
                  .emit_out = p_out, .emit_status = p_status, .emit_event = p_event,
                  .interactive = false, .deliverable = g_cfg.prompt_file != NULL};

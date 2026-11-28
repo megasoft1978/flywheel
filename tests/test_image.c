@@ -6,8 +6,10 @@
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdint.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <unistd.h>
 
 Cfg g_cfg;
 volatile sig_atomic_t g_abort;
@@ -495,6 +497,275 @@ static void test_msgs_parts(void) {
     msgs_free(&m);
 }
 
+/* the all-or-none loader shared by the TUI and one-shot mode */
+static void test_attach(void) {
+    put("ok.png", TINY, sizeof TINY);
+    char good[600], gone[600];
+    snprintf(good, sizeof good, "%s/ok.png", dir);
+    snprintf(gone, sizeof gone, "%s/missing.png", dir);
+    Images set = {0};
+    char why[600] = "";
+    char *refs[2] = {str_dup(good), str_dup(gone)};
+    T("missing file refuses the lot", !image_attach_refs(dir, refs, 2, &set, NULL, why, sizeof why));
+    T("all-or-none: nothing kept", set.n == 0);
+    T("reason names the file", strstr(why, "missing.png") != NULL);
+    free(refs[0]); free(refs[1]);
+    refs[0] = str_dup(good); refs[1] = str_dup(good);
+    T("two good refs attach", image_attach_refs(dir, refs, 2, &set, NULL, why, sizeof why));
+    T("both kept, sources set", set.n == 2 && set.v[0].url && set.v[1].source
+                                && !strcmp(set.v[1].source, good));
+    free(refs[0]); free(refs[1]);
+    images_free(&set);
+    drop("ok.png");
+}
+
+/* a rejected request drops the newest image, keeps the text, says so */
+static void test_drop_rejected(void) {
+    Msgs m;
+    msgs_init(&m);
+    msgs_push(&m, "system", "sys");
+    msgs_push(&m, "user", "first");
+    msgs_push(&m, "user", "second");
+    msgs_push(&m, "user", "third");
+    ImagePart p = part(8), q = part(8);
+    T("image on first", !images_add(&m.v[1].images, &p, NULL));
+    T("image on third", !images_add(&m.v[3].images, &q, NULL));
+    char note[300] = "";
+    T("client status 500 is not an image refusal", !image_drop_rejected(&m, "status 500 boom", note, sizeof note));
+    T("transient http error is not one", !image_drop_rejected(&m, "http: status 503", note, sizeof note));
+    T("auth error is not one", !image_drop_rejected(&m, "status 401 no key", note, sizeof note));
+    T("aborted is not one", !image_drop_rejected(&m, "aborted", note, sizeof note));
+    T("nothing dropped by those", m.v[1].images.n == 1 && m.v[3].images.n == 1);
+    T("400 drops the newest image", image_drop_rejected(&m, "status 400 bad image", note, sizeof note));
+    T("newest image gone", m.v[3].images.n == 0);
+    T("older image kept", m.v[1].images.n == 1);
+    T("text kept", !strcmp(m.v[3].content, "third") && !strcmp(m.v[3].role, "user"));
+    T("note says what was dropped", strstr(note, "image y.png ") && !strstr(note, "/x/")
+                                    && strstr(note, "the text stays"));
+    T("413 drops the next one", image_drop_rejected(&m, "status 413 too large", note, sizeof note));
+    T("oldest gone too", m.v[1].images.n == 0 && m.v[1].content && !strcmp(m.v[1].content, "first"));
+    T("no images left: nothing to drop", !image_drop_rejected(&m, "status 400 x", note, sizeof note));
+    msgs_free(&m);
+}
+
+/* push one user message holding one image named source (may be NULL) */
+static void with_image(Msgs *m, const char *source) {
+    msgs_push(m, "user", "text");
+    ImagePart p = part(8);
+    free(p.source);
+    p.source = source ? str_dup(source) : NULL;
+    T("image added", !images_add(&m->v[m->n - 1].images, &p, NULL));
+}
+
+static void test_drop_kept(void) {
+    Msgs m;
+    msgs_init(&m);
+    char note[300] = "";
+    with_image(&m, "/x/old.png");
+    T("new message not seen", !m.v[0].images_seen);
+    m.v[0].images_seen = true;
+    T("accepted image then 400 is kept",
+      !image_drop_rejected(&m, "status 400 bad", note, sizeof note) && m.v[0].images.n == 1);
+    with_image(&m, "/x/new.png");
+    const char *full[] = {
+        "status 400 {\"error\":\"request exceeds the available context size\"}",
+        "status 400 This model's Maximum Context Length is 8192 tokens",
+        "status 413 {\"type\":\"exceed_context_size_error\"}"};
+    for (int i = 0; i < 3; i++)
+        T(full[i], !image_drop_rejected(&m, full[i], note, sizeof note) && m.v[1].images.n == 1);
+    T("unaccepted one still dropped",
+      image_drop_rejected(&m, "status 400 bad", note, sizeof note) && !m.v[1].images.n
+      && m.v[0].images.n == 1);
+    msgs_insert(&m, 1, "user", "inserted");
+    T("inserted message not seen", !m.v[1].images_seen);
+
+    with_image(&m, "/d/a\x1b[31m\nb.png");
+    T("hostile file name", image_drop_rejected(&m, "status 400 x", note, sizeof note)
+                           && !strchr(note, '\x1b') && !strchr(note, '\n') && !strstr(note, "/d/"));
+    with_image(&m, "https://example.invalid/p/\x1b]0;t\n.png");
+    T("hostile url", image_drop_rejected(&m, "status 400 x", note, sizeof note)
+                     && !strchr(note, '\x1b') && !strchr(note, '\n')
+                     && strstr(note, "https://example.invalid/p/"));
+    with_image(&m, NULL);
+    T("no source", image_drop_rejected(&m, "status 400 x", note, sizeof note)
+                   && strstr(note, "the image image "));
+    msgs_free(&m);
+}
+
+/* a stub endpoint for runs of the real binary: every POST body is appended to
+   a log, and the mode decides the answers */
+enum { STUB_OK, STUB_BLIND, STUB_REFUSE, STUB_THEN_REFUSE, STUB_RESET_THEN_REFUSE };
+
+#define REQ_MARK "\n==REQ==\n"
+#define SSE_HEAD "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n"
+#define SSE_DONE SSE_HEAD "data: {\"choices\":[{\"delta\":{\"content\":\"DONE\"}," \
+                 "\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+#define SSE_TOOL SSE_HEAD "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c\"," \
+                 "\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"echo hi\\\"}\"}}]}," \
+                 "\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n"
+#define REFUSAL "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n{\"error\":\"bad image\"}"
+
+static void stub(int ls, int mode, const char *logf) {
+    static char req[1 << 20];
+    int posts = 0;
+    for (;;) {
+        int c = accept(ls, NULL, NULL);
+        if (c < 0) _exit(0);
+        size_t n = 0, want = 0;
+        char *body = NULL;
+        while (n < sizeof req - 1) {
+            ssize_t k = read(c, req + n, sizeof req - 1 - n);
+            if (k <= 0) break;
+            req[n += (size_t)k] = 0;
+            if (!body && (body = strstr(req, "\r\n\r\n"))) {
+                body += 4;
+                const char *cl = strstr(req, "Content-Length:");
+                want = cl && cl < body ? strtoul(cl + 15, NULL, 10) : 0;
+                if (strstr(req, "Expect: 100-continue") &&
+                    write(c, "HTTP/1.1 100 Continue\r\n\r\n", 25) < 0) break;
+            }
+            if (body && n >= (size_t)(body - req) + want) break;
+        }
+        const char *r = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        if (n && body && !strncmp(req, "POST ", 5)) {
+            FILE *f = fopen(logf, "a");
+            if (f) { fprintf(f, REQ_MARK "%s", body); fclose(f); }
+            posts++;
+            bool refuse = mode == STUB_REFUSE || (mode == STUB_THEN_REFUSE && posts > 1)
+                          || (mode == STUB_RESET_THEN_REFUSE && strstr(body, "Context reset after"));
+            bool tool = mode == STUB_THEN_REFUSE || mode == STUB_RESET_THEN_REFUSE;
+            r = refuse ? REFUSAL : tool ? SSE_TOOL : SSE_DONE;
+        } else if (n && mode == STUB_BLIND && !strncmp(req, "GET ", 4))
+            r = SSE_HEAD "{\"data\":[{\"id\":\"m\",\"vision\":false}]}";
+        if (write(c, r, strlen(r)) < 0) _exit(1);
+        close(c);
+    }
+}
+
+typedef struct { int code; char out[16384], err[4096], log[1 << 18]; } Run;
+
+static void slurp(const char *name, char *buf, size_t cap) {
+    char p[800];
+    snprintf(p, sizeof p, "%s/%s", dir, name);
+    FILE *f = fopen(p, "rb");
+    size_t n = f ? fread(buf, 1, cap - 1, f) : 0;
+    if (f) fclose(f);
+    buf[n] = 0;
+}
+
+/* run the binary against the stub; extra is a NULL-terminated argument list,
+   input (may be NULL) is piped to stdin */
+static bool run_bin(const char *bin, int mode, const char *const *extra, const char *input, Run *r) {
+    int ls = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t al = sizeof a;
+    if (ls < 0 || bind(ls, (struct sockaddr *)&a, sizeof a) || listen(ls, 8)
+        || getsockname(ls, (struct sockaddr *)&a, &al)) return false;
+    char logf[800], url[64], outf[800], errf[800], inf[800];
+    snprintf(logf, sizeof logf, "%s/req.log", dir);
+    snprintf(outf, sizeof outf, "%s/run.out", dir);
+    snprintf(errf, sizeof errf, "%s/run.err", dir);
+    snprintf(inf, sizeof inf, "%s/run.in", dir);
+    snprintf(url, sizeof url, "http://127.0.0.1:%d/v1", ntohs(a.sin_port));
+    drop("req.log");
+    if (input) put("run.in", input, strlen(input));
+    fflush(stdout);
+    pid_t srv = fork();
+    if (srv == 0) stub(ls, mode, logf);
+    close(ls);
+    pid_t pid = fork();
+    if (pid == 0) {
+        const char *av[32] = {bin, "--unsafe", "-q", "-C", dir, "-e", url, "-m", "m", "-W", "30"};
+        int n = 11;
+        for (int i = 0; extra[i] && n < 31; i++) av[n++] = extra[i];
+        int in = open(input ? inf : "/dev/null", O_RDONLY);
+        int out = open(outf, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        int err = open(errf, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (in < 0 || out < 0 || err < 0) _exit(126);
+        dup2(in, 0); dup2(out, 1); dup2(err, 2);
+        setenv("HOME", dir, 1);
+        unsetenv("http_proxy");
+        execv(bin, (char *const *)av);
+        _exit(127);
+    }
+    int st = 0;
+    waitpid(pid, &st, 0);
+    kill(srv, SIGKILL);
+    waitpid(srv, NULL, 0);
+    r->code = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+    slurp("run.out", r->out, sizeof r->out);
+    slurp("run.err", r->err, sizeof r->err);
+    slurp("req.log", r->log, sizeof r->log);
+    drop("req.log"); drop("run.out"); drop("run.err"); drop("run.in");
+    return true;
+}
+
+/* one-shot mode attaches the image named in a typed prompt, and only there; a
+   refused request drops it, an accepted one keeps it. Needs FW_BIN. */
+static void test_oneshot(void) {
+    const char *bin = getenv("FW_BIN");
+    if (!bin) { printf("SKIP one-shot image test: FW_BIN not set\n"); return; }
+    static Run r;
+    put("shot.png", TINY, sizeof TINY);
+    put("bad.png", "not an image", 12);
+
+    const char *typed[] = {"-T", "2", "describe ./shot.png", NULL};
+    T("one-shot: run", run_bin(bin, STUB_OK, typed, NULL, &r));
+    T("one-shot: image attached notice on stderr", strstr(r.err, "1 image attached") != NULL);
+    T("one-shot: exit 0", r.code == 0);
+    T("one-shot: image in the request", strstr(r.log, "\"image_url\"") != NULL);
+
+    /* text the user did not type on the command line is never searched */
+    const char *text = "compare ./shot.png with ./bad.png\n";
+    put("task.txt", text, strlen(text));
+    const char *file[] = {"-T", "2", "-f", NULL, NULL};
+    char task[800];
+    snprintf(task, sizeof task, "%s/task.txt", dir);
+    file[3] = task;
+    const char *piped[] = {"-T", "2", NULL};
+    const char *lines[] = {"-T", "2", "look:\n./shot.png ./bad.png", NULL};
+    const char *oneline_file[] = {"-T", "2", "-f", task, NULL};
+    const struct { const char *name; const char *const *args; const char *in; } src[] = {
+        {"-f", file, NULL}, {"stdin", piped, "compare ./shot.png with ./bad.png"},
+        {"multi-line argv", lines, NULL}, {"one-line -f", oneline_file, NULL}};
+    for (int i = 0; i < 4; i++) {
+        if (i == 3) put("task.txt", "describe ./shot.png", 19);
+        for (int mode = STUB_OK; mode <= STUB_BLIND; mode++) {
+            char name[80];
+            snprintf(name, sizeof name, "%s attaches nothing (%s)", src[i].name,
+                     mode == STUB_BLIND ? "no vision" : "bad image");
+            T(name, run_bin(bin, mode, src[i].args, src[i].in, &r) && r.code == 0
+                    && strstr(r.log, REQ_MARK) && !strstr(r.log, "\"image_url\"")
+                    && !strstr(r.err, "attached") && !strstr(r.err, "not sent"));
+        }
+    }
+
+    /* the agent wiring: refused request -> image dropped -> `image` event */
+    T("refused: run", run_bin(bin, STUB_REFUSE, typed, NULL, &r));
+    T("refused: image was sent", strstr(r.log, "\"image_url\"") != NULL);
+    T("refused: exit 1", r.code == 1);
+    T("refused: image event", strstr(r.out, "server refused the image shot.png (status 400)")
+                              && strstr(r.out, "dropped 1 from the message; the text stays"));
+
+    const char *longer[] = {"-T", "30", "describe ./shot.png", NULL};
+    T("accepted then refused: run", run_bin(bin, STUB_THEN_REFUSE, longer, NULL, &r));
+    const char *second = strstr(r.log, REQ_MARK);
+    second = second ? strstr(second + 1, REQ_MARK) : NULL;
+    T("accepted then refused: image still sent", second && strstr(second, "\"image_url\""));
+    T("accepted then refused: kept", r.code == 1 && !strstr(r.out, "server refused"));
+
+    T("reset then refused: run", run_bin(bin, STUB_RESET_THEN_REFUSE, longer, NULL, &r));
+    const char *reset = strstr(r.log, "Context reset after");
+    T("reset then refused: reset happened", reset != NULL);
+    while (reset && reset > r.log && strncmp(reset, REQ_MARK, strlen(REQ_MARK))) reset--;
+    T("reset then refused: image survives the reset", reset && strstr(reset, "\"image_url\""));
+    T("reset then refused: kept", r.code == 1 && !strstr(r.out, "server refused"));
+
+    drop("shot.png");
+    drop("bad.png");
+    drop("task.txt");
+}
+
 int main(void) {
     const char *tmp = getenv("TMPDIR");
     snprintf(dir, sizeof dir, "%s/fw-test-image-XXXXXX", tmp && *tmp ? tmp : "/tmp");
@@ -509,6 +780,10 @@ int main(void) {
     test_addresses();
     test_url();
     test_msgs_parts();
+    test_attach();
+    test_drop_rejected();
+    test_drop_kept();
+    test_oneshot();
     rmdir(dir);
     printf("image: %d passed, %d failed\n", passed, failed);
     return failed ? 1 : 0;

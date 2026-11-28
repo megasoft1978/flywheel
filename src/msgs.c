@@ -18,6 +18,7 @@ static void push(Msgs *m, const char *role, const char *content,
     x->tool_call_id = tcid ? str_dup(tcid) : NULL;
     x->tool_calls = tcs;
     x->images = (Images){0};
+    x->images_seen = false;
 }
 
 void msgs_push(Msgs *m, const char *role, const char *content) {
@@ -44,6 +45,7 @@ void msgs_insert(Msgs *m, int at, const char *role, const char *content) {
     x->tool_call_id = NULL;
     x->tool_calls = NULL;
     x->images = (Images){0};
+    x->images_seen = false;
 }
 
 static void msg_free(Msg *x) {
