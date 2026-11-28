@@ -4,140 +4,309 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>flywheel · a C coding agent for local models</title>
-<meta name="description" content="A small terminal coding agent written in C, built for a model running on your Mac.">
+<meta name="description" content="A small terminal coding agent written in C, built for a model running on your Mac. No cloud account, no API key.">
 <style>
-:root{--bg:#f7f5f0;--panel:#fff;--fg:#171612;--dim:#625e54;--line:#e3ded2;--acc:#9a6400;--bar:#b9b2a2;--ok:#1d7a3e;
+:root{color-scheme:light dark;--bg:#eef1f5;--panel:#fff;--fg:#14202e;--dim:#4d5b6b;--line:#d3dae3;--fill:#eef1f6;--edge:#9aa8ba;
+ --acc:#2447d6;--on-acc:#fff;--ok:#12714a;--no:#b3261e;--warn:#855600;
+ --head:"DIN Alternate",Bahnschrift,"Avenir Next",system-ui,sans-serif;
+ --body:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-@media (prefers-color-scheme:dark){:root{--bg:#0e0f11;--panel:#16181c;--fg:#ecebe7;--dim:#9c9a93;--line:#26292f;--acc:#f0b429;--bar:#555a63;--ok:#4cc46f}}
+@media (prefers-color-scheme:dark){:root{--bg:#0f141c;--panel:#18202c;--fg:#e8edf3;--dim:#9faec0;--line:#2b3646;--fill:#202a39;--edge:#50607a;
+ --acc:#8aa4ff;--on-acc:#0f141c;--ok:#5fd29a;--no:#ff8f85;--warn:#f2c14e}}
 *{margin:0;padding:0;box-sizing:border-box}
 html{scroll-behavior:smooth}
-body{background:var(--bg);color:var(--fg);font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif;-webkit-font-smoothing:antialiased}
-.wrap{max-width:960px;margin:0 auto;padding:0 20px}
-a{color:inherit}
-nav{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:22px 0}
-.brand{display:flex;align-items:center;gap:10px;font:700 17px var(--mono);text-decoration:none}
-.brand svg{width:26px;height:26px;color:var(--acc)}
-nav ul{display:flex;gap:22px;list-style:none;font-size:14.5px}
+body{background:var(--bg);color:var(--fg);font:16px/1.55 var(--body);-webkit-font-smoothing:antialiased;overflow-wrap:break-word}
+.wrap{max-width:1136px;margin:0 auto;padding:0 20px}
+a{color:var(--acc);text-underline-offset:3px}
+a:focus-visible{outline:2px solid var(--acc);outline-offset:3px;border-radius:3px}
+code{font-family:var(--mono);font-size:.88em}
+h1,h2,h3{font-family:var(--head);font-weight:700;line-height:1.12;text-wrap:balance}
+h2{font-size:clamp(26px,3.4vw,34px);margin-bottom:22px}
+h3{font-size:18px}
+
+nav{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:18px 0}
+.brand{display:flex;align-items:center;gap:9px;font:700 21px var(--head);color:var(--fg);text-decoration:none}
+.brand svg{width:28px;height:28px;color:var(--acc)}
+nav ul{display:flex;gap:20px;list-style:none;font-size:14.5px}
 nav ul a{text-decoration:none;color:var(--dim)} nav ul a:hover{color:var(--fg)}
-header{padding:56px 0 64px;display:grid;grid-template-columns:minmax(0,1fr);gap:44px}
-h1{font-size:clamp(34px,5.2vw,52px);line-height:1.08;letter-spacing:-.025em;text-wrap:balance}
-.lead{color:var(--dim);font-size:18px;margin:18px 0 28px}
-.cta{display:flex;gap:12px;flex-wrap:wrap}
-.btn{padding:11px 20px;border-radius:8px;font-weight:600;font-size:15px;text-decoration:none;border:1px solid var(--line)}
-.btn.p{background:var(--fg);color:var(--bg);border-color:var(--fg)}
-pre{font:13px/1.7 var(--mono);overflow-x:auto}
-video{display:block;width:100%;height:auto;border:1px solid var(--line);border-radius:12px;background:#1e1e2e}
-figcaption{color:var(--dim);font-size:13.5px;margin-top:10px;overflow-wrap:anywhere}
-section{padding:60px 0;border-top:1px solid var(--line)}
-h2{font-size:28px;letter-spacing:-.015em;line-height:1.2;margin-bottom:12px}
-h3{font-size:19px;margin:34px 0 6px}
-.sub{color:var(--dim);max-width:64ch;margin-bottom:26px}
-.grid{display:flex;flex-wrap:wrap;gap:1px;background:var(--line);border:1px solid var(--line);border-radius:12px;overflow:hidden}
-.grid div{flex:1 1 270px;background:var(--panel);padding:22px}
-.grid h4{font-size:15.5px;margin-bottom:6px}
-.grid p{color:var(--dim);font-size:14.5px}
-code{font-family:var(--mono);font-size:.9em}
-ul.safe{list-style:none;max-width:72ch}
-ul.safe li{padding:12px 0 12px 22px;border-bottom:1px solid var(--line);position:relative}
-ul.safe li::before{content:"";position:absolute;left:2px;top:22px;width:7px;height:7px;background:var(--acc);border-radius:2px}
-.big{font:700 40px/1 var(--mono);color:var(--acc)}
-ul.tiles{list-style:none;display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:8px;margin:18px 0}
-ul.tiles li{border:1px solid var(--line);border-radius:8px;padding:10px 12px;font:13px var(--mono);color:var(--dim);background:var(--panel);overflow-wrap:anywhere}
-ul.tiles li span{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.08em}
-ul.tiles li.ok{border-color:var(--ok);color:var(--fg)} ul.tiles li.ok span{color:var(--ok)}
-.note{border-left:3px solid var(--acc);padding:4px 0 4px 16px;color:var(--dim);font-size:14.5px;max-width:74ch}
-.note b{color:var(--fg)}
-.row{display:grid;grid-template-columns:250px 1fr 56px;gap:14px;align-items:center;padding:12px 0;border-bottom:1px solid var(--line)}
-.who b{display:block;font-size:14.5px}.who small{color:var(--dim);font-size:12.5px;display:block;line-height:1.4}
-.track{height:14px;background:var(--line);border-radius:3px;overflow:hidden}.track i{display:block;height:100%;background:var(--bar)}
-.me .track i{background:var(--acc)}
-.val{font:600 15px var(--mono);text-align:right}
-.code{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 20px}
-.code .d{color:var(--dim)}
-footer{border-top:1px solid var(--line);padding:30px 0 56px;color:var(--dim);font-size:14px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
-@media (max-width:820px){header{padding-top:28px}nav ul{gap:14px}
- .row{grid-template-columns:1fr 56px}.who{grid-column:1/-1}}
-@media (max-width:480px){nav ul li:not(:last-child){display:none}}
+
+header{display:grid;grid-template-columns:minmax(0,1fr);grid-template-areas:"pitch" "demo" "install" "cap" "need";row-gap:14px;padding:4px 0 52px}
+.pitch{grid-area:pitch}.demo{grid-area:demo}.install{grid-area:install}.cap{grid-area:cap}.need{grid-area:need}
+h1{font-size:clamp(32px,4.6vw,52px);line-height:1.04;letter-spacing:-.01em}
+.lead{color:var(--dim);font-size:17px;margin-top:10px;max-width:44ch}
+video{display:block;width:100%;height:auto;aspect-ratio:16/10;border-radius:12px;background:#1e1e2e;box-shadow:0 0 0 1px var(--edge)}
+video.still{display:none}
+@media (prefers-reduced-motion:reduce){video.moving{display:none}video.still{display:block}html{scroll-behavior:auto}}
+.cap{color:var(--dim);font-size:12.5px;line-height:1.5}
+.term{background:#1e1e2e;color:#cdd6f4;border-radius:10px;padding:14px 16px;font:12.5px/1.75 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere}
+.term span{color:#a6adc8}.term b{color:#a6e3a1;font-weight:400}
+.need{color:var(--dim);font-size:13.5px}
+@media (min-width:920px){
+ header{grid-template-columns:minmax(0,5fr) minmax(0,7fr);grid-template-areas:"pitch demo" "install demo" "need cap";grid-template-rows:auto 1fr auto;column-gap:40px;padding-top:28px;align-items:start}
+ .lead{font-size:18px}
+}
+
+section{padding:54px 0;border-top:1px solid var(--line)}
+.under{color:var(--dim);font-size:14.5px;margin-top:18px;max-width:74ch}
+
+/* loop diagram */
+.loop{display:block;width:100%;height:auto;margin:0 auto}
+.loop.wide{display:none;max-width:980px}.loop.tall{max-width:380px}
+@media (min-width:760px){.loop.wide{display:block}.loop.tall{display:none}}
+.loop text{fill:var(--fg);text-anchor:middle;font-family:var(--body)}
+.loop .h{font:700 19px var(--head)}
+.loop .s,.loop .l{font-size:14px;fill:var(--dim)}
+.loop .box{fill:var(--panel);stroke:var(--edge);stroke-width:1.5}
+.loop .f{stroke:var(--dim);stroke-width:2;fill:none}
+.loop .r{stroke:var(--acc);stroke-width:2;fill:none;stroke-dasharray:6 5;animation:spin 1.2s linear infinite}
+.loop .fh{fill:var(--dim)}.loop .rh{fill:var(--acc)}
+.loop .pill{fill:var(--bg);stroke:var(--acc);stroke-width:1.5}
+.loop .pt{font-size:13.5px;font-weight:600;fill:var(--acc)}
+@keyframes spin{to{stroke-dashoffset:-22}}
+@media (prefers-reduced-motion:reduce){.loop .r{animation:none}}
+
+/* sandbox */
+.fence{display:grid;grid-template-columns:minmax(0,1fr);gap:12px}
+@media (min-width:820px){.fence{grid-template-columns:repeat(3,minmax(0,1fr))}}
+.zone{background:var(--panel);border:1px solid var(--line);border-top:5px solid var(--c);border-radius:10px;padding:16px 18px}
+.zone.ok{--c:var(--ok)}.zone.warn{--c:var(--warn)}.zone.no{--c:var(--no)}
+.zone h3{color:var(--c);margin-bottom:6px}
+.zone ul{list-style:none}
+.zone li{display:grid;grid-template-columns:26px minmax(0,1fr);gap:10px;align-items:start;padding:9px 0;font-size:14.5px}
+.zone li+li{border-top:1px solid var(--line)}
+.zone li svg{width:22px;height:22px;color:var(--c)}
+.zone li small{display:block;color:var(--dim);font-size:13px;line-height:1.45}
+svg.i{fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+
+/* images */
+.split{display:grid;grid-template-columns:minmax(0,1fr);gap:24px;align-items:center}
+@media (min-width:820px){.split{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}}
+.shot .term{border-radius:10px 10px 0 0;padding-bottom:6px}
+.shot svg{display:block;width:100%;height:auto;background:#1e1e2e;border-radius:0 0 10px 10px}
+.ways{list-style:none}
+.ways li{padding:11px 0;border-bottom:1px solid var(--line)}
+
+/* features */
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr));column-gap:28px;row-gap:26px}
+.card{display:grid;grid-template-columns:44px minmax(0,1fr);gap:14px;align-items:start}
+.card>svg{width:44px;height:44px;padding:9px;border-radius:10px;background:var(--acc);color:var(--on-acc)}
+.card p{color:var(--dim);font-size:14.5px}
+
+/* benchmark slot */
+.slot{border:2px dashed var(--edge);border-radius:12px;padding:26px 20px;text-align:center}
+.slot svg{display:block;width:100%;max-width:420px;height:auto;margin:0 auto 14px;color:var(--edge)}
+.slot p{color:var(--dim);max-width:62ch;margin:6px auto 0;font-size:14.5px}
+
+.box-warn{border:2px solid var(--warn);border-radius:12px;background:var(--panel);padding:22px}
+.box-warn ul,.limits{list-style:none;display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));column-gap:32px}
+.box-warn li{padding:8px 0}
+.box-warn li b{display:block}
+.box-warn li span{color:var(--dim);font-size:14px}
+.limits li{padding:9px 0;border-bottom:1px solid var(--line);font-size:15px}
+
+footer{border-top:1px solid var(--line);padding:28px 0 48px;color:var(--dim);font-size:14px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+@media (max-width:520px){nav ul li.opt{display:none}nav ul{gap:14px}}
 </style>
 </head>
 <body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 6h6l2 2h10v11H3z"/></symbol>
+  <symbol id="i-temp" viewBox="0 0 24 24"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l3 2M9 3h6"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s4-6 10-6 10 6 10 6-4 6-10 6S2 12 2 12z"/><circle cx="12" cy="12" r="2.8"/></symbol>
+  <symbol id="i-box" viewBox="0 0 24 24"><path d="M12 3l8 4.5v9L12 21l-8-4.500v-9zM4 7.500l8 4.5 8-4.500M12 12v9"/></symbol>
+  <symbol id="i-disk" viewBox="0 0 24 24"><path d="M4 5h16v14H4zM4 13h16M8 16h.01"/></symbol>
+  <symbol id="i-pen" viewBox="0 0 24 24"><path d="M4 20l4-1L19 8l-3-3L5 16zM14 7l3 3M3 3l18 18"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><path d="M6 11h12v9H6zM8.5 11V8a3.500 3.500 0 017 0v3"/></symbol>
+  <symbol id="i-net" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18M4 4l16 16"/></symbol>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="M4 11l8-7 8 7M6 10v10h12V10"/></symbol>
+</svg>
+
 <div class="wrap">
 <nav>
-  <a class="brand" href="#"><svg viewBox="0 0 64 64" aria-hidden="true" fill="none" stroke="currentColor" stroke-linecap="round"><circle cx="32" cy="32" r="27" stroke-width="5"/><g stroke-width="2.5"><line x1="32" y1="32" x2="56.0" y2="32.0"/><line x1="32" y1="32" x2="44.0" y2="52.8"/><line x1="32" y1="32" x2="20.0" y2="52.8"/><line x1="32" y1="32" x2="8.0" y2="32.0"/><line x1="32" y1="32" x2="20.0" y2="11.2"/><line x1="32" y1="32" x2="44.0" y2="11.2"/></g><circle cx="32" cy="32" r="7" fill="currentColor" stroke="none"/></svg>flywheel</a>
-  <ul><li><a href="#benchmarks">Results</a></li><li><a href="#quickstart">Setup</a></li><li><a href="#safety">Safety</a></li><li><a href="https://github.com/megasoft1978/flywheel">GitHub</a></li></ul>
+  <a class="brand" href="#"><svg viewBox="0 0 64 64" aria-hidden="true" fill="none" stroke="currentColor" stroke-linecap="round"><circle cx="32" cy="32" r="27" stroke-width="6"/><g stroke-width="3"><path d="M32 32h24M32 32l12 20.8M32 32L20 52.800M32 32H8M32 32L20 11.200M32 32l12-20.800"/></g><circle cx="32" cy="32" r="8" fill="currentColor" stroke="none"/></svg>flywheel</a>
+  <ul><li class="opt"><a href="#harness">How it works</a></li><li class="opt"><a href="#quickstart">Install</a></li><li><a href="#safety">Safety</a></li><li><a href="https://github.com/megasoft1978/flywheel">GitHub</a></li></ul>
 </nav>
 
 <header>
-  <div>
-    <h1>A terminal coding agent in C for a model running on your Mac.</h1>
-    <p class="lead">Tested with Qwen3.8-27B served locally by Splash with a DFlash2 drafter. No cloud account, no API key. The commands the model runs are sandboxed on macOS.</p>
-    <div class="cta"><a class="btn p" href="#quickstart">Get started</a><a class="btn" href="https://github.com/megasoft1978/flywheel">View source</a></div>
+  <div class="pitch">
+    <h1>A coding agent that runs on your Mac. No API key.</h1>
+    <p class="lead">Written in C for a local model. No cloud account. On macOS, the commands it runs are sandboxed.</p>
   </div>
-  <figure>
-    <video controls muted loop playsinline preload="metadata" width="1280" height="800" poster="demo-poster.jpg" aria-label="Terminal recording: flywheel fixes two bugs in a small Python project and runs its tests">
-      <source src="demo.webm" type="video/webm">
-      <source src="demo.mp4" type="video/mp4">
+
+  <div class="demo">
+    <video class="moving" autoplay muted loop playsinline controls preload="metadata" width="1280" height="800" poster="demo-poster.jpg" aria-label="Terminal recording: flywheel fixes two bugs in a small Python project and runs its tests">
+      <source src="demo.webm" type="video/webm"><source src="demo.mp4" type="video/mp4">
     </video>
-    <figcaption>One real run, 56 s, uncut and at original speed: flywheel fixes two bugs in a small Python project and the 4 tests pass. One edit by the model fails along the way. Approval dialogs, including the project check, were answered "Yes" by the recording script, and <code>ls</code> was set to show numeric user ids. Qwen3.8-27B 4-bit + DFlash2 drafter, Splash 1.7.2, Apple M5 Max 64 GB, <code>flywheel -T 20 -W 120 --transcript</code>. Recorded with an earlier build, before the sandbox and image input. <a href="https://github.com/megasoft1978/flywheel/blob/main/demo/transcript.jsonl">Transcript</a></figcaption>
-  </figure>
+    <video class="still" muted loop playsinline controls preload="none" width="1280" height="800" poster="demo-poster.jpg" aria-label="Terminal recording: flywheel fixes two bugs in a small Python project and runs its tests">
+      <source src="demo.webm" type="video/webm"><source src="demo.mp4" type="video/mp4">
+    </video>
+  </div>
+
+  <div class="install" id="quickstart">
+    <div class="term">git clone https://github.com/megasoft1978/flywheel
+cd flywheel &amp;&amp; make
+./flywheel setup <span># asks first</span>
+./flywheel</div>
+  </div>
+
+  <p class="cap">One real run, 56 s, uncut. A script answered "Yes" to every approval. Recorded with an earlier build, before the sandbox and image input. <a href="https://github.com/megasoft1978/flywheel/blob/main/docs/advanced.md#about-the-demo-recording">About the recording</a></p>
+
+  <p class="need">Apple Silicon Mac with <code>clang</code> and <code>libcurl</code>. <code>setup</code> needs Homebrew and <code>aria2c</code>; model and drafter take about 19 GB. Tested on an M5 Max with 64 GB; smaller Macs are untested.</p>
 </header>
+
+<section id="harness">
+  <h2>A loop built for a local model's mistakes</h2>
+
+  <svg class="loop wide" viewBox="0 0 860 262" role="img" aria-label="The local model sends a tool call, flywheel repairs or rejects it, and commands run in the sandbox on macOS. Output goes back to the model and a loop breaker prunes repeats. When finished, TypeScript, Python, Go and Rust projects get a check gate; if it fails the model is told to fix it.">
+    <defs>
+      <marker id="wa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path class="fh" d="M0 0L10 5L0 10z"/></marker>
+      <marker id="wb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path class="rh" d="M0 0L10 5L0 10z"/></marker>
+    </defs>
+    <rect class="box" x="10" y="56" width="180" height="78" rx="10"/><text class="h" x="100" y="91">Local model</text><text class="s" x="100" y="114">on your Mac</text>
+    <rect class="box" x="230" y="56" width="180" height="78" rx="10"/><text class="h" x="320" y="91">Tool-call repair</text><text class="s" x="320" y="114">recover or reject</text>
+    <rect class="box" x="450" y="56" width="180" height="78" rx="10"/><text class="h" x="540" y="91">Sandbox</text><text class="s" x="540" y="114">commands, on macOS</text>
+    <rect class="box" x="670" y="56" width="180" height="78" rx="10"/><text class="h" x="760" y="91">Check gate</text><text class="s" x="760" y="114">type check or compile</text>
+    <path class="f" d="M190 95H229" marker-end="url(#wa)"/><path class="f" d="M410 95H449" marker-end="url(#wa)"/><path class="f" d="M630 95H669" marker-end="url(#wa)"/>
+    <text class="l" x="210" y="44">tool call</text><text class="l" x="650" y="44">when finished</text>
+    <path class="f" d="M760 56V30" marker-end="url(#wa)"/><text class="l" x="760" y="20">passes: done</text>
+    <path class="r" d="M540 134V180H130V136" marker-end="url(#wb)"/>
+    <text class="l" x="335" y="156">output goes back to the model</text>
+    <rect class="pill" x="221" y="167" width="228" height="26" rx="13"/><text class="pt" x="335" y="185">loop breaker prunes repeats</text>
+    <path class="r" d="M760 134V230H70V136" marker-end="url(#wb)"/>
+    <text class="l" x="415" y="252">check fails: the model is told to fix it</text>
+  </svg>
+
+  <svg class="loop tall" viewBox="0 0 340 444" role="img" aria-label="Local model, then tool-call repair, then sandbox on macOS, then check gate for TypeScript, Python, Go and Rust projects. Output goes back to the model, a loop breaker prunes repeats, and a failed check sends the model back to fix it.">
+    <defs>
+      <marker id="ta" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path class="fh" d="M0 0L10 5L0 10z"/></marker>
+      <marker id="tb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path class="rh" d="M0 0L10 5L0 10z"/></marker>
+    </defs>
+    <rect class="box" x="78" y="10" width="256" height="66" rx="10"/><text class="h" x="206" y="39">Local model</text><text class="s" x="206" y="61">on your Mac</text>
+    <rect class="box" x="78" y="110" width="256" height="66" rx="10"/><text class="h" x="206" y="139">Tool-call repair</text><text class="s" x="206" y="161">recover or reject</text>
+    <rect class="box" x="78" y="210" width="256" height="66" rx="10"/><text class="h" x="206" y="239">Sandbox</text><text class="s" x="206" y="261">commands, on macOS</text>
+    <rect class="box" x="78" y="322" width="256" height="66" rx="10"/><text class="h" x="206" y="351">Check gate</text><text class="s" x="206" y="373">type check or compile</text>
+    <path class="f" d="M206 76V109" marker-end="url(#ta)"/><path class="f" d="M206 176V209" marker-end="url(#ta)"/><path class="f" d="M206 276V321" marker-end="url(#ta)"/>
+    <text class="l" x="246" y="98">tool call</text><text class="l" x="261" y="304">when finished</text>
+    <path class="f" d="M206 388V416" marker-end="url(#ta)"/><text class="l" x="206" y="436">passes: done</text>
+    <path class="r" d="M78 243H52V56H77" marker-end="url(#tb)"/>
+    <text class="pt" transform="translate(44 150) rotate(-90)">output back, loop breaker</text>
+    <path class="r" d="M78 355H20V30H77" marker-end="url(#tb)"/>
+    <text class="l" transform="translate(12 192) rotate(-90)">check fails: fix it</text>
+  </svg>
+
+  <p class="under">File edits skip the sandbox but are confined to the project. The interactive UI asks before anything outside a short read-only list, and before the check, unless you chose "always allow": a remembered command is not asked again, even if the model has since changed the files it runs. Only TypeScript, Python, Go and Rust projects (the last two experimental) get a check gate; others finish without one. A passing check means the code type-checks or compiles, not that it is correct.</p>
+</section>
+
+<section id="sandbox">
+  <h2>What a model's command can touch on macOS</h2>
+  <div class="fence">
+    <div class="zone ok">
+      <h3>Read and write</h3>
+      <ul>
+        <li><svg class="i" aria-hidden="true"><use href="#i-folder"/></svg><div>Your project<small>except git hooks, git config, <code>.envrc</code> and other protected files</small></div></li>
+        <li><svg class="i" aria-hidden="true"><use href="#i-temp"/></svg><div>A private temp directory<small>not <code>/tmp</code></small></div></li>
+      </ul>
+    </div>
+    <div class="zone warn">
+      <h3>Readable by the model</h3>
+      <ul>
+        <li><svg class="i" aria-hidden="true"><use href="#i-eye"/></svg><div>A <code>.env</code> in the project<small>and other secrets there</small></div></li>
+        <li><svg class="i" aria-hidden="true"><use href="#i-box"/></svg><div>Toolchains and dependencies<small>a fixed list under your home, plus some git files</small></div></li>
+        <li><svg class="i" aria-hidden="true"><use href="#i-disk"/></svg><div>Everything outside your home<small>that you can read yourself</small></div></li>
+      </ul>
+    </div>
+    <div class="zone no">
+      <h3>Blocked</h3>
+      <ul>
+        <li><svg class="i" aria-hidden="true"><use href="#i-pen"/></svg><div>Writing anywhere else<small>except, in a linked git worktree, parts of the main repository's git data</small></div></li>
+        <li><svg class="i" aria-hidden="true"><use href="#i-home"/></svg><div>The rest of your home directory</div></li>
+        <li><svg class="i" aria-hidden="true"><use href="#i-lock"/></svg><div>Credential stores<small>a fixed list: <code>~/.ssh</code>, <code>~/.aws</code>, keychains, common browser profiles and others</small></div></li>
+        <li><svg class="i" aria-hidden="true"><use href="#i-net"/></svg><div>The network<small>unless you approve one command in the interactive UI; it can then reach any address</small></div></li>
+      </ul>
+    </div>
+  </div>
+  <p class="under">Start flywheel in a project directory: started in your home directory, commands can read and write nearly all of it. <a href="https://github.com/megasoft1978/flywheel/blob/main/docs/safety.md">Every rule and exception</a></p>
+</section>
+
+<section id="images">
+  <h2>Show it a screenshot</h2>
+  <div class="split">
+    <figure class="shot">
+      <div class="term"><span>$</span> flywheel "what is wrong in ./shot.png"
+<b>✓ 1 image attached</b></div>
+      <svg viewBox="0 0 440 150" role="img" aria-label="Illustration of a screenshot attached to the prompt">
+        <path d="M34 0v66h40" fill="none" stroke="#a6e3a1" stroke-width="2" stroke-dasharray="5 5"/>
+        <g transform="translate(74 14)">
+          <rect width="220" height="122" rx="8" fill="#313244" stroke="#6c7086"/>
+          <circle cx="14" cy="13" r="3.500" fill="#f38ba8"/><circle cx="26" cy="13" r="3.500" fill="#f9e2af"/><circle cx="38" cy="13" r="3.500" fill="#a6e3a1"/>
+          <path d="M0 26h220" stroke="#6c7086"/>
+          <g fill="#585b70"><rect x="14" y="38" width="96" height="8" rx="4"/><rect x="14" y="54" width="150" height="8" rx="4"/><rect x="14" y="104" width="72" height="8" rx="4"/></g>
+          <rect x="14" y="70" width="192" height="24" rx="5" fill="#f38ba8"/><rect x="24" y="78" width="130" height="8" rx="4" fill="#1e1e2e"/>
+        </g>
+        <text x="308" y="124" fill="#a6adc8" font-size="14" font-family="ui-monospace,Menlo,monospace">shot.png</text>
+      </svg>
+    </figure>
+    <div>
+      <ul class="ways">
+        <li>Drag an image onto the terminal, or type its path: <code>./shot.png</code>, not a bare name</li>
+        <li>Give an image URL (not in the static Linux build)</li>
+        <li><code>/paste</code> a picture from the clipboard (local macOS session)</li>
+      </ul>
+      <p class="under">Only what you type or paste is searched for images. Naming a file attaches it, even outside the project. The engine must serve the model with vision; <code>flywheel setup</code> starts it that way. <a href="https://github.com/megasoft1978/flywheel/blob/main/docs/advanced.md#images">Details</a></p>
+    </div>
+  </div>
+</section>
+
+<section id="features">
+  <h2>What you get</h2>
+  <div class="cards">
+    <div class="card"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v11H4zM2 20h20"/></svg><div><h3>Local, no API key</h3><p>Talks to a model server on your Mac. Sends no key.</p></div></div>
+    <div class="card"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 11-2.500-5.800M20 3v5h-5M9 9l6 6M15 9l-6 6"/></svg><div><h3>Loop breaker</h3><p>Prunes repeated turns, adds a correction, briefly raises temperature.</p></div></div>
+    <div class="card"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 6a5 5 0 00-6 6.500L3.500 17a2.100 2.100 0 003 3l4.500-4.500A5 5 0 0017.500 9L14 12.500 11.500 10z"/></svg><div><h3>Tool-call repair</h3><p>Recovers shell commands from JSON with raw control characters. Truncated ones never run.</p></div></div>
+    <div class="card"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20l4-1L19 8l-3-3L5 16zM14 7l3 3"/></svg><div><h3>Careful edits</h3><p>Unique-match replacements, confined to the project.</p></div></div>
+    <div class="card"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18v14H3zM7 9l3 3-3 3M12 15h5"/></svg><div><h3>Live terminal UI</h3><p>Type while it works. Esc interrupts. Output collapses.</p></div></div>
+    <div class="card"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 7l-5 5 5 5M16 7l5 5-5 5"/></svg><div><h3>Small enough to read</h3><p>About 11k lines of C plus cJSON. Only libcurl on macOS.</p></div></div>
+  </div>
+</section>
 
 <section id="benchmarks">
   <h2>Results</h2>
-  <p class="sub">8 of 13 private TypeScript/React tasks passed all hidden tests (score 10.15 of 13, median 5.7 minutes per task, one run). Terminal-Bench 2.0 pilot: 4 of 10.</p>
-
-  <h3>13 TypeScript and React tasks</h3>
-  <p class="sub">Private hidden-test suite. Score is the fraction of tests passing per task, zero if the type check fails; maximum 13.</p>
-  <div class="row me"><div class="who"><b>flywheel + Qwen3.8-27B</b><small>local · agent loop · one run</small></div><div class="track"><i style="width:78.1%"></i></div><div class="val">10.15</div></div><div class="row"><div class="who"><b>Claude Sonnet 5.5</b><small>one-shot, no tools · first attempt</small></div><div class="track"><i style="width:92.3%"></i></div><div class="val">12.00</div></div><div class="row"><div class="who"><b>Claude Haiku 5.5</b><small>one-shot, no tools · first attempt</small></div><div class="track"><i style="width:92.3%"></i></div><div class="val">12.00</div></div>
-  <p class="note" style="margin-top:18px"><b>The Claude models are clearly ahead.</b> With one retry that was shown the failing hidden test, Sonnet 5.5 and Haiku 5.5 both reached 13.00. Protocols differ, so treat this as a reference point, not a head-to-head: the Claude runs generated code without tools, while flywheel ran as an agent on a suite it had been tuned against. The Haiku row combines two runs. The flywheel run predates the current build. An earlier Python version of the harness scored 11.74 with 7 of 13 tasks fully passing.</p>
-  <h3>Terminal-Bench 2.0 pilot</h3>
-  <p><span class="big">4 / 10</span> tasks passed, with the model running locally.</p>
-  <ul class="tiles"><li class="ok"><span>pass</span>count-dataset-tokens</li><li class="ok"><span>pass</span>extract-elf</li><li class="ok"><span>pass</span>fix-git</li><li class="ok"><span>pass</span>git-multibranch</li><li><span>fail</span>chess-best-move</li><li><span>fail</span>circuit-fibsqrt</li><li><span>fail</span>make-mips-interpreter</li><li><span>fail</span>dna-insert</li><li><span>fail</span>filter-js-from-html</li><li><span>fail</span>gcode-to-text</li></ul>
-  <p class="note"><b>Not a leaderboard score.</b> The tasks were hand-picked, each ran once, seven were re-run after a Docker network outage stopped them from starting, and two builds were involved. <code>chess-best-move</code> needs reading an image file named by the task, which flywheel could not do then and still does not: it sends only images you type or paste. The pilot predates a fix for missing file-tool parameter schemas. A full run is still to be done.</p>
-
-</section>
-
-<section id="harness">
-  <h2>How the loop works</h2>
-  <p class="sub">Local models fail in repetitive ways: malformed tool calls, repeated commands, stalls. flywheel handles some of them around the model.</p>
-  <div class="grid"><div><h4>Loop breaker</h4><p>When similar commands keep returning similar results, prunes those turns, adds a correction and raises temperature.</p></div><div><h4>Strict tool calls</h4><p>Recovers shell commands from JSON with raw control characters. Truncated arguments are rejected, never run.</p></div><div><h4>Structured edits</h4><p><code>write_file</code> and <code>edit_file</code> with unique-match replacement, confined to the project.</p></div><div><h4>Verification gate</h4><p>A type check or compile per language, then one requirement-by-requirement pass. The interactive UI asks before running the check.</p></div><div><h4>Live terminal UI</h4><p>Type while it works, Esc to interrupt, collapsible output, streaming markdown, end-to-end tokens per second. <code>/copy</code> copies the last reply.</p></div><div><h4>Images</h4><p>Drag a file in, type its path or an image URL, or <code>/paste</code> from the clipboard. Naming a file attaches it, even outside the project. The engine must serve the model with vision.</p></div><div><h4>Sandbox on macOS</h4><p>Model commands and checks cannot write outside the project and a private temp directory, or reach the network unless you approve it. <a href="#safety">Limits apply.</a></p></div><div><h4>Small</h4><p>About 11k lines of C, plus vendored cJSON. libcurl only on macOS; the Linux build is static and speaks plain HTTP.</p></div></div>
-</section>
-
-<section id="stack">
-  <h2>The stack as tested</h2>
-  <ul class="safe"><li>Model: <code>uub336/Qwen3.8-27B-pi-mlx-4bit</code> (about 15 GB, MLX)</li><li>Drafter: <code>z-lab/Qwen3.8-27B-DFlash2</code> (about 3.9 GB)</li><li>Engine: Splash 1.7.2, <code>brew install incoai/tap/splash</code></li><li>Machine: Apple M5 Max, 64 GB. Smaller Macs are untested.</li></ul>
-</section>
-
-<section id="quickstart">
-  <h2>Get started</h2>
-  <p class="sub">macOS on Apple Silicon, with <code>clang</code> and <code>libcurl</code>. About 19 GB of downloads; <code>setup</code> needs Homebrew and <code>aria2c</code> (<code>brew install aria2</code>) installed first. Server already running? Set <code>FW_ENDPOINT</code>.</p>
-  <pre class="code">git clone https://github.com/megasoft1978/flywheel
-cd flywheel &amp;&amp; make
-
-./flywheel setup   <span class="d"># optional: engine + model, asks first</span>
-./flywheel init    <span class="d"># per-project instructions</span>
-./flywheel         <span class="d"># interactive session</span></pre>
+  <div class="slot">
+    <svg viewBox="0 0 420 110" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2"><path d="M30 8v92h370"/><path d="M30 31h370M30 54h370M30 77h370" stroke-dasharray="3 7"/></svg>
+    <h3>Benchmark being prepared</h3>
+    <p>A Terminal-Bench 2.1 run is being prepared, with the same local model in flywheel and in two other agents. No scored run has started, so there is no chart yet.</p>
+    <p><a href="https://github.com/megasoft1978/flywheel/blob/main/bench/PROTOCOL.md">Draft protocol</a> and <a href="https://github.com/megasoft1978/flywheel/blob/main/docs/benchmarks.md">early informal runs, with their caveats</a></p>
+  </div>
 </section>
 
 <section id="safety">
-  <h2>Safety, stated plainly</h2>
-  <p class="sub">flywheel runs shell commands on your machine. Here is what it does and does not protect against.</p>
-  <ul class="safe"><li><b>Sandbox on macOS.</b> Commands the model runs, the verification gate and benchmark grading scripts run under <code>sandbox-exec</code>. They cannot write outside the project and a private temp directory (grading scripts have their own). In a linked git worktree they can also write parts of the main repository’s git data. They have no network unless you approve it for one command, which can then reach any address. Run an untrusted repository or task in a VM.</li><li><b>Reads are limited under your home directory</b> to the project, toolchains, downloaded dependencies and some git files; a fixed list of credential stores stays closed, but other secrets in those places, such as a project <code>.env</code>, are readable. Everything readable outside your home stays readable and can reach the model. Started in your home directory itself, commands can read and write nearly all of it, except those stores and a few read-only files. Start it in a project directory.</li><li><b>What it does not cover.</b> Files inside the project can be changed, including build scripts you may later run outside the sandbox. File tools use their own project confinement. Background processes of commands without network can keep running.</li><li>The interactive UI asks before anything outside a short read-only list, including git, and before the verification gate. Commands you mark “always allow” are not asked again, even if the model has since changed the files they run. <b>One-shot and bench modes approve everything automatically</b> (network excepted).</li><li><b>No sandbox on Linux yet.</b> The interactive UI still runs there: approved commands can write anywhere you can and use the network. Without a sandbox, one-shot and bench refuse to run unless you pass <code>--unsafe</code>, which turns the sandbox and environment filtering off.</li><li>Some tools stop working inside the sandbox, for example global installs, <code>git config</code>, rebase and Docker. The full list is in the <a href="https://github.com/megasoft1978/flywheel#safety">README</a>.</li></ul>
+  <h2>Safety, before you run it</h2>
+  <div class="box-warn">
+    <ul>
+      <li><b>No sandbox on Linux.</b><span>Approved commands can write anywhere you can and use the network.</span></li>
+      <li><b>A project <code>.env</code> is readable by the model.</b><span>So are other secrets in the places it may read.</span></li>
+      <li><b>One-shot approves commands automatically.</b><span>One-shot means a prompt argument, <code>-f</code> or piped input. So does <code>bench</code>. Network access is the exception.</span></li>
+      <li><b>Use a VM for untrusted repositories and tasks.</b><span>Files in the project can change, including build scripts you may run later.</span></li>
+    </ul>
+  </div>
+  <p class="under"><code>--unsafe</code> turns off the sandbox, on macOS too, and environment filtering. Where there is no sandbox, one-shot and <code>bench</code> refuse to run without it. <a href="https://github.com/megasoft1978/flywheel/blob/main/docs/safety.md">Read the full safety page</a></p>
 </section>
 
 <section id="limits">
   <h2>Limits</h2>
-  <ul class="safe"><li>Images go only from what you type or paste, in the interactive UI and one-shot mode; no audio or video.</li><li>No API key support. The Linux build has no HTTPS and no sandbox.</li><li>No context compaction.</li><li>Go and Rust checks are experimental.</li><li>Tuned on the private suite above.</li><li>No Terminal-Bench 2.1 results yet, and no comparison with other agents on the same model (<a href="https://github.com/megasoft1978/flywheel/blob/main/bench/PROTOCOL.md">planned protocol</a>).</li></ul>
+  <ul class="limits">
+    <li>No API key support, so hosted services that require one do not work</li>
+    <li>The Linux build has no HTTPS and no sandbox</li>
+    <li>No context compaction</li>
+    <li>Images from typed or pasted input only; no audio or video</li>
+    <li>Go and Rust checks are experimental</li>
+    <li>Tuned on a private test suite</li>
+  </ul>
+  <p class="under" id="stack">Tested stack: <code>uub336/Qwen3.8-27B-pi-mlx-4bit</code> with the <code>z-lab/Qwen3.8-27B-DFlash2</code> drafter, Splash 1.7.2, Apple M5 Max 64 GB. Other engines and models are untested. <a href="https://github.com/megasoft1978/flywheel/blob/main/docs/advanced.md">Flags, configuration and development</a></p>
 </section>
 
-<footer><span>MIT licensed · C17</span><a href="https://github.com/megasoft1978/flywheel">github.com/megasoft1978/flywheel</a></footer>
+<footer><span>MIT licensed, C17</span><a href="https://github.com/megasoft1978/flywheel">github.com/megasoft1978/flywheel</a></footer>
 </div>
-<script>
-if (!matchMedia("(prefers-reduced-motion: reduce)").matches) {
-  const v = document.querySelector("video");
-  v.muted = true;
-  v.play().catch(() => {});
-}
-</script>
 </body>
 </html>

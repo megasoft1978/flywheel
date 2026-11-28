@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-10 -6 880 274" width="880" height="274" role="img" aria-labelledby="t d">
+<title id="t">How flywheel works</title>
+<desc id="d">The local model sends a tool call, which flywheel repairs or rejects, and commands run in the sandbox on macOS. Output goes back to the model, and a loop breaker prunes repeats. Only TypeScript, Python, Go and Rust projects (the last two experimental) get a check gate, which type-checks or compiles when the model has finished after changing files; if it fails the model goes back to fix it. Other projects finish without one.</desc>
+<style>
+  .bg{fill:#fff;stroke:#d3dae3}
+  .box{fill:#eef1f6;stroke:#9aa8ba;stroke-width:1.5}
+  text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;fill:#14202e;text-anchor:middle}
+  .h{font-size:18px;font-weight:700}
+  .s,.l{font-size:14px;fill:#4d5b6b}
+  .f{stroke:#4d5b6b;stroke-width:2;fill:none}
+  .r{stroke:#2447d6;stroke-width:2;fill:none;stroke-dasharray:6 5}
+  .fh{fill:#4d5b6b}.rh{fill:#2447d6}
+  .pill{fill:#fff;stroke:#2447d6;stroke-width:1.5}
+  .pt{font-size:13.5px;font-weight:600;fill:#2447d6}
+  @media (prefers-color-scheme:dark){
+    .bg{fill:#121821;stroke:#2b3646}
+    .box{fill:#1c2533;stroke:#50607a}
+    text{fill:#e8edf3}
+    .s,.l{fill:#9aa7b8}
+    .f{stroke:#9aa7b8}.fh{fill:#9aa7b8}
+    .r{stroke:#8aa4ff}.rh{fill:#8aa4ff}
+    .pill{fill:#121821;stroke:#8aa4ff}
+    .pt{fill:#8aa4ff}
+  }
+</style>
+<defs>
+  <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path class="fh" d="M0 0L10 5L0 10z"/></marker>
+  <marker id="b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path class="rh" d="M0 0L10 5L0 10z"/></marker>
+</defs>
+<rect class="bg" x="-9.5" y="-5.5" width="879" height="273" rx="12"/>
+
+<rect class="box" x="10" y="56" width="180" height="78" rx="10"/>
+<text class="h" x="100" y="91">Local model</text><text class="s" x="100" y="114">on your Mac</text>
+<rect class="box" x="230" y="56" width="180" height="78" rx="10"/>
+<text class="h" x="320" y="91">Tool-call repair</text><text class="s" x="320" y="114">recover or reject</text>
+<rect class="box" x="450" y="56" width="180" height="78" rx="10"/>
+<text class="h" x="540" y="91">Sandbox</text><text class="s" x="540" y="114">commands, on macOS</text>
+<rect class="box" x="670" y="56" width="180" height="78" rx="10"/>
+<text class="h" x="760" y="91">Check gate</text><text class="s" x="760" y="114">type check or compile</text>
+
+<path class="f" d="M190 95H229" marker-end="url(#a)"/>
+<path class="f" d="M410 95H449" marker-end="url(#a)"/>
+<path class="f" d="M630 95H669" marker-end="url(#a)"/>
+<text class="l" x="210" y="44">tool call</text>
+<text class="l" x="650" y="44">when finished</text>
+<path class="f" d="M760 56V30" marker-end="url(#a)"/>
+<text class="l" x="760" y="20">passes: done</text>
+
+<path class="r" d="M540 134V180H130V136" marker-end="url(#b)"/>
+<text class="l" x="335" y="156">output goes back to the model</text>
+<rect class="pill" x="221" y="167" width="228" height="26" rx="13"/>
+<text class="pt" x="335" y="185">loop breaker prunes repeats</text>
+
+<path class="r" d="M760 134V230H70V136" marker-end="url(#b)"/>
+<text class="l" x="415" y="252">check fails: the model is told to fix it</text>
+</svg>
