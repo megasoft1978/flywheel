@@ -44,12 +44,8 @@ static void mkdirs(const char *p) {
     mkdir(tmp, 0755);
 }
 
-int fw_copy_file(const char *src, const char *dst) {
-    int in = open(src, O_RDONLY);
-    if (in < 0) return -1;
-    struct stat st;
-    int out = fstat(in, &st) ? -1 : open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (out < 0) { close(in); return -1; }
+/* what is left of in, and the mode in st, to out */
+static int copy_fd(int in, const struct stat *st, int out) {
     char buf[65536];
     ssize_t n;
     int rc = 0;
@@ -58,7 +54,17 @@ int fw_copy_file(const char *src, const char *dst) {
         for (ssize_t off = 0, w; off < n; off += w)
             if ((w = write(out, buf + off, (size_t)(n - off))) <= 0) { rc = -1; break; }
     }
-    if (fchmod(out, st.st_mode & 07777)) rc = -1;
+    if (fchmod(out, st->st_mode & 07777)) rc = -1;
+    return rc;
+}
+
+int fw_copy_file(const char *src, const char *dst) {
+    int in = open(src, O_RDONLY);
+    if (in < 0) return -1;
+    struct stat st;
+    int out = fstat(in, &st) ? -1 : open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (out < 0) { close(in); return -1; }
+    int rc = copy_fd(in, &st, out);
     close(in);
     if (close(out)) rc = -1;
     return rc;
@@ -158,18 +164,17 @@ static void remove_tree(const char *dir) {
 }
 
 /* collect deliverables: recursive copy with skip rules (mirrors suite.py) */
-static void collect_rec(const char *root, const char *rel, const char *dest, const Manifest *m) {
-    char dir[1400];
-    snprintf(dir, sizeof dir, "%s%s%s", root, rel[0] ? "/" : "", rel);
-    DIR *d = opendir(dir);
-    if (!d) return;
+/* Takes over dfd, the directory rel of the task. A process the model left behind
+   can still be swapping entries for links: each one is opened without following,
+   checked and copied through that descriptor, never by its path again. */
+static void collect_rec(int dfd, const char *rel, const char *dest, const Manifest *m) {
+    DIR *d = dfd < 0 ? NULL : fdopendir(dfd);
+    if (!d) { if (dfd >= 0) close(dfd); return; }
     struct dirent *e;
     while ((e = readdir(d))) {
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
         char cr[1400];
         snprintf(cr, sizeof cr, "%s%s%s", rel, rel[0] ? "/" : "", e->d_name);
-        char fp[1400];
-        snprintf(fp, sizeof fp, "%s/%s", root, cr);
         /* first path component in skip list? */
         char first[512];
         snprintf(first, sizeof first, "%s", cr);
@@ -177,18 +182,22 @@ static void collect_rec(const char *root, const char *rel, const char *dest, con
         if (slash) *slash = 0;
         if (in_list(m->skip, first)) continue;
         /* model-made links point anywhere: neither followed nor collected */
+        int in = openat(dirfd(d), e->d_name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+        if (in < 0) continue;
         struct stat st;
-        if (lstat(fp, &st)) continue;
-        if (S_ISDIR(st.st_mode)) { collect_rec(root, cr, dest, m); continue; }
-        if (!S_ISREG(st.st_mode)) continue;
-        if (strstr(e->d_name, ".test.") || strstr(e->d_name, ".spec.")) continue;
-        char dp[1400];
-        snprintf(dp, sizeof dp, "%s/%s", dest, cr);
-        char dpar[1400];
-        snprintf(dpar, sizeof dpar, "%s", dp);
-        char *ls = strrchr(dpar, '/');
-        if (ls) { *ls = 0; mkdirs(dpar); }
-        fw_copy_file(fp, dp);
+        if (fstat(in, &st)) { close(in); continue; }
+        if (S_ISDIR(st.st_mode)) { collect_rec(in, cr, dest, m); continue; }
+        if (S_ISREG(st.st_mode) && !strstr(e->d_name, ".test.") && !strstr(e->d_name, ".spec.")) {
+            char dp[1400];
+            snprintf(dp, sizeof dp, "%s/%s", dest, cr);
+            char dpar[1400];
+            snprintf(dpar, sizeof dpar, "%s", dp);
+            char *ls = strrchr(dpar, '/');
+            if (ls) { *ls = 0; mkdirs(dpar); }
+            int out = open(dp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            if (out >= 0) { copy_fd(in, &st, out); close(out); }
+        }
+        close(in);
     }
     closedir(d);
 }
@@ -263,7 +272,9 @@ static cJSON *grade_task(const char *suite, const char *script, const char *tid,
     int total = cJSON_IsNumber(tt) ? tt->valueint : 0;
     int passed = cJSON_IsNumber(tp) ? tp->valueint : 0;
     bool tsc = cJSON_IsTrue(ts);
-    cJSON_DeleteItemFromObjectCaseSensitive(res, "full_pass");   /* computed here only */
+    /* computed here only: a script may print the key more than once */
+    while (cJSON_GetObjectItemCaseSensitive(res, "full_pass"))
+        cJSON_DeleteItemFromObjectCaseSensitive(res, "full_pass");
     cJSON_AddBoolToObject(res, "full_pass", total > 0 && passed == total && tsc);
     return res;
 }
@@ -388,7 +399,7 @@ int fw_do_bench(int argc, char **argv) {
         char fdir[1400];
         snprintf(fdir, sizeof fdir, "%s/files", td);
         mkdirs(fdir);
-        collect_rec(sb, "", fdir, &m);
+        collect_rec(open(sb, O_RDONLY | O_DIRECTORY | O_NOFOLLOW), "", fdir, &m);
         cJSON *res = grade_task(suite, m.grade_script, tid, fdir, m.grade_timeout);
 
         /* summary entry, python-compatible shape */

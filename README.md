@@ -322,11 +322,15 @@ Where it does not protect you:
   stores and the protected files.
 
 **`bench` grading scripts** run the code the model wrote, so they get the same sandbox, never with
-network, and their processes are killed when grading ends. A grade script runs in a fresh temporary
-directory; it can read the suite and write there and in `$TMPDIR`. `$2` is a copy of the collected
-files, thrown away afterwards. Your environment is not passed on, and anything it needs under
-`$HOME` outside the places listed above is unreadable. `--unsafe` runs it as before, with your
-environment and no sandbox. **The score is still not trustworthy against a hostile model:** code
+network, and their processes are killed when grading ends, also when `bench` gets SIGINT, SIGTERM,
+SIGHUP or SIGQUIT. SIGKILL of `bench` can still orphan a grader. A grade script runs in a fresh
+temporary directory; it can read the suite and write there and in `$TMPDIR`. `$2` is a copy of the
+collected files, thrown away afterwards. Of your environment only `PATH`, `HOME`, `LANG` and `TERM`
+are passed on, and anything it needs under `$HOME` outside the places listed above is unreadable,
+a `grade_script` outside the suite included. A suite that is `$HOME` or a directory above it is not
+readable. `--unsafe` runs it with your environment and no sandbox; unlike before, its stdin is
+`/dev/null`, it has its own process group and what it leaves in that group is killed.
+**The score is still not trustworthy against a hostile model:** code
 the grader runs shares its process and output, so it can forge the result line, stop the grader,
 change the copied files before they are checked, and read the whole suite, hidden tests and earlier
 results included. Run untrusted suites or models in a VM.
