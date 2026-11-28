@@ -32,8 +32,8 @@ section{padding:60px 0;border-top:1px solid var(--line)}
 h2{font-size:28px;letter-spacing:-.015em;line-height:1.2;margin-bottom:12px}
 h3{font-size:19px;margin:34px 0 6px}
 .sub{color:var(--dim);max-width:64ch;margin-bottom:26px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:12px;overflow:hidden}
-.grid div{background:var(--panel);padding:22px}
+.grid{display:flex;flex-wrap:wrap;gap:1px;background:var(--line);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+.grid div{flex:1 1 270px;background:var(--panel);padding:22px}
 .grid h4{font-size:15.5px;margin-bottom:6px}
 .grid p{color:var(--dim);font-size:14.5px}
 code{font-family:var(--mono);font-size:.9em}
