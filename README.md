@@ -185,8 +185,10 @@ untrusted repository or task in a VM.
 - One `.git` is already there: uv opens `$TMPDIR/cache/uv/sdists-v9/.git` for writing and fails
   when it cannot. It is made before any command runs, as a link to `/dev/null`, so what uv writes
   is discarded and it never names a repository. No rule is opened for it: it cannot be written
-  as a file, removed, renamed or replaced, and the directories above it up to `$TMPDIR` cannot be
-  removed, renamed, replaced or cloned.
+  as a file, removed, renamed or replaced, and neither can the directories above it up to
+  `$TMPDIR`.
+- Commands cannot clone directories (`clonefile`): a clone would carry a `.git` inside past the
+  rules above. Cloning files (`cp -c`) works.
 - What `core.hooksPath` names is closed like `.git/hooks`, also to the file tools and before it
   exists; for husky's `.husky/_`, all of `.husky`. Every value in the system, global, repository,
   worktree and submodule configs counts, also one that another overrides, and every `include` and

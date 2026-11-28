@@ -2499,8 +2499,7 @@ static void sb_names(Sb *b, const char *proj, bool repo, const char *other) {
 /* uv opens a .git in its cache for writing and fails when it cannot. No command
    may create one, so TMPDIR starts with it, as a link to /dev/null: opening it
    needs no rule of its own, and it can never name a repository. The name rules
-   keep the link itself; this keeps it where uv looks, and stops a clone of a
-   directory above it from copying the link to where it cannot be removed. */
+   keep the link itself; this keeps it where uv looks. */
 #define SBX_UV_GIT "cache/uv/sdists-v9/.git"
 
 static void sb_uv_git(Sb *b, const char *tmp) {
@@ -2509,10 +2508,6 @@ static void sb_uv_git(Sb *b, const char *tmp) {
     b->from = b->n;
     sb_add(b, "(deny file-write-unlink");
     sb_pin(b, p);
-    sb_pin_above(b, p);
-    sb_add(b, ")");
-    b->from = b->n;
-    sb_add(b, "(deny file-clone");
     sb_pin_above(b, p);
     sb_add(b, ")");
 }
@@ -2567,6 +2562,9 @@ static char *sbx_profile(const char *cwd, const char *tmp, bool net, const char 
     sb_project(&b, &areas, repo, linked ? &w : NULL);
     sb_names(&b, proj, repo, other);
     if (tmp) sb_uv_git(&b, rtmp);
+    /* a directory clone brings what is inside past the name rules, a .git the
+       command then cannot remove; files are still cloned (cp -c) */
+    sb_add(&b, "(deny file-clone (vnode-type DIRECTORY))");
     /* names this command's processes, so that all of them can be found later */
     if (mark) {
         char rule[160];

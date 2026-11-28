@@ -4198,6 +4198,16 @@ static void test_sandbox_tools(void) {
         snprintf(cmd, sizeof cmd, "cloned%d", i);
         T(sources[i], gone(proj, cmd));
     }
+    /* nor any other directory that can be read: it may hold a .git of its own */
+    put(under(base, "out2/d/.git/x"), "OUTSIDE\n");
+    snprintf(cmd, sizeof cmd, "cat '%s/out2/d/.git/x'", base);
+    shown(cmd, "OUTSIDE");
+    snprintf(cmd, sizeof cmd, "./clone '%s/out2/d' cloned-other 2>&1", base);
+    shown(cmd, "Operation not permitted");
+    T("no clone of a directory outside the project", gone(proj, "cloned-other"));
+    /* while cp -c, which clones file by file, keeps working */
+    works("mkdir -p tree/a && echo x > tree/a/f && cp -c tree/a/f cp-file && cp -Rc tree cp-tree"
+          " && cmp tree/a/f cp-file && cmp tree/a/f cp-tree/a/f");
     if (out_has("command -v uv >/dev/null && echo has-uv", "has-uv"))
         works("uv venv --offline v && uv pip list --offline --python v");
     else printf("unit: SKIP uv (not installed)\n");
@@ -4283,9 +4293,25 @@ static void test_sandbox_tools(void) {
     snprintf(cmd, sizeof cmd, "mv \"$T/cache\" \"$T.aside\" && ln -s \"%s/victim\" \"$T/cache\"", base);
     exited(proj, cmd, left, sizeof left);
     T("exit follows no link", *left && !gone(base, "victim/uv/sdists-v9/.git"));
+    if (*left) {        /* what that exit rightly left behind */
+        static const char *const rest[] = {"/cache", "", ".aside/uv/sdists-v9/.git",
+            ".aside/uv/sdists-v9", ".aside/uv", ".aside", NULL};
+        for (int i = 0; rest[i]; i++) {
+            snprintf(cmd, sizeof cmd, "%s%s", left, rest[i]);
+            if (unlink(cmd)) rmdir(cmd);
+        }
+    }
     exited(proj, "rm \"$T/cache/uv/sdists-v9/.git\" && echo keep > \"$T/cache/uv/sdists-v9/.git\"",
            left, sizeof left);
     T("exit removes only its own link", *left && !gone(left, "cache/uv/sdists-v9/.git"));
+    if (*left) {
+        snprintf(cmd, sizeof cmd, "%s/cache/uv/sdists-v9/.git", left);
+        unlink(cmd);
+        for (char *e; (e = strrchr(cmd, '/')) && e >= cmd + strlen(left); ) {
+            *e = 0;
+            rmdir(cmd);
+        }
+    }
 
     setenv("HOME", old, 1);
     free(old);
