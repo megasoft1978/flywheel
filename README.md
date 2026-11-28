@@ -330,6 +330,8 @@ are passed on, and anything it needs under `$HOME` outside the places listed abo
 a `grade_script` outside the suite included. A suite that is `$HOME` or a directory above it is not
 readable. `--unsafe` runs it with your environment and no sandbox; unlike before, its stdin is
 `/dev/null`, it has its own process group and what it leaves in that group is killed.
+Collected files are limited to 64 MiB each, 256 MiB per task and 64 directory levels; what is over
+is left out, with a line on stderr.
 **The score is still not trustworthy against a hostile model:** code
 the grader runs shares its process and output, so it can forge the result line, stop the grader,
 change the copied files before they are checked, and read the whole suite, hidden tests and earlier

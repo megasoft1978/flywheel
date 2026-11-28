@@ -810,6 +810,7 @@ static void test_agent_strict(void) {
 /* run ./flywheel, stdout on a pty or a pipe; returns what it printed */
 static int run_status;   /* exit code of the last run */
 
+static unsigned run_limit = 20;   /* seconds a run may take */
 static char *run_flywheel(bool tty, char *const *argv) {
     static char out[65536];
     int rd = -1, wr = -1, fds[2];
@@ -822,7 +823,7 @@ static char *run_flywheel(bool tty, char *const *argv) {
     fflush(stdout);
     pid_t pid = fork();
     if (!pid) {
-        alarm(20);
+        alarm(run_limit);
         int nul = open("/dev/null", O_RDWR);
         dup2(nul, 0); dup2(wr, 1); dup2(nul, 2);
         close(rd); close(wr);
@@ -2496,7 +2497,7 @@ static void test_bench_collect_race(void) {
         "use POSIX;\n"
         "my $h = shift;\n"
         "open F, '>', 'm0'; print F 'decoy'; close F;\n"
-        "for (1..150) { mkdir 'p'; chdir 'p' }\n"
+        "for (1..60) { mkdir 'p'; chdir 'p' }\n"
         "sub plain { open F, '>', 'r'; print F 'decoy'; close F; rename 'r', $_[0] }\n"
         "for (1..3) { mkdir \"d$_\"; plain(\"f$_\"); plain(\"d$_/key\") }\n"
         "if (fork) { select undef, undef, undef, 0.3; exit }\n"
@@ -2527,6 +2528,56 @@ static void test_bench_collect_race(void) {
     T("bench race: no secret in the results", !leaked);
     setenv("HOME", oldhome, 1);
     free(oldhome);
+}
+
+/* run bench on a task whose command is the given perl script; suite gets the
+   new suite directory. true if bench got to its last line */
+static bool bench_perl(char *suite, const char *script) {
+    char tmpl[] = "/tmp/fwlimXXXXXX";
+    if (!mkdtemp(tmpl) || !realpath(tmpl, suite)) { *suite = 0; return false; }
+    put(under(suite, "tasks/t1/prompt.md"), "hi\n");
+    put(under(suite, "run_task.sh"), "echo '{}'\n");
+    put(under(suite, "tasks/t1/starter/make.pl"), script);
+    bench_call = "{\"command\":\"perl make.pl\"}";
+    pid_t srv = serve(reply_bench);
+    char *bv[] = {"flywheel", "-e", g_cfg.endpoint, "-T", "3", "bench", suite, "tg", "t1", NULL};
+    char *out = run_flywheel(false, bv);
+    stop(srv);
+    return strstr(out, "tg DONE tasks=1") != NULL;
+}
+
+static void bench_perl_done(const char *suite) {
+    char rm[PATH_MAX + 16];
+    snprintf(rm, sizeof rm, "rm -rf '%s'", suite);
+    if (*suite) T("bench limits: clean up", !system(rm));
+}
+
+/* what the model leaves cannot crash the collection or fill the disk */
+static void test_bench_collect_limits(void) {
+    char suite[PATH_MAX];
+    run_limit = 180;   /* macOS makes and removes deep trees slowly */
+    bool done = bench_perl(suite,
+        "open F, '>', 'shallow'; print F 'ok'; close F;\n"
+        "for (1..3000) { mkdir 'p' or die; chdir 'p' or die;\n"
+        "  if ($_ == 70) { open F, '>', 'past'; close F } }\n"
+        "open F, '>', 'bottom'; close F;\n");
+    run_limit = 20;
+    T("bench deep tree: bench finishes", done);
+    T("bench deep tree: shallow file collected",
+      holds(under(suite, "runs/tg/t1/files/shallow"), "ok"));
+    char deep[PATH_MAX + 256];
+    int n = snprintf(deep, sizeof deep, "%s/runs/tg/t1/files", suite);
+    for (int i = 0; i < 64; i++) n += snprintf(deep + n, sizeof deep - (size_t)n, "/p");
+    T("bench deep tree: depth capped", access(deep, F_OK) != 0);
+    bench_perl_done(suite);
+
+    done = bench_perl(suite,
+        "open F, '>', 'small'; print F 'ok'; close F;\n"
+        "open F, '>', 'big'; truncate F, 1 << 30 or die; close F;\n");
+    T("bench huge file: bench finishes", done);
+    T("bench huge file: sibling collected", holds(under(suite, "runs/tg/t1/files/small"), "ok"));
+    T("bench huge file: not collected", access(under(suite, "runs/tg/t1/files/big"), F_OK) != 0);
+    bench_perl_done(suite);
 }
 
 /* the work directory of the grader of the suite named by mark, and its processes */
@@ -4141,6 +4192,7 @@ int main(void) {
         test_sandbox_escapes();
         test_bench_grader();
         test_bench_collect_race();
+        test_bench_collect_limits();
         test_bench_signals();
         test_nested_git();
         test_linked_worktree();

@@ -23,6 +23,12 @@
 #include <time.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+
+/* bounds on what is collected from a task: the model made it */
+#define COLLECT_MAX_DEPTH 64            /* directories, one stack frame each */
+#define COLLECT_MAX_FILE  (64 << 20)    /* bytes */
+#define COLLECT_MAX_TOTAL (256 << 20)
 
 /* ---------- small fs helpers ---------- */
 
@@ -44,13 +50,18 @@ static void mkdirs(const char *p) {
     mkdir(tmp, 0755);
 }
 
-/* what is left of in, and the mode in st, to out */
-static int copy_fd(int in, const struct stat *st, int out) {
+/* what is left of in, at most *limit bytes, and the mode in st, to out;
+   *limit goes down by what was read. -1 on an error or an abort. */
+static int copy_fd(int in, const struct stat *st, int out, long long *limit) {
     char buf[65536];
     ssize_t n;
     int rc = 0;
-    while (!rc && (n = read(in, buf, sizeof buf)) != 0) {
+    while (!rc && *limit > 0) {
+        if (g_abort) { rc = -1; break; }
+        size_t want = *limit < (long long)sizeof buf ? (size_t)*limit : sizeof buf;
+        if ((n = read(in, buf, want)) == 0) break;
         if (n < 0) { rc = -1; break; }
+        *limit -= n;
         for (ssize_t off = 0, w; off < n; off += w)
             if ((w = write(out, buf + off, (size_t)(n - off))) <= 0) { rc = -1; break; }
     }
@@ -64,7 +75,8 @@ int fw_copy_file(const char *src, const char *dst) {
     struct stat st;
     int out = fstat(in, &st) ? -1 : open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (out < 0) { close(in); return -1; }
-    int rc = copy_fd(in, &st, out);
+    long long all = LLONG_MAX;
+    int rc = copy_fd(in, &st, out, &all);
     close(in);
     if (close(out)) rc = -1;
     return rc;
@@ -164,14 +176,21 @@ static void remove_tree(const char *dir) {
 }
 
 /* collect deliverables: recursive copy with skip rules (mirrors suite.py) */
-/* Takes over dfd, the directory rel of the task. A process the model left behind
+/* Takes over dfd, the directory rel of the task, depth levels down; *left is
+   what may still be copied. A process the model left behind
    can still be swapping entries for links: each one is opened without following,
    checked and copied through that descriptor, never by its path again. */
-static void collect_rec(int dfd, const char *rel, const char *dest, const Manifest *m) {
+static void collect_rec(int dfd, const char *rel, const char *dest, const Manifest *m,
+                        int depth, long long *left) {
+    if (depth >= COLLECT_MAX_DEPTH) {
+        if (dfd >= 0) close(dfd);
+        fprintf(stderr, "bench: directories nested %d deep, not collected below\n", depth);
+        return;
+    }
     DIR *d = dfd < 0 ? NULL : fdopendir(dfd);
     if (!d) { if (dfd >= 0) close(dfd); return; }
     struct dirent *e;
-    while ((e = readdir(d))) {
+    while (!g_abort && (e = readdir(d))) {
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
         char cr[1400];
         snprintf(cr, sizeof cr, "%s%s%s", rel, rel[0] ? "/" : "", e->d_name);
@@ -186,8 +205,16 @@ static void collect_rec(int dfd, const char *rel, const char *dest, const Manife
         if (in < 0) continue;
         struct stat st;
         if (fstat(in, &st)) { close(in); continue; }
-        if (S_ISDIR(st.st_mode)) { collect_rec(in, cr, dest, m); continue; }
+        if (S_ISDIR(st.st_mode)) { collect_rec(in, cr, dest, m, depth + 1, left); continue; }
         if (S_ISREG(st.st_mode) && !strstr(e->d_name, ".test.") && !strstr(e->d_name, ".spec.")) {
+            if (st.st_size > COLLECT_MAX_FILE || st.st_size > *left) {
+                char *safe = clean_text(cr, false, false);   /* the model's name */
+                for (char *p = safe; *p; p++) if (*p == '\n') *p = ' ';
+                fprintf(stderr, "bench: %s is too large, not collected\n", safe);
+                free(safe);
+                close(in);
+                continue;
+            }
             char dp[1400];
             snprintf(dp, sizeof dp, "%s/%s", dest, cr);
             char dpar[1400];
@@ -195,7 +222,12 @@ static void collect_rec(int dfd, const char *rel, const char *dest, const Manife
             char *ls = strrchr(dpar, '/');
             if (ls) { *ls = 0; mkdirs(dpar); }
             int out = open(dp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-            if (out >= 0) { copy_fd(in, &st, out); close(out); }
+            if (out >= 0) {
+                long long n = st.st_size;   /* growth after the check is left out */
+                copy_fd(in, &st, out, &n);
+                *left -= st.st_size - n;
+                close(out);
+            }
         }
         close(in);
     }
@@ -210,6 +242,10 @@ static void run_grade(const char *suite, const char *script, const char *tid,
                       const char *files, int timeout, char **out, char **err) {
     char sp[1400];
     snprintf(sp, sizeof sp, "%s/%s", suite, script);
+    if (g_abort) {   /* what was collected may be partial, and nothing new starts */
+        *err = str_dup("aborted — not graded");
+        return;
+    }
     if (g_cfg.unsafe) {
         run_script(sp, tid, files, NULL, NULL, timeout, out, err);
         return;
@@ -399,7 +435,8 @@ int fw_do_bench(int argc, char **argv) {
         char fdir[1400];
         snprintf(fdir, sizeof fdir, "%s/files", td);
         mkdirs(fdir);
-        collect_rec(open(sb, O_RDONLY | O_DIRECTORY | O_NOFOLLOW), "", fdir, &m);
+        long long left = COLLECT_MAX_TOTAL;
+        collect_rec(open(sb, O_RDONLY | O_DIRECTORY | O_NOFOLLOW), "", fdir, &m, 0, &left);
         cJSON *res = grade_task(suite, m.grade_script, tid, fdir, m.grade_timeout);
 
         /* summary entry, python-compatible shape */
